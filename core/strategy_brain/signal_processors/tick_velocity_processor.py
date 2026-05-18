@@ -148,11 +148,13 @@ class TickVelocityProcessor(BaseSignalProcessor):
             vel_first_30s = vel_60s - vel_30s
             acceleration = vel_30s - vel_first_30s  # positive = accelerating
 
+        vel_60s_text = f"{vel_60s * 100:+.3f}%" if vel_60s is not None else "N/A"
+        vel_30s_text = f"{vel_30s * 100:+.3f}%" if vel_30s is not None else "N/A"
         logger.info(
             f"TickVelocity: curr={curr:.4f}, "
-            f"vel_60s={vel_60s*100:+.3f}% " if vel_60s else "vel_60s=N/A "
-            f"vel_30s={vel_30s*100:+.3f}% " if vel_30s else "vel_30s=N/A "
-            f"accel={acceleration*100:+.4f}%"
+            f"vel_60s={vel_60s_text}, "
+            f"vel_30s={vel_30s_text}, "
+            f"accel={acceleration * 100:+.4f}%"
         )
 
         # Use best available velocity for signal decision

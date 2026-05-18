@@ -135,7 +135,8 @@ class PerformanceTracker:
             Trade record
         """
         # Calculate P&L
-        if direction == "long":
+        direction_key = direction.lower()
+        if direction_key in {"long", "buy", "buy_yes", "buy_no"}:
             pnl_pct = (exit_price - entry_price) / entry_price
         else:  # short
             pnl_pct = (entry_price - exit_price) / entry_price

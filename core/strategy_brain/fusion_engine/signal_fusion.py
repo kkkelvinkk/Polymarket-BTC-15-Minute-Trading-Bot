@@ -127,10 +127,10 @@ class SignalFusionEngine:
             return None
         
         if bullish_contrib >= bearish_contrib:
-            direction = SignalDirection.BULLISH if "BULLISH" in str(SignalDirection.BULLISH) else "BULLISH"
+            direction = SignalDirection.BULLISH
             dominant = bullish_contrib
         else:
-            direction = SignalDirection.BEARISH if "BEARISH" in str(SignalDirection.BEARISH) else "BEARISH"
+            direction = SignalDirection.BEARISH
             dominant = bearish_contrib
         
         consensus_score = (dominant / total_contrib) * 100 if total_contrib > 0 else 0.0

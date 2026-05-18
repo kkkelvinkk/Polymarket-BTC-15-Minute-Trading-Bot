@@ -2,7 +2,6 @@
 Grafana Metrics Exporter
 Exports trading metrics in Prometheus format for Grafana
 """
-import asyncio
 from datetime import datetime
 from decimal import Decimal
 from typing import Dict, Any, Optional
@@ -201,6 +200,8 @@ class GrafanaMetricsExporter:
         self._is_running = False
         self._server = None
         self._thread = None
+        self._update_thread = None
+        self._stop_event = threading.Event()
         
         logger.info(f"Initialized Grafana Metrics Exporter (port {port})")
     
@@ -370,32 +371,47 @@ class GrafanaMetricsExporter:
             
             self._is_running = True
             
-            # Start update loop
-            asyncio.create_task(self._update_loop())
+            # Start metrics updates in a normal thread. The exporter itself is
+            # launched from a short-lived event loop in bot.py, so an asyncio
+            # task would be left pending when that loop exits.
+            self._stop_event.clear()
+            self._update_thread = threading.Thread(
+                target=self._run_update_loop,
+                daemon=True,
+                name="grafana-metrics-update",
+            )
+            self._update_thread.start()
             
         except Exception as e:
             logger.error(f"Failed to start metrics server: {e}")
     
-    async def _update_loop(self) -> None:
+    def _run_update_loop(self) -> None:
         """Periodically update metrics."""
-        while self._is_running:
+        while self._is_running and not self._stop_event.is_set():
             try:
                 self.update_metrics()
-                await asyncio.sleep(self.update_interval)
-                
-            except asyncio.CancelledError:
-                break
+                self._stop_event.wait(self.update_interval)
             except Exception as e:
                 logger.error(f"Error in metrics update loop: {e}")
-                await asyncio.sleep(self.update_interval)
+                self._stop_event.wait(self.update_interval)
     
     async def stop(self) -> None:
         """Stop metrics server."""
         self._is_running = False
+        self._stop_event.set()
         
         if self._server:
             self._server.shutdown()
             self._server.server_close()
+            self._server = None
+
+        if (
+            self._update_thread
+            and self._update_thread.is_alive()
+            and self._update_thread is not threading.current_thread()
+        ):
+            self._update_thread.join(timeout=2)
+        self._update_thread = None
             
         logger.info("Metrics exporter stopped")
     

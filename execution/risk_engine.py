@@ -2,6 +2,7 @@
 Risk Engine
 Manages position sizing, risk limits, and portfolio constraints
 """
+import os
 from decimal import Decimal
 from datetime import datetime
 from typing import Optional, Dict, Any, List
@@ -65,13 +66,13 @@ class RiskEngine:
         Args:
             limits: Risk limits configuration
         """
-        # Default conservative limits with $1 max per trade
+        # Default conservative limits, configurable through .env.
         self.limits = limits or RiskLimits(
-            max_position_size=Decimal("1.0"),  # $1 max per position
-            max_total_exposure=Decimal("10.0"),  # $10 total
-            max_positions=5,
-            max_drawdown_pct=0.15,  # 15% max drawdown
-            max_loss_per_day=Decimal("5.0"),  # $5 daily loss limit
+            max_position_size=Decimal(os.getenv("MAX_POSITION_SIZE", "1.0")),
+            max_total_exposure=Decimal(os.getenv("MAX_TOTAL_EXPOSURE", "10.0")),
+            max_positions=int(os.getenv("MAX_POSITIONS", "5")),
+            max_drawdown_pct=float(os.getenv("MAX_DRAWDOWN_PCT", "0.15")),
+            max_loss_per_day=Decimal(os.getenv("MAX_LOSS_PER_DAY", "5.0")),
             max_leverage=1.0,
         )
         
@@ -81,6 +82,7 @@ class RiskEngine:
         # Track daily statistics
         self._daily_pnl = Decimal("0")
         self._daily_trades = 0
+        self._stats_date = datetime.now().date()
         self._peak_balance = Decimal("1000.0")  # Starting balance
         self._current_balance = Decimal("1000.0")
         
@@ -110,6 +112,8 @@ class RiskEngine:
         Returns:
             (is_valid, error_message)
         """
+        self._maybe_reset_daily_stats()
+
         # Check position size limit ($1 max)
         if size > self.limits.max_position_size:
             return False, f"Position size ${size} exceeds max ${self.limits.max_position_size}"
@@ -189,6 +193,7 @@ class RiskEngine:
         direction: str,
         stop_loss: Optional[Decimal] = None,
         take_profit: Optional[Decimal] = None,
+        count_trade: bool = True,
     ) -> None:
         """
         Add a new position to track.
@@ -201,6 +206,8 @@ class RiskEngine:
             stop_loss: Stop loss price
             take_profit: Take profit price
         """
+        self._maybe_reset_daily_stats()
+
         position = PositionRisk(
             position_id=position_id,
             current_size=size,
@@ -218,9 +225,46 @@ class RiskEngine:
         )
         
         self._positions[position_id] = position
-        self._daily_trades += 1
+        if count_trade:
+            self._daily_trades += 1
         
         logger.info(f"Added position: {position_id} (${size:.2f} @ ${entry_price:.2f})")
+
+    def adjust_position(
+        self,
+        position_id: str,
+        size: Decimal,
+        entry_price: Decimal,
+        direction: Optional[str] = None,
+    ) -> None:
+        """Adjust an existing position after partial fills or final fill price updates."""
+        if position_id not in self._positions:
+            self.add_position(
+                position_id=position_id,
+                size=size,
+                entry_price=entry_price,
+                direction=direction or "buy",
+                count_trade=False,
+            )
+            return
+
+        position = self._positions[position_id]
+        position.current_size = size
+        position.entry_price = entry_price
+        position.current_price = entry_price
+        position.unrealized_pnl = Decimal("0")
+        if direction:
+            position.metadata["direction"] = direction
+
+        logger.info(f"Adjusted position: {position_id} (${size:.2f} @ ${entry_price:.4f})")
+
+    def release_position(self, position_id: str) -> bool:
+        """Release a position without booking realized P&L."""
+        if position_id not in self._positions:
+            return False
+        del self._positions[position_id]
+        logger.info(f"Released position without P&L: {position_id}")
+        return True
     
     def update_position(
         self,
@@ -246,7 +290,8 @@ class RiskEngine:
         # Calculate P&L
         direction = position.metadata.get("direction", "long")
         
-        if direction == "long":
+        direction_key = str(direction).lower()
+        if direction_key in {"long", "buy", "buy_yes", "buy_no"}:
             pnl_pct = (current_price - position.entry_price) / position.entry_price
         else:  # short
             pnl_pct = (position.entry_price - current_price) / position.entry_price
@@ -292,6 +337,8 @@ class RiskEngine:
         Returns:
             Realized P&L or None
         """
+        self._maybe_reset_daily_stats()
+
         if position_id not in self._positions:
             return None
         
@@ -300,7 +347,8 @@ class RiskEngine:
         # Calculate final P&L
         direction = position.metadata.get("direction", "long")
         
-        if direction == "long":
+        direction_key = str(direction).lower()
+        if direction_key in {"long", "buy", "buy_yes", "buy_no"}:
             pnl_pct = (exit_price - position.entry_price) / position.entry_price
         else:
             pnl_pct = (position.entry_price - exit_price) / position.entry_price
@@ -324,6 +372,43 @@ class RiskEngine:
         )
         
         return realized_pnl
+
+    def record_realized_pnl(
+        self,
+        pnl: Decimal,
+        source: str = "settlement",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Record realized P&L that is not tied to an open risk position.
+
+        This is used for settlement events that do not have a corresponding
+        open risk position, for example after a process restart.
+        """
+        self._maybe_reset_daily_stats()
+
+        self._current_balance += pnl
+        self._daily_pnl += pnl
+
+        if self._current_balance > self._peak_balance:
+            self._peak_balance = self._current_balance
+
+        logger.info(
+            f"Recorded realized P&L from {source}: ${pnl:+.2f} "
+            f"(daily=${self._daily_pnl:+.2f})"
+        )
+
+    def restore_daily_stats(self, daily_pnl: Decimal, daily_trades: int) -> None:
+        """Restore same-day realized P&L after a process restart."""
+        self._maybe_reset_daily_stats()
+        self._daily_pnl = daily_pnl
+        self._daily_trades = daily_trades
+        self._current_balance = Decimal("1000.0") + daily_pnl
+        self._peak_balance = max(Decimal("1000.0"), self._current_balance)
+        logger.info(
+            f"Restored daily risk stats from ledger: trades={daily_trades}, "
+            f"pnl=${daily_pnl:+.2f}"
+        )
     
     def _assess_risk_level(self, position: PositionRisk) -> RiskLevel:
         """Assess risk level of a position."""
@@ -426,7 +511,14 @@ class RiskEngine:
         """Reset daily statistics (call at start of each day)."""
         self._daily_pnl = Decimal("0")
         self._daily_trades = 0
+        self._stats_date = datetime.now().date()
         logger.info("Reset daily statistics")
+
+    def _maybe_reset_daily_stats(self) -> None:
+        """Reset daily counters once when the local calendar day changes."""
+        today = datetime.now().date()
+        if today != self._stats_date:
+            self.reset_daily_stats()
 
 
 # Singleton instance

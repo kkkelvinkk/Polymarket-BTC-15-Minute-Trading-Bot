@@ -37,11 +37,11 @@ A production-grade algorithmic trading bot for **Polymarket's 15-minute BTC pric
 | **7-Phase Architecture** | Modular, testable, production-ready design |
 | **Multi-Signal Intelligence** | Spike Detection, Sentiment Analysis, Price Divergence |
 | **Risk-First Design** | $1 max per trade, 30% stop loss, 20% take profit |
-| **Dual-Mode Operation** | Toggle between simulation and live without restart |
+| **Explicit Mode Operation** | Simulation observes decisions; live startup requires Redis control |
 | **Real-Time Monitoring** | Grafana dashboards + Prometheus metrics |
 | **Self-Learning** | Automatically optimizes signal weights based on performance |
 | **Auto-Recovery** | WebSocket auto-reconnection, rate limiting, data validation |
-| **Paper Trading** | Full P&L tracking in simulation mode |
+| **Decision-Only Simulation** | Records candidate decisions only; no live-equivalent fills or P&L |
 
 ---
 
@@ -106,17 +106,17 @@ bash
 pip install -r requirements.txt
 ```
 ## 4. Configure Environment Variables
-```
-bash
-cp .env.example .env
-Edit .env with your credentials:
 
-env
+Create or edit `.env` with your credentials:
+
+```env
 # Polymarket API Credentials
 POLYMARKET_PK=your_private_key_here
-POLYMARKET_API_KEY=your_api_key_here
-POLYMARKET_API_SECRET=your_api_secret_here
-POLYMARKET_PASSPHRASE=your_passphrase_here
+POLYMARKET_FUNDER=your_deposit_or_wallet_address_here
+POLYMARKET_SIGNATURE_TYPE=3
+POLYMARKET_API_KEY=wallet_derived_api_key_here
+POLYMARKET_API_SECRET=wallet_derived_api_secret_here
+POLYMARKET_PASSPHRASE=wallet_derived_passphrase_here
 
 # Redis Configuration
 REDIS_HOST=localhost
@@ -124,11 +124,160 @@ REDIS_PORT=6379
 REDIS_DB=2
 
 # Trading Parameters
+MARKET_BUY_USD=1.00
 MAX_POSITION_SIZE=1.0
+MAX_TOTAL_EXPOSURE=10.0
+MAX_POSITIONS=5
+MAX_DRAWDOWN_PCT=0.15
+MAX_LOSS_PER_DAY=5.0
+REQUIRE_SIGNAL_CONFIRMATION=true
+MIN_SIGNAL_CONFIDENCE=0.70
+EV_FEE_BUFFER=0.005
+EV_SPREAD_BUFFER=0.01
+LIVE_SETTLEMENT_GRACE_SECONDS=3600
+REQUIRE_AUTO_REDEEM_TOKEN_HINT=true
+LIVE_TRADE_LEDGER_PATH=live_trades.json
+POLYGON_RPC_URL=https://your-polygon-rpc.example
 STOP_LOSS_PCT=0.30
 TAKE_PROFIT_PCT=0.20
 SPIKE_THRESHOLD=0.15
 DIVERGENCE_THRESHOLD=0.05
+```
+
+Boolean flags accept only explicit values: `true`, `false`, `1`, `0`, `yes`,
+`no`, `on`, or `off`. Invalid values abort instead of being silently coerced.
+
+`live_trades.json` stores filled live trades until Polymarket sends `auto_redeem`.
+If no payout event arrives after `LIVE_SETTLEMENT_GRACE_SECONDS`, the bot marks
+the trade as `SETTLEMENT_UNKNOWN` instead of fabricating a $0 loss. A delayed
+`auto_redeem` can still correct the record and update realized P&L. Live submit
+requires valid market settlement metadata; missing `market_end_time` is rejected
+instead of using a secondary timeout. Live trading pauses while any
+`SETTLEMENT_UNKNOWN` record still has `needs_reconciliation=true`.
+
+Manual reconciliation is explicit and auditable. Stop the bot first, verify the
+actual settlement externally, resolve exactly one unknown order, then restart the
+bot so it reloads the ledger:
+
+```bash
+python mark_settlement_resolved.py \
+  --order-id ORDER_ID \
+  --payout 0 \
+  --reason "Verified no redeemable payout in Polymarket UI on 2026-05-18"
+```
+
+The tool takes the same `live_trades.json.lock` used by the bot and refuses to
+run while the bot is running. It resolves the ledger path from
+`LIVE_TRADE_LEDGER_PATH` by default and prints the exact resolved ledger and lock
+paths before writing. It changes `settlement_source` to `manual_reconciliation`,
+records the previous unknown state, computes P&L from the verified payout, and
+clears `needs_reconciliation`. It does not add an automatic override or hidden
+resume path.
+
+If an old open trade is stuck and cannot be timed out because its metadata is
+incomplete, stop the bot and move exactly one open order into
+`SETTLEMENT_UNKNOWN` before reconciling it:
+
+```bash
+python mark_settlement_resolved.py \
+  --migrate-open-to-unknown ORDER_ID \
+  --confirm-open-migration \
+  --reason "Open trade missing market_end_time after schema migration"
+```
+
+If `live_trades.json` is corrupt or unreadable, startup fails closed. Repair the
+JSON manually from a known-good copy before starting live mode. Keep external
+snapshots of this file, for example with a cron job that copies it to a dated
+backup path outside the repo.
+
+If the live ledger blocks during a fill callback, later fill callbacks are
+ignored until the process is repaired and restarted. This prevents the bot from
+committing a partial local view as if it were complete. During recovery, verify
+the order state from Polymarket exchange/order records; do not rely only on
+`live_trades.json`. If a filled order is missing from the ledger entirely,
+create a `SETTLEMENT_UNKNOWN` record from the external order details, then
+resolve it with the verified payout:
+
+```bash
+python mark_settlement_resolved.py \
+  --create-unknown-from-external-order ORDER_ID \
+  --confirm-external-order \
+  --external-size 2.00 \
+  --external-entry-price 0.50 \
+  --external-filled-qty 4 \
+  --external-direction long \
+  --external-trade-label "YES (UP)" \
+  --external-instrument-id "cond-token.POLYMARKET" \
+  --external-token-id TOKEN_ID \
+  --external-slug MARKET_SLUG \
+  --external-condition-id CONDITION_ID \
+  --external-submitted-at 2026-05-18T12:00:00Z \
+  --external-filled-at 2026-05-18T12:00:02Z \
+  --external-market-end-time 2026-05-18T12:15:00Z \
+  --reason "Rebuilt from Polymarket order records after ledger write failure"
+```
+
+The reconstruction command rejects inconsistent fill math unless
+`--external-size` matches `--external-entry-price * --external-filled-qty`
+within the smaller of $0.01 or 0.5%, rejects entry prices outside
+`0 < price <= 1`, and rejects impossible ordering unless
+`submitted_at <= filled_at <= market_end_time`. After creating the unknown
+record, resolve it with the verified payout using `--order-id ORDER_ID --payout
+PAYOUT --reason "..."`.
+
+`REQUIRE_AUTO_REDEEM_TOKEN_HINT=true` avoids assigning wallet-level redeem
+payouts to bot trades when the event does not identify the token or outcome.
+Those events are kept in the ledger as pending retry/reconciliation items, with
+a 7-day retention limit and 500-event cap. Before relying on live settlement,
+capture and inspect at least one real Polymarket `auto_redeem` log line and
+confirm the payload includes one of the supported token/outcome fields:
+`asset_id`, `assetId`, `token_id`, `tokenId`, `clobTokenId`, `clob_token_id`,
+`outcome`, `redeemed_outcome`, `redeemedOutcome`, `winning_outcome`, or
+`winningOutcome`. A `side` field is accepted only when its value is a normalized
+outcome (`yes`, `up`, `no`, or `down`); execution-side values such as `BUY` do
+not unlock settlement matching.
+
+Also verify that the real `auto_redeem` payload includes a parseable `timestamp`
+in seconds or milliseconds. Missing or invalid timestamps are left pending for
+manual review; the bot does not fabricate settlement time.
+
+`EV_FEE_BUFFER` and `EV_SPREAD_BUFFER` are heuristic confidence buffers. The
+current fused signal confidence is not a calibrated settlement probability, so
+these values filter low-confidence entries but are not a true mathematical EV
+model.
+
+Simulation records decision observations only. These records do not go through
+live-equivalent order submission, fill tracking, settlement ledger writes,
+`auto_redeem`, position/P&L accounting, or live failure behavior. They remain
+`PENDING` and must not be used as a win-rate or P&L source until a separate
+live-equivalent paper execution engine is implemented.
+
+For Polymarket's current deposit-wallet flow, `POLYMARKET_PK` is the private key for the signer wallet and `POLYMARKET_FUNDER` is the Polymarket deposit wallet address. Do not guess the funder address from MetaMask; discover it from Polymarket:
+
+```bash
+venv/bin/python configure_polymarket_deposit_wallet.py
+```
+
+Then derive and record the wallet-derived CLOB API credentials:
+
+```bash
+venv/bin/python derive_polymarket_api_creds.py
+```
+
+Do not use Builder or Relayer API keys for `POLYMARKET_API_KEY`; the bot expects wallet-derived CLOB API credentials.
+
+Check the CLOB balance seen by the bot. This is the number the live trading adapter will use:
+
+```bash
+venv/bin/python check_polymarket_balance.py --sync
+```
+
+For older direct MetaMask/EOA trading only, set `POLYMARKET_FUNDER` to the same public address shown in MetaMask and `POLYMARKET_SIGNATURE_TYPE=0`. If that wallet has Polygon USDC.e but CLOB allowances are `0`, approve the spender contracts from the MetaMask EOA wallet:
+
+```bash
+POLYGON_RPC_URL=https://your-polygon-rpc.example venv/bin/python approve_polymarket_clob.py
+POLYGON_RPC_URL=https://your-polygon-rpc.example venv/bin/python approve_polymarket_clob.py --execute
+venv/bin/python check_polymarket_balance.py --sync
 ```
 ## 5. Start Redis
 ```
@@ -147,18 +296,18 @@ redis-server
 ## 6. Run the Bot
 ```
 bash
-# Test mode (trades every minute - for quick testing)
-python run_bot.py --test-mode
+# Test mode (decision observations every minute - for quick signal checks)
+python bot.py --test-mode
 
 # Live trading mode (REAL MONEY!)
 python 15m_bot_runner.py --live
 ```
 ## ⚙️ Configuration Options
 Argument	Description	Default
---test-mode	Trade every minute for testing	False
+--test-mode	Decision observations every minute	False
 --live	Enable live trading (real money)	False
 --no-grafana	Disable Grafana metrics	False
-##View Paper Trades
+## View Decision Observations
 ```
 bash
 python view_paper_trades.py
@@ -228,8 +377,9 @@ polymarket-btc-15m-bot/
 ├── patch_gamma_markets.py       # Temporary patch/fix for Polymarket API
 ├── redis_control.py             # Switch trading mode (sim/live/test)
 ├── requirements.txt             # Python dependencies
-├── run_bot.py                   # Main bot entry point
-├── view_paper_trades.py         # View simulation/paper trade history
+├── bot.py                       # Main bot entry point
+├── 15m_bot_runner.py            # Auto-restart wrapper for bot.py
+├── view_paper_trades.py         # View simulation decision observations
 └── README.md                    # This file
 ```
 Testing
@@ -276,8 +426,8 @@ Open a Pull Request
 **A:** The bot caps each trade at $1, so you can start with as little as $10–20.
 
 **Q: Is this profitable?**  
-**A:** Yes — in simulation testing it has shown good results (e.g. ~75% win rate in early runs).  
-However, **past performance does not guarantee future results**. Always test thoroughly in simulation mode first.
+**A:** No claim is made from simulation records. Current simulation is
+decision-only observation, not live-equivalent execution or settlement.
 
 **Q: Do I need programming experience?**  
 **A:** Basic Python knowledge is helpful (e.g. understanding how to run scripts and edit config files), but the bot is designed to run with just a few simple commands — no coding required for normal use.
@@ -287,7 +437,7 @@ However, **past performance does not guarantee future results**. Always test tho
 
 **Q: What's the difference between test mode and normal mode?**  
 **A:**  
-- **Test mode** — trades simulated every minute (great for quick testing and debugging)  
+- **Test mode** — decision observations every minute (great for quick signal/debug checks)
 - **Normal mode** — trades every 15 minutes (matches the intended 15-minute strategy timeframe)
 
  
@@ -302,7 +452,7 @@ Always understand the risks before trading with real money
 
 The developers are not responsible for any financial losses
 
-Start with simulation mode, then small amounts, then scale up
+Use simulation only to observe decisions; use small live size only after checking live settlement behavior.
 
 ## Acknowledgments
 NautilusTrader - Professional trading framework
@@ -325,4 +475,3 @@ If you find this project useful, please star the GitHub repo! It helps others di
 
 ## contact me on telegram 
  [![Telegram](https://img.shields.io/badge/Telegram-%230088cc.svg?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/Bigg_O7)
-

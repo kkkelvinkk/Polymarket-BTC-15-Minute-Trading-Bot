@@ -1,26 +1,52 @@
 """
-Patch for PolymarketExecutionClient to support $1 market buys.
+Patch for PolymarketExecutionClient market buys.
 
-The Polymarket adapter normally requires quote_quantity=True for BUY market orders,
-but our strategy sends token quantities (quote_quantity=False).
-This patch intercepts BUY market orders and forces them to use the configured
-USD amount ($1 default) via the create_market_order API call.
+BUY market orders must be quote-denominated, meaning order.quantity is the
+USDC.e amount to spend. This patch keeps that behavior explicit and prevents
+token-denominated BUY market orders from being submitted accidentally.
 
 How Polymarket market orders work:
-  - BUY:  amount = USD to spend  (e.g. 1.0 = spend $1)
+  - BUY:  amount = USDC.e to spend (e.g. 1.0 = spend $1)
   - SELL: amount = tokens to sell (e.g. 5.0 = sell 5 tokens)
 
-Minimum order: $1 USD for market BUY orders (NOT 5 tokens).
+Minimum order: $1 USDC.e for market BUY orders (NOT 5 tokens).
 The 5-token minimum only applies to LIMIT orders.
 """
 
 import asyncio
+import json
 import logging
-import os
 
 logger = logging.getLogger(__name__)
 
 _patch_applied = False
+_auto_redeem_handlers = []
+
+
+def register_auto_redeem_handler(handler):
+    """Register a synchronous callback for Polymarket auto_redeem events."""
+    if handler not in _auto_redeem_handlers:
+        _auto_redeem_handlers.append(handler)
+
+
+def unregister_auto_redeem_handler(handler):
+    """Remove a previously registered auto_redeem callback."""
+    try:
+        _auto_redeem_handlers.remove(handler)
+    except ValueError:
+        pass
+
+
+def _dispatch_auto_redeem(payload):
+    """Forward auto_redeem payloads to registered bot handlers."""
+    for handler in list(_auto_redeem_handlers):
+        try:
+            handler(dict(payload))
+        except Exception as exc:
+            # Handler order is fail-closed: a failing handler aborts later handlers
+            # and lets the websocket layer surface the settlement-path exception.
+            logger.exception("auto_redeem handler failed; stopping websocket event consumption: %s", exc)
+            raise
 
 
 def apply_market_order_patch():
@@ -39,26 +65,28 @@ def apply_market_order_patch():
         from nautilus_trader.common.enums import LogColor
         from py_clob_client.client import MarketOrderArgs, PartialCreateOrderOptions
 
-        # --- Read USD amount from environment (default $1) ---
-        _DEFAULT_USD_AMOUNT = float(os.getenv("MARKET_BUY_USD", "1.0"))
-        logger.info(f"Market BUY USD amount configured to: ${_DEFAULT_USD_AMOUNT:.2f}")
-
         async def _patched_submit_market_order(self, command, instrument):
             """
             Patched market order handler.
 
-            For BUY orders:  always use USD amount (default $1) via create_market_order.
+            For BUY orders:  use quote quantity as the USDC.e amount via create_market_order.
             For SELL orders: use token quantity as normal (base-denominated).
             """
             order = command.order
 
             if order.side == OrderSide.BUY:
-                # Read amount each call so live env changes take effect
-                usd_amount = float(os.getenv("MARKET_BUY_USD", str(_DEFAULT_USD_AMOUNT)))
+                if not order.is_quote_quantity:
+                    self._deny_market_order_quantity(
+                        order,
+                        "Polymarket market BUY orders require quote-denominated quantities; "
+                        "resubmit with `quote_quantity=True`",
+                    )
+                    return
+
+                usd_amount = float(order.quantity)
 
                 self._log.info(
-                    f"[PATCH] BUY market order → using ${usd_amount:.2f} USD "
-                    f"(token qty ignored: {float(order.quantity):.6f})",
+                    f"[PATCH] BUY market order → spending ${usd_amount:.2f} USDC.e",
                     LogColor.MAGENTA,
                 )
 
@@ -136,10 +164,39 @@ def apply_market_order_patch():
 
                 await self._post_signed_order(order, signed_order)
 
+        original_handle_ws_message = PolymarketExecutionClient._handle_ws_message
+
+        def _patched_handle_ws_message(self, raw: bytes) -> None:
+            try:
+                payload = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+            except Exception:
+                return original_handle_ws_message(self, raw)
+
+            if payload.get("event_type") == "auto_redeem":
+                payload_keys = ",".join(sorted(str(key) for key in payload.keys()))
+                self._log.info(
+                    "[PATCH] Handling Polymarket auto_redeem websocket event "
+                    f"slug={payload.get('slug')} amount={payload.get('amount')} "
+                    f"txn={payload.get('txn_hash')} keys={payload_keys} "
+                    f"asset_id={payload.get('asset_id')} assetId={payload.get('assetId')} "
+                    f"token_id={payload.get('token_id')} tokenId={payload.get('tokenId')} "
+                    f"clobTokenId={payload.get('clobTokenId')} outcome={payload.get('outcome')} "
+                    f"side={payload.get('side')}",
+                    LogColor.BLUE,
+                )
+                _dispatch_auto_redeem(payload)
+                return
+
+            return original_handle_ws_message(self, raw)
+
         # Apply the patch
         PolymarketExecutionClient._submit_market_order = _patched_submit_market_order
+        PolymarketExecutionClient._handle_ws_message = _patched_handle_ws_message
         _patch_applied = True
-        logger.info("Market order patch applied — BUY orders will use $MARKET_BUY_USD (default $1)")
+        logger.info(
+            "Market order patch applied — BUY orders use quote_quantity as USDC.e spend; "
+            "auto_redeem websocket events are handled locally"
+        )
         return True
 
     except ImportError as e:

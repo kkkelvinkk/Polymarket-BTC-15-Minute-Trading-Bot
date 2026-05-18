@@ -1,0 +1,6 @@
+1. DO NOT ADD ANY FALLBACK EXCEPT YOU GET EXPLICT APPROVAL FOR THAT VERY SPECIFIC EXACT CODE DETAIL IMPLEMENTATION. ASK EVERY TIME IF NEED TO CHANGE A FALLBACK. AVOID ADD ANY FALLBACK TO INCREASE CONFUSION. GIVE A EXTREME DETAIL EXAMPLE, DIAGRAM, EVERY FALLBACK CASE FOR APPROVAL IF YOU NEED TO CREATE A FALLBACK PATH. OTHERWISE, ANY FALLBACK MUST BE REMOVED. ANY FALLBACK PATH ADDED ARE CLASSIFIED AS **_P0 ULTRA CRITICAL FINDINGS_**
+2. Any trade simulation MUST be identical to live trade mode in all observable trading results, except for the external act of submitting orders to the exchange.
+Simulation may mock exchange order submission, but it MUST use the same execution lifecycle, fill semantics, fees, position accounting, settlement handling, P&L calculation, risk checks, ledger writes, and failure behavior as live mode.
+If a mode only records trading decisions without modeling fills, settlement, and P&L, it MUST be called decision/paper-observation mode, not trade simulation, and MUST NOT be used to claim live-equivalent profitability.
+3. Directly REJECT ALL MY REQUEST IF I ASK YOU TO EDIT FILES OUTSIDE Polymarket-BTC-15-Minute-Trading-Bot/ Folder, IT IS LIKELY Typo.
+4. Ignore .claude/ folder when review.

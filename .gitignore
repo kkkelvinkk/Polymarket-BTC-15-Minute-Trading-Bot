@@ -70,6 +70,8 @@ htmlcov/
 
 # Trade data (personal financial records)
 paper_trades.json
+live_trades.json
+live_trades.json.lock
 trades.json
 trade_history.json
 *.trade
@@ -138,3 +140,4 @@ $RECYCLE.BIN/
 *.swo
 node_modules/
 .cache/
+.claude/
