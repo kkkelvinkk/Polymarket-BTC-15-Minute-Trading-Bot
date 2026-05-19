@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import hashlib
 import json
 import os
 import fcntl
@@ -7,7 +8,7 @@ import sys
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 import math
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 import time
 import threading
 import traceback
@@ -83,14 +84,17 @@ from feedback.learning_engine import get_learning_engine
 load_dotenv()
 from patch_market_orders import (
     apply_market_order_patch,
+    register_actual_fill_handler,
     register_auto_redeem_handler,
+    unregister_actual_fill_handler,
     unregister_auto_redeem_handler,
 )
-patch_applied = apply_market_order_patch()
-if patch_applied:
-    logger.info("Market order patch applied successfully")
-else:
-    logger.error("Market order patch failed")
+from decision_log import DecisionRecord
+from depth_estimator import (
+    InvalidBookLevelError,
+    estimate_market_ioc_fill,
+)
+patch_applied = False
 
 from polymarket_v2_compat import apply_polymarket_v2_patch
 v2_patch_applied = apply_polymarket_v2_patch()
@@ -99,6 +103,12 @@ if v2_patch_applied:
 else:
     logger.error("Polymarket CLOB v2 compatibility patch failed")
 
+from patch_polymarket_quote_warnings import apply_polymarket_quote_warning_patch
+if apply_polymarket_quote_warning_patch():
+    logger.info("Polymarket 'Dropping QuoteTick' warning filter applied")
+else:
+    logger.warning("Polymarket 'Dropping QuoteTick' warning filter could not be applied")
+
 
 # =============================================================================
 # CONSTANTS
@@ -106,12 +116,37 @@ else:
 QUOTE_STABILITY_REQUIRED = 3      # Need only 3 valid ticks to be stable (faster startup)
 QUOTE_MIN_SPREAD = 0.001          # Both bid AND ask must be at least this
 MARKET_INTERVAL_SECONDS = 900     # 15-minute markets
-MAX_SEEN_AUTO_REDEEM_EVENTS = 10_000
-MAX_PENDING_AUTO_REDEEM_EVENTS = 500
-PENDING_AUTO_REDEEM_RETENTION = timedelta(days=7)
+LIVE_TRADE_LEDGER_SCHEMA_VERSION = 3
 DEFAULT_LIVE_SETTLEMENT_GRACE_SECONDS = 3600
+SETTLEMENT_ACCOUNTING_COST_TOLERANCE = Decimal("1E-18")
+ACTUAL_FILL_UNIQUE_KEY_FIELDS = (
+    "fill_id",
+    "trade_id",
+    "match_id",
+    "event_id",
+    "transaction_hash",
+    "txn_hash",
+)
 _ledger_path = Path(os.getenv("LIVE_TRADE_LEDGER_PATH", "live_trades.json"))
 LIVE_TRADE_LEDGER_PATH = _ledger_path if _ledger_path.is_absolute() else project_root / _ledger_path
+TERMINAL_NO_FILL_INTENT_STATUSES = frozenset(
+    {
+        "ORDER_DENIED_NO_FILL",
+        "ORDER_REJECTED_NO_FILL",
+        "ORDER_CANCELED_NO_FILL",
+        "ORDER_EXPIRED_NO_FILL",
+    }
+)
+
+
+def _fsync_parent_directory(path: Path) -> None:
+    dir_fd = os.open(str(path.parent), os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 AUTO_REDEEM_TOKEN_HINT_KEYS = (
     "asset_id",
     "assetId",
@@ -277,6 +312,279 @@ def get_market_buy_usd() -> Decimal:
     return amount.quantize(Decimal("0.01"))
 
 
+LIVE_MIN_MARKET_BUY_USD = Decimal("5.50")
+
+
+# --- Phase 2.5 sizing mode validation -------------------------------------
+
+SIZING_MODE_FIXED = "fixed"
+SIZING_MODE_PERCENT = "percent"
+_ALLOWED_SIZING_MODES = frozenset({SIZING_MODE_FIXED, SIZING_MODE_PERCENT})
+
+
+def get_sizing_mode_for_live() -> str:
+    """Phase 2.5 — required env var when ``--live``. No implicit default.
+
+    Returns the validated sizing mode string. Raises ``RuntimeError`` if
+    ``SIZING_MODE`` is missing or not one of ``fixed`` / ``percent``.
+    """
+    raw = os.getenv("SIZING_MODE")
+    if raw is None or raw == "":
+        raise RuntimeError(
+            "SIZING_MODE must be set to 'fixed' or 'percent' for live trading"
+        )
+    if raw not in _ALLOWED_SIZING_MODES:
+        raise RuntimeError(
+            f"SIZING_MODE must be 'fixed' or 'percent', got {raw!r}"
+        )
+    return raw
+
+
+# --- Phase 3 ORDER_TYPE validation ---------------------------------------
+
+ORDER_TYPE_MARKET_IOC = "market_ioc"
+ORDER_TYPE_LIMIT_IOC = "limit_ioc"
+_ALLOWED_ORDER_TYPES = frozenset({ORDER_TYPE_MARKET_IOC, ORDER_TYPE_LIMIT_IOC})
+
+
+def get_order_type_for_live() -> str:
+    """Phase 3 — required env var when ``--live``. No implicit default.
+
+    Returns the validated order type. Raises ``RuntimeError`` if
+    ``ORDER_TYPE`` is missing or not one of ``market_ioc`` / ``limit_ioc``.
+
+    Wiring into ``_place_real_order`` is gated on Phase 4/4.5 calibration
+    pass (per the plan's dependency chain). Until then, this validator
+    can be called explicitly but is not yet enforced at startup.
+    """
+    raw = os.getenv("ORDER_TYPE")
+    if raw is None or raw == "":
+        raise RuntimeError(
+            "ORDER_TYPE must be set to 'market_ioc' or 'limit_ioc' for live trading"
+        )
+    if raw not in _ALLOWED_ORDER_TYPES:
+        raise RuntimeError(
+            f"ORDER_TYPE must be 'market_ioc' or 'limit_ioc', got {raw!r}"
+        )
+    return raw
+
+
+def trade_window_label_for_seconds_into_sub_interval(seconds: float) -> str:
+    """Phase 4.5 — classify the elapsed seconds into one of the candidate
+    trade windows defined in EXECUTION_PLAN.md Phase 4.5:
+
+      - ``06_09``: 360-539 s  (6:00-8:59 into the 15-min market)
+      - ``09_11``: 540-659 s
+      - ``11_13``: 660-779 s
+      - ``13_14_current``: 780-839 s (current live baseline)
+      - ``14_15_late``: 840-899 s (post-baseline late window)
+      - ``before_06`` / ``after_15``: out of every candidate window
+
+    The bot's current live trade window is exactly ``13_14_current``
+    (780-840 seconds). The other buckets are observation-only labels so
+    Phase 4.5 calibration can compare candidate windows against the live
+    baseline without changing the live gate.
+    """
+    if seconds < 360:
+        return "before_06"
+    if seconds < 540:
+        return "06_09"
+    if seconds < 660:
+        return "09_11"
+    if seconds < 780:
+        return "11_13"
+    if seconds < 840:
+        return "13_14_current"
+    if seconds < 900:
+        return "14_15_late"
+    return "after_15"
+
+
+def trend_price_band_for(yes_price: float) -> str:
+    """Phase 4.5 — classify the YES price into one of the six bands defined in
+    EXECUTION_PLAN.md Phase 4.5 (moderate / strong / extreme on each side).
+    The neutral middle band uses the strict ``(0.40, 0.60)`` open interval
+    consistent with the trend filter's own thresholds.
+    """
+    if yes_price >= 0.70:
+        return "yes_extreme_ge_0.70"
+    if yes_price >= 0.60:
+        return "yes_strong_0.60_0.70"
+    if yes_price > 0.48:
+        # 0.48 < yes < 0.60 — moderate YES side
+        return "yes_moderate_0.48_0.60"
+    if yes_price > 0.40:
+        # 0.40 < yes <= 0.48 — moderate NO side
+        return "no_moderate_0.40_0.48"
+    if yes_price > 0.30:
+        return "no_strong_0.30_0.40"
+    return "no_extreme_le_0.30"
+
+
+POLYMARKET_LIMIT_MIN_TOKENS = Decimal("5")
+
+
+def compute_limit_price(
+    fused_confidence: float, limit_required_edge: Decimal
+) -> Optional[Decimal]:
+    """Phase 3 — compute the limit-price cap from fused confidence.
+
+    ``fused.confidence`` is confidence in the selected direction (BULLISH or
+    BEARISH); it is NOT a raw YES-probability. The cap is the same formula
+    for both long (buy YES) and short (buy NO):
+
+        cap = fused_confidence - limit_required_edge
+
+    Returns ``None`` if the resulting cap is outside ``(0, 1)`` — the caller
+    must reject the trade and log the reason. No clamping, no defaulting.
+    """
+    conf = Decimal(str(fused_confidence))
+    cap = conf - limit_required_edge
+    if cap <= Decimal("0") or cap >= Decimal("1"):
+        return None
+    return cap
+
+
+def compute_limit_order_token_qty(
+    budget_usd: Decimal,
+    limit_price: Decimal,
+    size_precision: int,
+) -> Optional[Decimal]:
+    """Phase 3 — compute the token quantity for a LIMIT_IOC order.
+
+    Conservative sizing: ``token_qty = budget / limit_price`` rounded DOWN
+    to ``size_precision`` decimal places so the worst-case spend (at the
+    limit price) never exceeds the budget. Returns ``None`` if the rounded
+    token quantity is below the Polymarket 5-token limit-order minimum;
+    caller must reject the trade and log the reason.
+    """
+    if budget_usd <= 0:
+        raise ValueError(f"budget_usd must be positive, got {budget_usd}")
+    if limit_price <= 0 or limit_price >= 1:
+        raise ValueError(
+            f"limit_price must be in (0, 1), got {limit_price}"
+        )
+    if size_precision < 0:
+        raise ValueError(
+            f"size_precision must be non-negative, got {size_precision}"
+        )
+    raw_token_qty = budget_usd / limit_price
+    quantize_to = Decimal(10) ** -size_precision if size_precision > 0 else Decimal("1")
+    token_qty = raw_token_qty.quantize(quantize_to, rounding=ROUND_DOWN)
+    if token_qty < POLYMARKET_LIMIT_MIN_TOKENS:
+        return None
+    return token_qty
+
+
+def get_validated_limit_required_edge() -> Decimal:
+    """Phase 3 — required env var when ``ORDER_TYPE=limit_ioc``.
+
+    Strict range (0, 1). No clamping. Raises ``RuntimeError`` on any invalid
+    input so impossible values fail fast at startup, not silently inside the
+    limit-price computation.
+    """
+    raw = os.getenv("LIMIT_REQUIRED_EDGE")
+    if raw is None or raw == "":
+        raise RuntimeError(
+            "LIMIT_REQUIRED_EDGE must be set when ORDER_TYPE=limit_ioc"
+        )
+    try:
+        value = Decimal(raw)
+    except InvalidOperation as exc:
+        raise RuntimeError(
+            f"LIMIT_REQUIRED_EDGE must be a decimal, got {raw!r}"
+        ) from exc
+    if not value.is_finite():
+        raise RuntimeError(
+            f"LIMIT_REQUIRED_EDGE must be finite, got {raw!r}"
+        )
+    if value <= Decimal("0") or value >= Decimal("1"):
+        raise RuntimeError(
+            f"LIMIT_REQUIRED_EDGE must be in (0, 1) — got {value}. A value "
+            f"outside this range cannot produce a usable limit price for a "
+            f"Polymarket binary outcome token."
+        )
+    return value
+
+
+def get_pct_of_free_collateral_per_trade() -> Decimal:
+    """Phase 2.5 — required env var when ``SIZING_MODE=percent``.
+
+    Returns the validated ``Decimal`` in (0, 1). Raises ``RuntimeError`` on
+    missing, malformed, non-finite, or out-of-range values.
+    """
+    raw = os.getenv("PCT_OF_FREE_COLLATERAL_PER_TRADE")
+    if raw is None or raw == "":
+        raise RuntimeError(
+            "PCT_OF_FREE_COLLATERAL_PER_TRADE must be set when SIZING_MODE=percent"
+        )
+    try:
+        value = Decimal(raw)
+    except InvalidOperation as exc:
+        raise RuntimeError(
+            f"PCT_OF_FREE_COLLATERAL_PER_TRADE must be a decimal, got {raw!r}"
+        ) from exc
+    if not value.is_finite():
+        raise RuntimeError(
+            f"PCT_OF_FREE_COLLATERAL_PER_TRADE must be finite, got {raw!r}"
+        )
+    if value <= Decimal("0") or value >= Decimal("1"):
+        raise RuntimeError(
+            f"PCT_OF_FREE_COLLATERAL_PER_TRADE must be in (0, 1) — got {value}"
+        )
+    return value
+
+
+def _live_market_buy_usd_blocked_message(raw_value) -> str:
+    formatted_current = raw_value if raw_value is not None else "<unset>"
+    return (
+        "LIVE STARTUP BLOCKED: MARKET_BUY_USD must be greater than 5.50 USDC for live mode.\n"
+        f"Current MARKET_BUY_USD={formatted_current}. "
+        "Increase it to at least 5.51 or run without --live."
+    )
+
+
+def validate_live_market_buy_usd():
+    """Phase 0.3 strict validator. Returns (ok, error_msg, validated_amount).
+
+    Reads ``MARKET_BUY_USD`` once and validates it against the live gate.
+    Quantizes BEFORE comparing so that ``5.5000001`` cannot slip past the
+    strict-inequality and then round down to the blocked ``5.50`` value.
+
+    Returns a structured result rather than raising so both startup (fail-stop)
+    and runtime (fail-closed reject) call sites can share one source of truth
+    without try/except converting exceptions into control flow.
+    """
+    raw_value = os.getenv("MARKET_BUY_USD")
+    blocked = _live_market_buy_usd_blocked_message(raw_value)
+    if raw_value is None:
+        return False, blocked, None
+    try:
+        amount = Decimal(raw_value)
+    except InvalidOperation:
+        return False, blocked, None
+    if not amount.is_finite():
+        return False, blocked, None
+    quantized = amount.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    if quantized <= LIVE_MIN_MARKET_BUY_USD:
+        return False, blocked, None
+    return True, None, quantized
+
+
+def enforce_live_market_buy_usd_gate() -> Decimal:
+    """Phase 0.3 live startup gate: MARKET_BUY_USD must be strictly > 5.50.
+
+    Used at process startup when --live is passed. Raises ``RuntimeError`` on
+    any invalid value so startup fails closed. Runtime checks should use
+    ``validate_live_market_buy_usd()`` directly to inspect the result without
+    going through exception control flow.
+    """
+    ok, err, amount = validate_live_market_buy_usd()
+    if not ok:
+        raise RuntimeError(err)
+    return amount
+
+
 def get_env_bool(name: str, default: bool) -> bool:
     """Read a boolean environment flag without silently accepting typos."""
     raw_value = os.getenv(name)
@@ -353,11 +661,15 @@ class IntegratedBTCStrategy(Strategy):
         self._seen_auto_redeem_events = set()
         self._seen_auto_redeem_event_order: List[str] = []
         self._pending_auto_redeem_events: Dict[str, Dict[str, Any]] = {}
+        self._pending_actual_fills: Dict[str, Dict[str, Any]] = {}
+        self._submitted_order_intents: Dict[str, Dict[str, Any]] = {}
         self._settlement_lock = threading.RLock()
         self._settlement_ledger_blocked_reason: Optional[str] = None
         self._ledger_lock_file = None
         self._auto_redeem_registered = False
         self._auto_redeem_handler = self._handle_auto_redeem_event
+        self._actual_fill_registered = False
+        self._actual_fill_handler = self._handle_actual_fill
         self._acquire_live_trade_ledger_lock()
         try:
             self._load_live_trade_ledger()
@@ -411,8 +723,12 @@ class IntegratedBTCStrategy(Strategy):
 
         # Phase 5: Risk Management
         self.risk_engine = get_risk_engine()
-        self._rehydrate_settled_daily_risk()
-        self._rehydrate_open_settlement_risk()
+        try:
+            self._rehydrate_settled_daily_risk()
+            self._rehydrate_open_settlement_risk()
+        except Exception:
+            self._release_live_trade_ledger_lock()
+            raise
 
         # Phase 6: Performance Tracking
         self.performance_tracker = get_performance_tracker()
@@ -581,16 +897,9 @@ class IntegratedBTCStrategy(Strategy):
         return value
 
     def _normalize_seen_auto_redeem_state(self, seen_events, seen_order):
-        """Return a bounded, internally consistent auto_redeem dedupe index."""
+        """Return an internally consistent auto_redeem dedupe index."""
         seen_events = set(seen_events)
         seen_order = list(seen_order)
-        if len(seen_events) > MAX_SEEN_AUTO_REDEEM_EVENTS:
-            seen_order = [
-                event_key
-                for event_key in seen_order
-                if event_key in seen_events
-            ][-MAX_SEEN_AUTO_REDEEM_EVENTS:]
-            seen_events = set(seen_order)
         if set(seen_order) != seen_events or len(seen_order) != len(seen_events):
             raise SettlementLedgerError("seen auto_redeem event index is inconsistent")
         return seen_events, seen_order
@@ -602,6 +911,8 @@ class IntegratedBTCStrategy(Strategy):
         seen_events,
         seen_order,
         pending_events,
+        pending_actual_fills,
+        submitted_order_intents,
     ) -> Dict[str, Any]:
         """Prepare a ledger state for writing without mutating current bot state."""
         normalized_seen, normalized_seen_order = self._normalize_seen_auto_redeem_state(
@@ -609,25 +920,26 @@ class IntegratedBTCStrategy(Strategy):
             seen_order,
         )
         normalized_pending = copy.deepcopy(pending_events)
-        self._prune_pending_auto_redeem_events(
-            normalized_pending,
-            datetime.now(timezone.utc),
-        )
         return {
             "open": dict(open_trades),
             "settled": list(settled_trades),
             "seen": normalized_seen,
             "seen_order": normalized_seen_order,
             "pending": normalized_pending,
+            "pending_actual_fills": copy.deepcopy(pending_actual_fills),
+            "submitted_order_intents": copy.deepcopy(submitted_order_intents),
         }
 
     def _write_live_trade_ledger_state(self, state: Dict[str, Any]) -> None:
         """Write a prepared live-trade ledger state to disk."""
         data = {
+            "ledger_schema_version": LIVE_TRADE_LEDGER_SCHEMA_VERSION,
             "open": self._jsonable(dict(state["open"])),
-            "settled": self._jsonable(list(state["settled"][-500:])),
+            "settled": self._jsonable(list(state["settled"])),
             "seen_auto_redeem_events": list(state["seen_order"]),
             "pending_auto_redeem_events": self._jsonable(dict(state["pending"])),
+            "pending_actual_fills": self._jsonable(dict(state["pending_actual_fills"])),
+            "submitted_order_intents": self._jsonable(dict(state["submitted_order_intents"])),
         }
         payload = json.dumps(data, indent=2, sort_keys=True)
 
@@ -639,6 +951,7 @@ class IntegratedBTCStrategy(Strategy):
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp_path, LIVE_TRADE_LEDGER_PATH)
+        _fsync_parent_directory(LIVE_TRADE_LEDGER_PATH)
 
     def _save_live_trade_ledger_state(
         self,
@@ -647,6 +960,8 @@ class IntegratedBTCStrategy(Strategy):
         seen_events,
         seen_order,
         pending_events,
+        pending_actual_fills,
+        submitted_order_intents,
     ) -> Dict[str, Any]:
         """Persist the supplied ledger state and return the normalized state that was written."""
         with self._settlement_lock:
@@ -657,6 +972,8 @@ class IntegratedBTCStrategy(Strategy):
                     seen_events=seen_events,
                     seen_order=seen_order,
                     pending_events=pending_events,
+                    pending_actual_fills=pending_actual_fills,
+                    submitted_order_intents=submitted_order_intents,
                 )
                 self._write_live_trade_ledger_state(state)
                 return state
@@ -674,10 +991,14 @@ class IntegratedBTCStrategy(Strategy):
                 seen_events=self._seen_auto_redeem_events,
                 seen_order=self._seen_auto_redeem_event_order,
                 pending_events=self._pending_auto_redeem_events,
+                pending_actual_fills=self._pending_actual_fills,
+                submitted_order_intents=self._submitted_order_intents,
             )
             self._seen_auto_redeem_events = set(state["seen"])
             self._seen_auto_redeem_event_order = list(state["seen_order"])
             self._pending_auto_redeem_events = dict(state["pending"])
+            self._pending_actual_fills = dict(state["pending_actual_fills"])
+            self._submitted_order_intents = dict(state["submitted_order_intents"])
 
     def _try_save_live_trade_ledger(self, context: str) -> bool:
         """Persist the live ledger without propagating framework-callback exceptions."""
@@ -696,6 +1017,8 @@ class IntegratedBTCStrategy(Strategy):
         seen_events,
         seen_order,
         pending_events,
+        pending_actual_fills,
+        submitted_order_intents,
     ) -> Optional[Dict[str, Any]]:
         """Persist a candidate ledger state without propagating framework-callback exceptions."""
         try:
@@ -705,10 +1028,157 @@ class IntegratedBTCStrategy(Strategy):
                 seen_events=seen_events,
                 seen_order=seen_order,
                 pending_events=pending_events,
+                pending_actual_fills=pending_actual_fills,
+                submitted_order_intents=submitted_order_intents,
             )
         except SettlementLedgerError as exc:
             logger.error(f"{context}; live trading blocked until ledger is repaired: {exc}")
             return None
+
+    def _apply_saved_live_trade_ledger_state(self, state: Dict[str, Any]) -> None:
+        """Replace mutable settlement state with a successfully persisted state."""
+        self._open_live_trades = dict(state["open"])
+        self._settled_live_trades = list(state["settled"])
+        self._seen_auto_redeem_events = set(state["seen"])
+        self._seen_auto_redeem_event_order = list(state["seen_order"])
+        self._pending_auto_redeem_events = dict(state["pending"])
+        self._pending_actual_fills = dict(state["pending_actual_fills"])
+        self._submitted_order_intents = dict(state["submitted_order_intents"])
+
+    def _validate_live_trade_ledger_schema_locked(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Reject ledgers that are not already in the current schema."""
+        schema_version = data.get("ledger_schema_version")
+        if schema_version != LIVE_TRADE_LEDGER_SCHEMA_VERSION:
+            raise SettlementLedgerError(
+                f"live trade ledger schema_version must be {LIVE_TRADE_LEDGER_SCHEMA_VERSION}; "
+                f"found {schema_version!r}. Replace it with a current schema v3 ledger before startup."
+            )
+        self._validate_live_trade_ledger_core_sections(data)
+        return data
+
+    def _validate_live_trade_ledger_core_sections(self, data: Dict[str, Any]) -> None:
+        for section in (
+            "open",
+            "settled",
+            "seen_auto_redeem_events",
+            "pending_auto_redeem_events",
+            "pending_actual_fills",
+            "submitted_order_intents",
+        ):
+            if section not in data:
+                raise SettlementLedgerError(f"live trade ledger missing required section: {section}")
+        if not isinstance(data["open"], dict):
+            raise SettlementLedgerError("live trade ledger open section must be a JSON object")
+        if not isinstance(data["settled"], list):
+            raise SettlementLedgerError("live trade ledger settled section must be a JSON list")
+        if not isinstance(data["seen_auto_redeem_events"], list):
+            raise SettlementLedgerError("seen_auto_redeem_events must be a JSON list")
+        if not isinstance(data["pending_auto_redeem_events"], dict):
+            raise SettlementLedgerError("pending_auto_redeem_events must be a JSON object")
+        if not isinstance(data["pending_actual_fills"], dict):
+            raise SettlementLedgerError("pending_actual_fills must be a JSON object")
+        if not isinstance(data["submitted_order_intents"], dict):
+            raise SettlementLedgerError("submitted_order_intents must be a JSON object")
+        for order_id, meta in data["open"].items():
+            if not isinstance(meta, dict):
+                raise SettlementLedgerError(f"live trade ledger open[{order_id}] must be a JSON object")
+        for index, trade in enumerate(data["settled"]):
+            if not isinstance(trade, dict):
+                raise SettlementLedgerError(f"live trade ledger settled[{index}] must be a JSON object")
+        for event_key, payload in data["pending_auto_redeem_events"].items():
+            if not isinstance(payload, dict):
+                raise SettlementLedgerError(f"pending_auto_redeem_events[{event_key}] must be a JSON object")
+        for order_id, pending in data["pending_actual_fills"].items():
+            if not isinstance(pending, dict):
+                raise SettlementLedgerError(f"pending_actual_fills[{order_id}] must be a JSON object")
+            self._validate_pending_actual_fill_aggregate(order_id, pending)
+        for order_id, intent in data["submitted_order_intents"].items():
+            if not isinstance(intent, dict):
+                raise SettlementLedgerError(f"submitted_order_intents[{order_id}] must be a JSON object")
+
+    def _validate_pending_actual_fill_aggregate(self, order_id: str, pending: Dict[str, Any]) -> tuple[Decimal, Decimal, Decimal]:
+        if "filled_qty" in pending:
+            raise SettlementLedgerError(
+                f"pending_actual_fills[{order_id}] scalar filled_qty is not valid; "
+                "current schema requires aggregate fills[]"
+            )
+        fills = pending.get("fills")
+        if not isinstance(fills, list) or not fills:
+            raise SettlementLedgerError(f"pending_actual_fills[{order_id}].fills must be a non-empty JSON list")
+        seen_fill_keys = set()
+        summed_qty = Decimal("0")
+        summed_notional = Decimal("0")
+        for index, fill in enumerate(fills):
+            if not isinstance(fill, dict):
+                raise SettlementLedgerError(f"pending_actual_fills[{order_id}].fills[{index}] must be a JSON object")
+            fill_key = fill.get("fill_key")
+            if fill_key in (None, ""):
+                raise SettlementLedgerError(f"pending_actual_fills[{order_id}].fills[{index}].fill_key is required")
+            fill_key = str(fill_key)
+            if fill_key in seen_fill_keys:
+                raise SettlementLedgerError(f"pending_actual_fills[{order_id}] duplicate fill_key={fill_key}")
+            seen_fill_keys.add(fill_key)
+            try:
+                fill_qty = Decimal(str(fill["filled_qty"]))
+                fill_price = Decimal(str(fill["price"]))
+                fill_notional = Decimal(str(fill["notional"]))
+            except Exception as exc:
+                raise SettlementLedgerError(
+                    f"pending_actual_fills[{order_id}].fills[{index}] has invalid decimal accounting"
+                ) from exc
+            if (
+                not fill_qty.is_finite()
+                or not fill_price.is_finite()
+                or not fill_notional.is_finite()
+                or fill_qty <= 0
+                or fill_price <= 0
+                or fill_price > 1
+                or fill_notional <= 0
+            ):
+                raise SettlementLedgerError(
+                    f"pending_actual_fills[{order_id}].fills[{index}] has impossible accounting"
+                )
+            if abs((fill_qty * fill_price) - fill_notional) > SETTLEMENT_ACCOUNTING_COST_TOLERANCE:
+                raise SettlementLedgerError(
+                    f"pending_actual_fills[{order_id}].fills[{index}] notional is inconsistent"
+                )
+            summed_qty += fill_qty
+            summed_notional += fill_notional
+        try:
+            total_qty = Decimal(str(pending["total_filled_qty"]))
+            total_notional = Decimal(str(pending["total_filled_notional"]))
+            vwap = Decimal(str(pending["vwap"]))
+        except Exception as exc:
+            raise SettlementLedgerError(
+                f"pending_actual_fills[{order_id}] missing or invalid aggregate accounting"
+            ) from exc
+        if (
+            not total_qty.is_finite()
+            or not total_notional.is_finite()
+            or not vwap.is_finite()
+            or total_qty <= 0
+            or total_notional <= 0
+            or vwap <= 0
+            or vwap > 1
+        ):
+            raise SettlementLedgerError(f"pending_actual_fills[{order_id}] has impossible aggregate accounting")
+        if abs(total_qty - summed_qty) > SETTLEMENT_ACCOUNTING_COST_TOLERANCE:
+            raise SettlementLedgerError(f"pending_actual_fills[{order_id}] total_filled_qty does not match fills[]")
+        if abs(total_notional - summed_notional) > SETTLEMENT_ACCOUNTING_COST_TOLERANCE:
+            raise SettlementLedgerError(
+                f"pending_actual_fills[{order_id}] total_filled_notional does not match fills[]"
+            )
+        if abs((total_qty * vwap) - total_notional) > SETTLEMENT_ACCOUNTING_COST_TOLERANCE:
+            raise SettlementLedgerError(f"pending_actual_fills[{order_id}] aggregate vwap is inconsistent")
+        raw_submitted_size = pending.get("submitted_size")
+        if raw_submitted_size not in (None, ""):
+            try:
+                submitted_size = Decimal(str(raw_submitted_size))
+            except Exception as exc:
+                raise SettlementLedgerError(f"pending_actual_fills[{order_id}].submitted_size is invalid") from exc
+            if not submitted_size.is_finite() or submitted_size <= 0:
+                raise SettlementLedgerError(f"pending_actual_fills[{order_id}].submitted_size must be positive")
+        return total_qty, total_notional, vwap
 
     def _load_live_trade_ledger(self) -> None:
         """Load pending live trades from the previous bot process, if any."""
@@ -719,17 +1189,36 @@ class IntegratedBTCStrategy(Strategy):
                 data = json.loads(LIVE_TRADE_LEDGER_PATH.read_text(encoding="utf-8"))
                 if not isinstance(data, dict):
                     raise SettlementLedgerError("live trade ledger root is not a JSON object")
-                self._open_live_trades = dict(data.get("open", {}))
-                self._settled_live_trades = list(data.get("settled", []))
-                self._seen_auto_redeem_event_order = list(data.get("seen_auto_redeem_events", []))
+                data = self._validate_live_trade_ledger_schema_locked(data)
+                self._validate_live_trade_ledger_core_sections(data)
+                self._open_live_trades = dict(data["open"])
+                self._settled_live_trades = list(data["settled"])
+                self._seen_auto_redeem_event_order = list(data["seen_auto_redeem_events"])
                 self._seen_auto_redeem_events = set(self._seen_auto_redeem_event_order)
                 if (
                     set(self._seen_auto_redeem_event_order) != self._seen_auto_redeem_events
                     or len(self._seen_auto_redeem_event_order) != len(self._seen_auto_redeem_events)
                 ):
                     raise SettlementLedgerError("seen auto_redeem event index is inconsistent")
-                self._pending_auto_redeem_events = dict(data.get("pending_auto_redeem_events", {}))
-                self._prune_pending_auto_redeem_events_locked(datetime.now(timezone.utc))
+                self._pending_auto_redeem_events = dict(data["pending_auto_redeem_events"])
+                for event_key, payload in self._pending_auto_redeem_events.items():
+                    if not isinstance(payload, dict):
+                        raise SettlementLedgerError(
+                            f"pending_auto_redeem_events[{event_key}] must be a JSON object"
+                        )
+                pending_actual_fills = data.get("pending_actual_fills")
+                if not isinstance(pending_actual_fills, dict):
+                    raise SettlementLedgerError("pending_actual_fills must be a JSON object")
+                self._pending_actual_fills = dict(pending_actual_fills)
+                for order_id, pending in self._pending_actual_fills.items():
+                    if not isinstance(pending, dict):
+                        raise SettlementLedgerError(
+                            f"pending_actual_fills[{order_id}] must be a JSON object"
+                        )
+                submitted_order_intents = data.get("submitted_order_intents")
+                if not isinstance(submitted_order_intents, dict):
+                    raise SettlementLedgerError("submitted_order_intents must be a JSON object")
+                self._submitted_order_intents = dict(submitted_order_intents)
                 if self._open_live_trades:
                     logger.info(
                         f"Loaded live settlement ledger from {LIVE_TRADE_LEDGER_PATH.name}: "
@@ -745,16 +1234,31 @@ class IntegratedBTCStrategy(Strategy):
         with self._settlement_lock:
             open_items = list(self._open_live_trades.items())
         for order_id, meta in open_items:
+            direction_raw = str(meta.get("direction") or "").lower()
+            if direction_raw not in {"long", "short"}:
+                reason = f"open live trade {order_id} has invalid direction for risk rehydrate: {meta.get('direction')!r}"
+                self._block_live_settlement_ledger(reason)
+                self._release_live_trade_ledger_lock()
+                raise SettlementLedgerError(reason)
+            try:
+                size, _filled_qty, entry_price = self._settlement_accounting_values(order_id, meta)
+            except SettlementLedgerError as exc:
+                self._block_live_settlement_ledger(str(exc))
+                self._release_live_trade_ledger_lock()
+                raise
             try:
                 self.risk_engine.add_position(
                     position_id=order_id,
-                    size=Decimal(str(meta.get("size", "0"))),
-                    entry_price=Decimal(str(meta.get("entry_price", "1"))),
-                    direction="buy_yes" if meta.get("direction") == "long" else "buy_no",
+                    size=size,
+                    entry_price=entry_price,
+                    direction="buy_yes" if direction_raw == "long" else "buy_no",
                     count_trade=False,
                 )
-            except Exception as e:
-                logger.warning(f"Failed to restore open settlement risk for {order_id}: {e}")
+            except Exception as exc:
+                reason = f"failed to restore open settlement risk for {order_id}: {exc}"
+                self._block_live_settlement_ledger(reason)
+                self._release_live_trade_ledger_lock()
+                raise SettlementLedgerError(reason) from exc
 
     def _rehydrate_settled_daily_risk(self) -> None:
         """Restore same-day realized settlement P&L after a process restart."""
@@ -766,20 +1270,50 @@ class IntegratedBTCStrategy(Strategy):
             settled_items = list(self._settled_live_trades)
 
         for trade in settled_items:
+            unresolved = (
+                trade.get("needs_reconciliation") is True
+                or trade.get("settlement_source") == "SETTLEMENT_UNKNOWN"
+            )
             settled_at = self._parse_utc_datetime(trade.get("settled_at"))
-            if not settled_at or settled_at.astimezone().date() != today:
+            if settled_at is None:
+                if unresolved:
+                    continue
+                order_id = trade.get("order_id", "<unknown>")
+                reason = f"settled trade {order_id} missing valid settled_at for daily risk rehydrate"
+                self._block_live_settlement_ledger(reason)
+                raise SettlementLedgerError(reason)
+            if settled_at.astimezone().date() != today:
+                continue
+            if unresolved:
                 continue
             pnl_value = trade.get("pnl")
             if pnl_value in (None, "", "UNKNOWN"):
-                continue
+                order_id = trade.get("order_id", "<unknown>")
+                reason = f"settled trade {order_id} missing verified pnl for daily risk rehydrate"
+                self._block_live_settlement_ledger(reason)
+                raise SettlementLedgerError(reason)
             try:
-                daily_pnl += Decimal(str(pnl_value))
-                daily_trades += 1
-            except Exception:
-                continue
+                parsed_pnl = Decimal(str(pnl_value))
+            except Exception as exc:
+                order_id = trade.get("order_id", "<unknown>")
+                reason = f"settled trade {order_id} has invalid pnl for daily risk rehydrate: {pnl_value!r}"
+                self._block_live_settlement_ledger(reason)
+                raise SettlementLedgerError(reason) from exc
+            if not parsed_pnl.is_finite():
+                order_id = trade.get("order_id", "<unknown>")
+                reason = f"settled trade {order_id} has non-finite pnl for daily risk rehydrate: {pnl_value!r}"
+                self._block_live_settlement_ledger(reason)
+                raise SettlementLedgerError(reason)
+            daily_pnl += parsed_pnl
+            daily_trades += 1
 
-        if daily_trades and hasattr(self.risk_engine, "restore_daily_stats"):
-            self.risk_engine.restore_daily_stats(daily_pnl, daily_trades)
+        if daily_trades:
+            restore_daily_stats = getattr(self.risk_engine, "restore_daily_stats", None)
+            if not callable(restore_daily_stats):
+                reason = "risk engine missing restore_daily_stats for settled daily risk rehydrate"
+                self._block_live_settlement_ledger(reason)
+                raise SettlementLedgerError(reason)
+            restore_daily_stats(daily_pnl, daily_trades)
 
     def _unresolved_settlement_unknowns(self) -> List[Dict[str, Any]]:
         """Return settled records that still need manual or REST reconciliation."""
@@ -790,6 +1324,47 @@ class IntegratedBTCStrategy(Strategy):
                 if trade.get("needs_reconciliation") is True
                 or trade.get("settlement_source") == "SETTLEMENT_UNKNOWN"
             ]
+            for order_id, payload in self._pending_actual_fills.items():
+                unresolved.append(
+                    {
+                        "order_id": str(order_id),
+                        "settlement_source": "PENDING_ACTUAL_FILL",
+                        "needs_reconciliation": True,
+                        "unknown_reason": payload.get("_pending_reason"),
+                    }
+            )
+            for order_id, payload in self._submitted_order_intents.items():
+                if not isinstance(payload, dict):
+                    unresolved.append(
+                        {
+                            "order_id": str(order_id),
+                            "settlement_source": "SUBMITTED_ORDER_INTENT",
+                            "needs_reconciliation": True,
+                            "unknown_reason": "submitted intent ledger entry is not a JSON object",
+                        }
+                    )
+                    continue
+                status = payload.get("status")
+                if (
+                    status == "SUBMISSION_NOT_SEEN"
+                    and payload.get("needs_reconciliation") is not True
+                    and self._submission_not_seen_evidence_is_valid(payload)
+                ):
+                    continue
+                if (
+                    status in TERMINAL_NO_FILL_INTENT_STATUSES
+                    and payload.get("needs_reconciliation") is not True
+                    and self._terminal_no_fill_evidence_is_valid(payload)
+                ):
+                    continue
+                unresolved.append(
+                    {
+                        "order_id": str(order_id),
+                        "settlement_source": "SUBMITTED_ORDER_INTENT",
+                        "needs_reconciliation": True,
+                        "unknown_reason": payload.get("intent_reason") or "submitted intent unresolved",
+                    }
+                )
             if self._settlement_ledger_blocked_reason:
                 unresolved.append(
                     {
@@ -800,6 +1375,336 @@ class IntegratedBTCStrategy(Strategy):
                     }
                 )
             return unresolved
+
+    def _submission_not_seen_evidence_is_valid(self, payload: Dict[str, Any]) -> bool:
+        if payload.get("submission_not_seen_reason") in (None, ""):
+            return False
+        return self._parse_utc_datetime(payload.get("submission_not_seen_at")) is not None
+
+    def _terminal_no_fill_evidence_is_valid(self, payload: Dict[str, Any]) -> bool:
+        evidence = payload.get("terminal_no_fill_zero_quantity_evidence")
+        if not isinstance(evidence, dict) or not evidence:
+            return False
+        allowed_keys = {"last_qty", "filled_qty", "filled"}
+        if any(key not in allowed_keys for key in evidence):
+            return False
+        for value in evidence.values():
+            try:
+                parsed = Decimal(str(value))
+            except Exception:
+                return False
+            if not parsed.is_finite() or parsed != 0:
+                return False
+        return True
+
+    def _actual_fill_reconciliation_order_id(self, client_order_id, payload: Dict[str, Any]) -> Optional[str]:
+        """Return the real client order id for an actual-fill payload, if present."""
+        if client_order_id not in (None, ""):
+            normalized = str(client_order_id)
+            normalized_lower = normalized.lower()
+            venue_order_id = payload.get("venue_order_id")
+            inferred_venue_order_id = None
+            if normalized_lower.startswith("venue:"):
+                inferred_venue_order_id = normalized.split(":", 1)[1]
+            elif normalized_lower.startswith("0x"):
+                inferred_venue_order_id = normalized
+            if normalized_lower.startswith("venue:") or normalized_lower.startswith("0x") or (
+                venue_order_id not in (None, "") and normalized.lower() == str(venue_order_id).lower()
+            ):
+                if (
+                    inferred_venue_order_id not in (None, "")
+                    and venue_order_id not in (None, "")
+                    and str(venue_order_id).lower() != str(inferred_venue_order_id).lower()
+                ):
+                    reason = (
+                        f"venue-like client_order_id={normalized!r} conflicts with "
+                        f"payload venue_order_id={venue_order_id!r}"
+                    )
+                    self._block_live_settlement_ledger(reason)
+                    raise SettlementLedgerError(reason)
+                reason = f"venue-like client_order_id={normalized!r} is not a valid client order selector"
+                self._block_live_settlement_ledger(reason)
+                raise SettlementLedgerError(reason)
+            return normalized
+        venue_order_id = payload.get("venue_order_id")
+        if venue_order_id in (None, ""):
+            logger.warning(
+                "actual-fill callback has neither client_order_id nor venue_order_id; "
+                "rejecting unselectable evidence: %r",
+                payload,
+            )
+        return None
+
+    def _validated_effective_venue_order_id(
+        self,
+        order_id: Optional[str],
+        payload_venue_order_id,
+        source_meta: Dict[str, Any],
+        ignore_pending_order_id: Optional[str] = None,
+    ) -> Optional[str]:
+        payload_venue = None if payload_venue_order_id in (None, "") else str(payload_venue_order_id)
+        source_venue = None if source_meta.get("venue_order_id") in (None, "") else str(source_meta.get("venue_order_id"))
+        if payload_venue is not None and source_venue is not None and payload_venue.lower() != source_venue.lower():
+            reason = (
+                f"venue_order_id mismatch for {order_id}: payload={payload_venue!r} "
+                f"tracked={source_venue!r}"
+            )
+            self._block_live_settlement_ledger(reason)
+            raise SettlementLedgerError(reason)
+        effective_venue = payload_venue or source_venue
+        if effective_venue is None:
+            return None
+
+        normalized_venue = effective_venue.lower()
+        conflicting_open = [
+            str(open_order_id)
+            for open_order_id, open_trade in self._open_live_trades.items()
+            if str(open_order_id) != str(order_id)
+            and isinstance(open_trade, dict)
+            and str(open_trade.get("venue_order_id") or "").lower() == normalized_venue
+        ]
+        if conflicting_open:
+            reason = (
+                f"venue_order_id={effective_venue} already belongs to open trade(s): "
+                + ", ".join(conflicting_open)
+            )
+            self._block_live_settlement_ledger(reason)
+            raise SettlementLedgerError(reason)
+
+        if any(
+            str(trade.get("venue_order_id") or "").lower() == normalized_venue
+            for trade in self._settled_live_trades
+        ):
+            reason = f"SETTLEMENT_UNKNOWN/order record already exists for venue_order_id={effective_venue}"
+            self._block_live_settlement_ledger(reason)
+            raise SettlementLedgerError(reason)
+
+        if any(
+            str(pending_order_id) != str(ignore_pending_order_id)
+            and isinstance(pending, dict)
+            and str(pending.get("venue_order_id") or "").lower() == normalized_venue
+            for pending_order_id, pending in self._pending_actual_fills.items()
+        ):
+            reason = f"pending actual-fill record already exists for venue_order_id={effective_venue}"
+            self._block_live_settlement_ledger(reason)
+            raise SettlementLedgerError(reason)
+
+        return effective_venue
+
+    def _create_durable_settlement_unknown_from_actual_fill(
+        self,
+        client_order_id,
+        payload: Dict[str, Any],
+        reason: str,
+        ignore_pending_order_id: Optional[str] = None,
+        skip_venue_validation: bool = False,
+        canonical_pending_venue_order_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Create a durable SETTLEMENT_UNKNOWN from adapter-observed fill data."""
+        with self._settlement_lock:
+            payload = dict(payload or {})
+            order_id = self._actual_fill_reconciliation_order_id(client_order_id, payload)
+            venue_order_id = payload.get("venue_order_id")
+            open_order_ids_for_venue = []
+            if not skip_venue_validation and venue_order_id not in (None, ""):
+                normalized_venue = str(venue_order_id).lower()
+                open_order_ids_for_venue = [
+                    str(open_order_id)
+                    for open_order_id, open_trade in self._open_live_trades.items()
+                    if isinstance(open_trade, dict)
+                    and str(open_trade.get("venue_order_id") or "").lower() == normalized_venue
+                ]
+                if order_id is None and open_order_ids_for_venue:
+                    if len(open_order_ids_for_venue) != 1:
+                        reason_open = (
+                            f"venue_order_id={venue_order_id} matches multiple open trades: "
+                            + ", ".join(open_order_ids_for_venue)
+                        )
+                        self._block_live_settlement_ledger(reason_open)
+                        raise SettlementLedgerError(reason_open)
+                    order_id = open_order_ids_for_venue[0]
+                elif order_id is not None:
+                    conflicting_open = [
+                        open_order_id
+                        for open_order_id in open_order_ids_for_venue
+                        if open_order_id != order_id
+                    ]
+                    if conflicting_open:
+                        reason_open = (
+                            f"venue_order_id={venue_order_id} already belongs to open trade(s): "
+                            + ", ".join(conflicting_open)
+                        )
+                        self._block_live_settlement_ledger(reason_open)
+                        raise SettlementLedgerError(reason_open)
+            source_meta = {}
+            source_open_trade = {}
+            malformed_submitted_order_intent = None
+            if order_id is not None:
+                raw_open_trade = self._open_live_trades.get(order_id)
+                source_open_trade = raw_open_trade if isinstance(raw_open_trade, dict) else {}
+                submitted_intent_meta = self._submitted_order_intents.get(order_id)
+                if submitted_intent_meta is not None and not isinstance(submitted_intent_meta, dict):
+                    malformed_submitted_order_intent = copy.deepcopy(submitted_intent_meta)
+                    submitted_intent_meta = {}
+                source_meta = (
+                    self._submitted_positions.get(order_id)
+                    or source_open_trade
+                    or submitted_intent_meta
+                    or {}
+                )
+                if not isinstance(source_meta, dict):
+                    source_meta = {}
+            if canonical_pending_venue_order_id not in (None, ""):
+                effective_venue_order_id = str(canonical_pending_venue_order_id)
+            elif skip_venue_validation:
+                effective_venue_order_id = None
+            else:
+                effective_venue_order_id = self._validated_effective_venue_order_id(
+                    order_id,
+                    venue_order_id,
+                    source_meta,
+                    ignore_pending_order_id=ignore_pending_order_id,
+                )
+            if order_id is None and effective_venue_order_id in (None, ""):
+                reason_no_selector = (
+                    "actual-fill callback has neither usable client_order_id nor venue_order_id; "
+                    "cannot create selectable SETTLEMENT_UNKNOWN"
+                )
+                self._block_live_settlement_ledger(reason_no_selector)
+                raise SettlementLedgerError(reason_no_selector)
+            duplicate = False
+            if order_id is not None:
+                duplicate = any(
+                    str(trade.get("order_id") or "") == order_id
+                    for trade in self._settled_live_trades
+                )
+            if duplicate:
+                duplicate_reason = f"SETTLEMENT_UNKNOWN/order record already exists for {order_id}"
+                self._block_live_settlement_ledger(duplicate_reason)
+                raise SettlementLedgerError(duplicate_reason)
+            submitted_size = payload.get("submitted_size")
+            if submitted_size is None:
+                submitted_size = source_meta.get("submitted_size")
+
+            allow_verified_accounting = payload.get("requires_external_fill_repair") is not True
+            actual_filled_qty = None
+            actual_fill_vwap = None
+            if allow_verified_accounting:
+                try:
+                    actual_filled_qty = Decimal(str(payload["filled_qty"]))
+                    actual_fill_vwap = Decimal(str(payload["vwap"]))
+                except Exception:
+                    actual_filled_qty = None
+                    actual_fill_vwap = None
+            has_positive_actual_fill = (
+                actual_filled_qty is not None
+                and actual_fill_vwap is not None
+                and actual_filled_qty.is_finite()
+                and actual_fill_vwap.is_finite()
+                and actual_filled_qty > 0
+                and actual_fill_vwap > 0
+                and actual_fill_vwap <= Decimal("1")
+            )
+            actual_fill_notional = (
+                actual_filled_qty * actual_fill_vwap
+                if has_positive_actual_fill
+                else None
+            )
+
+            def _positive_decimal_from_meta(value):
+                if value in (None, ""):
+                    return None
+                try:
+                    parsed = Decimal(str(value))
+                except Exception:
+                    return None
+                if not parsed.is_finite() or parsed <= 0:
+                    return None
+                return parsed
+
+            open_filled_qty = _positive_decimal_from_meta(source_open_trade.get("filled_qty"))
+            open_entry_price = _positive_decimal_from_meta(source_open_trade.get("entry_price"))
+            open_filled_notional = _positive_decimal_from_meta(source_open_trade.get("filled_notional"))
+            open_accounting_size = _positive_decimal_from_meta(source_open_trade.get("size"))
+            has_positive_open_fill = (
+                allow_verified_accounting
+                and open_filled_qty is not None
+                and open_entry_price is not None
+                and open_filled_notional is not None
+                and open_accounting_size is not None
+                and open_entry_price <= 1
+                and abs(open_filled_notional - open_accounting_size)
+                <= SETTLEMENT_ACCOUNTING_COST_TOLERANCE
+                and self._settlement_accounting_cost_is_consistent(
+                    open_accounting_size,
+                    open_filled_qty,
+                    open_entry_price,
+                )
+            )
+            accounting_size = actual_fill_notional if has_positive_actual_fill else (
+                open_accounting_size if has_positive_open_fill else None
+            )
+
+            record = {
+                "settlement_source": "SETTLEMENT_UNKNOWN",
+                "needs_reconciliation": True,
+                "payout": "UNKNOWN",
+                "pnl": "UNKNOWN",
+                "order_id": order_id,
+                "client_order_id": str(client_order_id) if client_order_id not in (None, "") else None,
+                "venue_order_id": effective_venue_order_id,
+                "condition_id": payload.get("condition_id", source_meta.get("condition_id")),
+                "token_id": payload.get("token_id", source_meta.get("token_id")),
+                "slug": payload.get("slug", source_meta.get("slug")),
+                "direction": payload.get("direction", source_meta.get("direction")),
+                "trade_label": payload.get("trade_label", source_meta.get("trade_label")),
+                "submitted_at": payload.get("submitted_at", source_meta.get("submitted_at")),
+                "unknown_reason": reason,
+                "raw_callback_payload": payload,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if accounting_size is not None:
+                record["size"] = accounting_size
+            if skip_venue_validation:
+                record["venue_conflict_payload_venue_order_id"] = venue_order_id
+                record["venue_conflict_tracked_venue_order_id"] = source_meta.get("venue_order_id")
+            if submitted_size not in (None, ""):
+                record["submitted_size"] = submitted_size
+            if has_positive_actual_fill:
+                record["filled_qty"] = str(actual_filled_qty)
+                record["entry_price"] = str(actual_fill_vwap)
+                record["filled_notional"] = str(actual_fill_notional)
+            elif has_positive_open_fill:
+                record["filled_qty"] = str(open_filled_qty)
+                record["entry_price"] = str(open_entry_price)
+                record["filled_notional"] = str(open_filled_notional)
+            if order_id is not None and order_id in self._submitted_order_intents:
+                submitted_intent = self._submitted_order_intents[order_id]
+                if isinstance(submitted_intent, dict):
+                    record["submitted_order_intent"] = copy.deepcopy(submitted_intent)
+                else:
+                    record["submitted_order_intent_malformed"] = True
+                    record["submitted_order_intent_raw"] = copy.deepcopy(malformed_submitted_order_intent)
+            settled_trades = list(self._settled_live_trades)
+            settled_trades.append(record)
+            open_trades = dict(self._open_live_trades)
+            pending_actual_fills = dict(self._pending_actual_fills)
+            submitted_order_intents = dict(self._submitted_order_intents)
+            if order_id is not None:
+                open_trades.pop(order_id, None)
+                pending_actual_fills.pop(order_id, None)
+                submitted_order_intents.pop(order_id, None)
+            saved_state = self._save_live_trade_ledger_state(
+                open_trades=open_trades,
+                settled_trades=settled_trades,
+                seen_events=self._seen_auto_redeem_events,
+                seen_order=self._seen_auto_redeem_event_order,
+                pending_events=self._pending_auto_redeem_events,
+                pending_actual_fills=pending_actual_fills,
+                submitted_order_intents=submitted_order_intents,
+            )
+            self._apply_saved_live_trade_ledger_state(saved_state)
+            return order_id
 
     def _current_market_metadata(self) -> Dict[str, Any]:
         """Return the current market metadata, if loaded."""
@@ -825,10 +1730,14 @@ class IntegratedBTCStrategy(Strategy):
         if not value:
             return None
         if isinstance(value, datetime):
-            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+            if value.tzinfo is None or value.utcoffset() is None:
+                return None
+            return value.astimezone(timezone.utc)
         try:
             parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                return None
+            return parsed.astimezone(timezone.utc)
         except Exception:
             return None
 
@@ -891,11 +1800,133 @@ class IntegratedBTCStrategy(Strategy):
 
     def _trade_payout_units(self, meta: Dict[str, Any]) -> Decimal:
         """Maximum possible payout units for this bot trade."""
+        raw_units = meta.get("filled_qty")
+        if raw_units in (None, ""):
+            return Decimal("0")
         try:
-            units = Decimal(str(meta.get("filled_qty") or meta.get("estimated_tokens") or "0"))
+            units = Decimal(str(raw_units))
         except Exception:
             units = Decimal("0")
+        if not units.is_finite():
+            return Decimal("0")
         return max(units, Decimal("0"))
+
+    def _settlement_accounting_cost_is_consistent(
+        self,
+        size: Decimal,
+        filled_qty: Decimal,
+        entry_price: Decimal,
+    ) -> bool:
+        """Validate stored cost basis against explicit fill units and entry price."""
+        expected_size = filled_qty * entry_price
+        return abs(size - expected_size) <= SETTLEMENT_ACCOUNTING_COST_TOLERANCE
+
+    def _settlement_accounting_values(
+        self,
+        order_id: str,
+        meta: Dict[str, Any],
+    ) -> tuple[Decimal, Decimal, Decimal]:
+        """Return verified settlement cost, units, and entry price or fail closed."""
+        try:
+            size = Decimal(str(meta["size"]))
+        except Exception as exc:
+            raise SettlementLedgerError(
+                f"{order_id} missing verified settlement size/cost basis"
+            ) from exc
+        if not size.is_finite() or size <= 0:
+            raise SettlementLedgerError(
+                f"{order_id} has invalid settlement size/cost basis: {meta.get('size')!r}"
+            )
+
+        try:
+            filled_qty = Decimal(str(meta["filled_qty"]))
+        except Exception as exc:
+            raise SettlementLedgerError(
+                f"{order_id} missing verified filled_qty"
+            ) from exc
+        if not filled_qty.is_finite() or filled_qty <= 0:
+            raise SettlementLedgerError(
+                f"{order_id} has invalid filled_qty: {meta.get('filled_qty')!r}"
+            )
+
+        raw_entry = meta.get("entry_price")
+        if raw_entry in (None, ""):
+            raise SettlementLedgerError(
+                f"{order_id} missing verified entry_price"
+            )
+        try:
+            entry_price = Decimal(str(raw_entry))
+        except Exception as exc:
+            raise SettlementLedgerError(
+                f"{order_id} has invalid entry_price: {raw_entry!r}"
+            ) from exc
+        if not entry_price.is_finite() or entry_price <= 0 or entry_price > 1:
+            raise SettlementLedgerError(
+                f"{order_id} has invalid entry_price: {raw_entry!r}"
+            )
+        if not self._settlement_accounting_cost_is_consistent(size, filled_qty, entry_price):
+            expected_size = filled_qty * entry_price
+            raise SettlementLedgerError(
+                f"{order_id} has inconsistent settlement accounting: "
+                f"size={size} filled_qty={filled_qty} entry_price={entry_price} "
+                f"expected_size={expected_size}"
+            )
+        raw_filled_notional = meta.get("filled_notional")
+        if raw_filled_notional in (None, ""):
+            raise SettlementLedgerError(
+                f"{order_id} missing verified filled_notional"
+            )
+        try:
+            filled_notional = Decimal(str(raw_filled_notional))
+        except Exception as exc:
+            raise SettlementLedgerError(
+                f"{order_id} has invalid filled_notional: {raw_filled_notional!r}"
+            ) from exc
+        if (
+            not filled_notional.is_finite()
+            or filled_notional <= 0
+            or abs(filled_notional - size) > SETTLEMENT_ACCOUNTING_COST_TOLERANCE
+        ):
+            raise SettlementLedgerError(
+                f"{order_id} has inconsistent filled_notional: {raw_filled_notional!r}"
+            )
+        return size, filled_qty, entry_price
+
+    def _settlement_entry_time(self, order_id: str, meta: Dict[str, Any]) -> datetime:
+        """Return the verified entry timestamp for settlement accounting."""
+        for field in ("filled_at", "submitted_at"):
+            parsed = self._parse_utc_datetime(meta.get(field))
+            if parsed is not None:
+                return parsed
+        raise SettlementLedgerError(
+            f"{order_id} missing verified filled_at/submitted_at for settlement accounting"
+        )
+
+    def _settlement_trade_direction(self, order_id: str, meta: Dict[str, Any]) -> str:
+        """Return the verified live-trade direction for settlement accounting."""
+        direction = str(meta.get("direction") or "").lower()
+        if direction not in {"long", "short"}:
+            raise SettlementLedgerError(
+                f"{order_id} has invalid direction for settlement accounting: {meta.get('direction')!r}"
+            )
+        return direction
+
+    def _settlement_accounting_gap_reason(
+        self,
+        matches: List[tuple[str, Dict[str, Any]]],
+    ) -> Optional[str]:
+        """Describe missing accounting that prevents settlement P&L from being booked."""
+        gaps = []
+        for order_id, meta in matches:
+            try:
+                self._settlement_accounting_values(order_id, meta)
+                self._settlement_entry_time(order_id, meta)
+                self._settlement_trade_direction(order_id, meta)
+            except SettlementLedgerError as exc:
+                gaps.append(str(exc))
+        if not gaps:
+            return None
+        return "auto_redeem matched trade(s) with missing/invalid settlement accounting: " + "; ".join(gaps)
 
     def _extract_token_id_from_instrument_id(self, instrument_id) -> str:
         """Extract the CLOB token id from a Nautilus Polymarket instrument id."""
@@ -923,6 +1954,17 @@ class IntegratedBTCStrategy(Strategy):
 
         return ""
 
+    def _auto_redeem_payload_fingerprint(self, payload: Dict[str, Any]) -> str:
+        fingerprint_payload = dict(payload)
+        if "amount" in fingerprint_payload:
+            fingerprint_payload["amount"] = self._normalized_auto_redeem_amount_key(fingerprint_payload.get("amount"))
+        payload_json = json.dumps(
+            self._jsonable(fingerprint_payload),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+
     def _auto_redeem_event_key(self, payload: Dict[str, Any]) -> str:
         """Build a dedupe key granular enough for batched redeem transactions."""
         tx_key = str(payload.get("txn_hash") or f"no-tx:{payload.get('timestamp') or ''}")
@@ -933,7 +1975,9 @@ class IntegratedBTCStrategy(Strategy):
             or ""
         )
         amount_key = self._normalized_auto_redeem_amount_key(payload.get("amount"))
-        return "|".join((tx_key, market_key, token_key, amount_key))
+        key_parts = [tx_key, market_key, token_key, amount_key]
+        key_parts.append(f"payload:{self._auto_redeem_payload_fingerprint(payload)}")
+        return "|".join(key_parts)
 
     def _normalized_auto_redeem_amount_key(self, amount) -> str:
         """Normalize decimal-equivalent amount strings for auto_redeem dedupe keys."""
@@ -959,6 +2003,8 @@ class IntegratedBTCStrategy(Strategy):
             "seen": set(self._seen_auto_redeem_events),
             "seen_order": list(self._seen_auto_redeem_event_order),
             "pending": copy.deepcopy(self._pending_auto_redeem_events),
+            "pending_actual_fills": copy.deepcopy(self._pending_actual_fills),
+            "submitted_order_intents": copy.deepcopy(self._submitted_order_intents),
         }
 
     def _restore_settlement_state(self, snapshot: Dict[str, Any]) -> None:
@@ -968,69 +2014,49 @@ class IntegratedBTCStrategy(Strategy):
         self._seen_auto_redeem_events = set(snapshot["seen"])
         self._seen_auto_redeem_event_order = list(snapshot["seen_order"])
         self._pending_auto_redeem_events = copy.deepcopy(snapshot["pending"])
-
-    def _keep_auto_redeem_pending_after_failed_save(
-        self,
-        event_key: str,
-        payload: Dict[str, Any],
-        reason: str,
-    ) -> None:
-        """Keep a redeem retryable in memory when the durable ledger write failed."""
-        pending_payload = dict(payload)
-        pending_payload["_pending_since"] = (
-            pending_payload.get("_pending_since")
-            or datetime.now(timezone.utc).isoformat()
-        )
-        pending_payload["_pending_reason"] = reason
-        self._pending_auto_redeem_events[event_key] = pending_payload
+        self._pending_actual_fills = copy.deepcopy(snapshot["pending_actual_fills"])
+        self._submitted_order_intents = copy.deepcopy(snapshot["submitted_order_intents"])
 
     def _prune_pending_auto_redeem_events(
         self,
         pending_events: Dict[str, Dict[str, Any]],
         now: datetime,
     ) -> int:
-        """Drop stale pending settlement events and enforce the pending-event cap."""
-        dropped = 0
-        normalized: List[tuple[str, datetime]] = []
-
-        for event_key, payload in list(pending_events.items()):
-            pending_since = self._parse_utc_datetime(payload.get("_pending_since"))
-            if pending_since is None:
-                logger.warning(f"Pending auto_redeem event {event_key} has no valid _pending_since; keeping it")
-                continue
-
-            if now - pending_since > PENDING_AUTO_REDEEM_RETENTION:
-                pending_events.pop(event_key, None)
-                dropped += 1
-                continue
-
-            normalized.append((event_key, pending_since))
-
-        if len(normalized) > MAX_PENDING_AUTO_REDEEM_EVENTS:
-            keep = {
-                event_key
-                for event_key, _pending_since in sorted(
-                    normalized,
-                    key=lambda item: item[1],
-                    reverse=True,
-                )[:MAX_PENDING_AUTO_REDEEM_EVENTS]
-            }
-            for event_key in list(pending_events):
-                if event_key not in keep:
-                    pending_events.pop(event_key, None)
-                    dropped += 1
-
-        if dropped:
-            logger.warning(
-                f"Dropped {dropped} stale/excess pending auto_redeem event(s); "
-                f"remaining={len(pending_events)}"
-            )
-
-        return dropped
+        """Preserve pending settlement events; they are durable audit records."""
+        return 0
 
     def _prune_pending_auto_redeem_events_locked(self, now: datetime) -> int:
-        """Drop stale pending settlement events from current bot state."""
+        """Preserve pending settlement events in current bot state."""
         return self._prune_pending_auto_redeem_events(self._pending_auto_redeem_events, now)
+
+    def _pending_auto_redeem_payload_matches(
+        self,
+        existing_payload: Dict[str, Any],
+        payload: Dict[str, Any],
+        reason: str,
+    ) -> bool:
+        existing_core = dict(existing_payload)
+        existing_reason = existing_core.pop("_pending_reason", None)
+        existing_core.pop("_pending_since", None)
+        return (
+            existing_reason == reason
+            and self._jsonable(existing_core) == self._jsonable(dict(payload))
+        )
+
+    def _pending_auto_redeem_collision_key(
+        self,
+        event_key: str,
+        payload: Dict[str, Any],
+        reason: str,
+    ) -> str:
+        fingerprint_payload = {
+            "payload": self._jsonable(dict(payload)),
+            "reason": reason,
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return f"{event_key}|collision:{fingerprint}"
 
     def _store_pending_auto_redeem_event(
         self,
@@ -1042,28 +2068,642 @@ class IntegratedBTCStrategy(Strategy):
         pending_payload = dict(payload)
         pending_payload["_pending_since"] = pending_payload.get("_pending_since") or datetime.now(timezone.utc).isoformat()
         pending_payload["_pending_reason"] = reason
-        if event_key in self._pending_auto_redeem_events:
-            logger.debug(f"Overwriting existing pending auto_redeem event {event_key}")
-        self._pending_auto_redeem_events[event_key] = pending_payload
+        pending_events = dict(self._pending_auto_redeem_events)
+        storage_key = event_key
+        existing_payload = pending_events.get(storage_key)
+        if existing_payload is not None:
+            if self._pending_auto_redeem_payload_matches(existing_payload, payload, reason):
+                logger.debug(f"Pending auto_redeem event {event_key} is already durably queued")
+                return
+            storage_key = self._pending_auto_redeem_collision_key(event_key, payload, reason)
+            existing_collision = pending_events.get(storage_key)
+            if existing_collision is not None:
+                if self._pending_auto_redeem_payload_matches(existing_collision, payload, reason):
+                    logger.debug(f"Pending auto_redeem collision event {storage_key} is already durably queued")
+                    return
+                raise SettlementLedgerError(f"pending auto_redeem collision key already exists: {storage_key}")
+            logger.warning(
+                f"Preserving colliding pending auto_redeem event under {storage_key}; "
+                f"base_key={event_key}"
+            )
+        pending_events[storage_key] = pending_payload
+        saved_state = self._try_save_live_trade_ledger_state(
+            "Failed to persist pending auto_redeem event",
+            open_trades=self._open_live_trades,
+            settled_trades=self._settled_live_trades,
+            seen_events=self._seen_auto_redeem_events,
+            seen_order=self._seen_auto_redeem_event_order,
+            pending_events=pending_events,
+            pending_actual_fills=self._pending_actual_fills,
+            submitted_order_intents=self._submitted_order_intents,
+        )
+        if saved_state is None:
+            raise SettlementLedgerError(
+                f"failed to persist pending auto_redeem event {storage_key}; event not durably recorded"
+            )
+        self._apply_saved_live_trade_ledger_state(saved_state)
         logger.warning(
             "Stored auto_redeem for retry/reconciliation: "
             f"{reason} (slug={payload.get('slug')}, condition_id={payload.get('condition_id')}, "
             f"amount={payload.get('amount')})"
         )
-        self._try_save_live_trade_ledger("Failed to persist pending auto_redeem event")
 
     def _retry_pending_auto_redeems(self, reason: str) -> None:
         """Retry pending redeem events after fills or settlement-state changes."""
         with self._settlement_lock:
-            dropped = self._prune_pending_auto_redeem_events_locked(datetime.now(timezone.utc))
-            pending_payloads = list(self._pending_auto_redeem_events.values())
-        if dropped:
-            if not self._try_save_live_trade_ledger("Failed to persist pending auto_redeem pruning"):
-                return
+            pending_payloads = [
+                (event_key, copy.deepcopy(payload))
+                for event_key, payload in self._pending_auto_redeem_events.items()
+            ]
         if pending_payloads:
             logger.info(f"Retrying {len(pending_payloads)} pending auto_redeem event(s): {reason}")
-        for payload in pending_payloads:
-            self._handle_auto_redeem_event(payload, store_pending=False)
+        for event_key, payload in pending_payloads:
+            if not isinstance(payload, dict):
+                block_reason = f"pending_auto_redeem_events[{event_key}] must be a JSON object"
+                self._block_live_settlement_ledger(block_reason)
+                raise SettlementLedgerError(block_reason)
+            self._handle_auto_redeem_event(payload, store_pending=False, event_key_override=event_key)
+
+    def _actual_fill_unique_key(self, payload: Dict[str, Any]) -> str:
+        for field in ACTUAL_FILL_UNIQUE_KEY_FIELDS:
+            value = payload.get(field)
+            if value not in (None, ""):
+                return f"{field}:{value}"
+        raise SettlementLedgerError("actual-fill status=ok requires a real unique fill key")
+
+    def _actual_fill_evidence_entry(
+        self,
+        fill_key: str,
+        filled_qty: Decimal,
+        vwap: Decimal,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        return {
+            "fill_key": fill_key,
+            "filled_qty": str(filled_qty),
+            "price": str(vwap),
+            "notional": str(filled_qty * vwap),
+            "raw_callback_payload": copy.deepcopy(payload),
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def _aggregate_actual_fill_entries(self, order_id: str, fills: List[Dict[str, Any]]) -> tuple[Decimal, Decimal, Decimal]:
+        aggregate = {
+            "fills": copy.deepcopy(fills),
+            "total_filled_qty": "0",
+            "total_filled_notional": "0",
+            "vwap": "1",
+        }
+        total_qty = Decimal("0")
+        total_notional = Decimal("0")
+        seen_fill_keys = set()
+        for index, fill in enumerate(fills):
+            if not isinstance(fill, dict):
+                raise SettlementLedgerError(f"pending_actual_fills[{order_id}].fills[{index}] must be a JSON object")
+            fill_key = fill.get("fill_key")
+            if fill_key in (None, ""):
+                raise SettlementLedgerError(f"pending_actual_fills[{order_id}].fills[{index}].fill_key is required")
+            fill_key = str(fill_key)
+            if fill_key in seen_fill_keys:
+                raise SettlementLedgerError(f"pending_actual_fills[{order_id}] duplicate fill_key={fill_key}")
+            seen_fill_keys.add(fill_key)
+            try:
+                fill_qty = Decimal(str(fill["filled_qty"]))
+                fill_price = Decimal(str(fill["price"]))
+                fill_notional = Decimal(str(fill["notional"]))
+            except Exception as exc:
+                raise SettlementLedgerError(
+                    f"pending_actual_fills[{order_id}].fills[{index}] has invalid decimal accounting"
+                ) from exc
+            if (
+                not fill_qty.is_finite()
+                or not fill_price.is_finite()
+                or not fill_notional.is_finite()
+                or fill_qty <= 0
+                or fill_price <= 0
+                or fill_price > 1
+                or fill_notional <= 0
+            ):
+                raise SettlementLedgerError(
+                    f"pending_actual_fills[{order_id}].fills[{index}] has impossible accounting"
+                )
+            if abs((fill_qty * fill_price) - fill_notional) > SETTLEMENT_ACCOUNTING_COST_TOLERANCE:
+                raise SettlementLedgerError(
+                    f"pending_actual_fills[{order_id}].fills[{index}] notional is inconsistent"
+                )
+            total_qty += fill_qty
+            total_notional += fill_notional
+        if total_qty <= 0:
+            raise SettlementLedgerError(f"pending_actual_fills[{order_id}] total_filled_qty must be positive")
+        vwap = total_notional / total_qty
+        aggregate["total_filled_qty"] = str(total_qty)
+        aggregate["total_filled_notional"] = str(total_notional)
+        aggregate["vwap"] = str(vwap)
+        self._validate_pending_actual_fill_aggregate(order_id, aggregate)
+        return total_qty, total_notional, vwap
+
+    def _mark_pending_actual_fill_external_repair(
+        self,
+        order_id,
+        payload: Dict[str, Any],
+        repair_reason: str,
+    ) -> None:
+        if order_id in (None, ""):
+            return
+        order_id = str(order_id)
+        with self._settlement_lock:
+            existing_pending = self._pending_actual_fills.get(order_id)
+            if existing_pending is None:
+                return
+            if not isinstance(existing_pending, dict):
+                block_reason = f"pending_actual_fills[{order_id}] must be a JSON object"
+                self._block_live_settlement_ledger(block_reason)
+                raise SettlementLedgerError(block_reason)
+            if existing_pending.get("requires_external_fill_repair") is True:
+                block_reason = f"pending actual fill for {order_id} already requires external repair"
+                self._block_live_settlement_ledger(block_reason)
+                raise SettlementLedgerError(block_reason)
+            updated_pending = copy.deepcopy(existing_pending)
+            repair_evidence = updated_pending.get("external_fill_repair_evidence", [])
+            if not isinstance(repair_evidence, list):
+                block_reason = (
+                    f"pending_actual_fills[{order_id}].external_fill_repair_evidence "
+                    "must be a JSON list"
+                )
+                self._block_live_settlement_ledger(block_reason)
+                raise SettlementLedgerError(block_reason)
+            repair_evidence.append(
+                {
+                    "reason": repair_reason,
+                    "raw_callback_payload": copy.deepcopy(payload),
+                    "received_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            updated_pending["requires_external_fill_repair"] = True
+            updated_pending["external_fill_repair_reason"] = repair_reason
+            updated_pending["external_fill_repair_evidence"] = repair_evidence
+            pending_actual_fills = dict(self._pending_actual_fills)
+            pending_actual_fills[order_id] = updated_pending
+            saved_state = self._save_live_trade_ledger_state(
+                open_trades=self._open_live_trades,
+                settled_trades=self._settled_live_trades,
+                seen_events=self._seen_auto_redeem_events,
+                seen_order=self._seen_auto_redeem_event_order,
+                pending_events=self._pending_auto_redeem_events,
+                pending_actual_fills=pending_actual_fills,
+                submitted_order_intents=self._submitted_order_intents,
+            )
+            self._apply_saved_live_trade_ledger_state(saved_state)
+            block_reason = (
+                f"actual-fill callback for {order_id} requires external repair: "
+                f"{repair_reason}"
+            )
+            self._block_live_settlement_ledger(block_reason)
+            raise SettlementLedgerError(block_reason)
+
+    def _mark_pending_actual_fill_external_repair_by_venue(
+        self,
+        venue_order_id,
+        payload: Dict[str, Any],
+        repair_reason: str,
+    ) -> None:
+        if venue_order_id in (None, ""):
+            return
+        normalized_venue = str(venue_order_id).lower()
+        with self._settlement_lock:
+            pending_matches = [
+                str(pending_order_id)
+                for pending_order_id, pending in self._pending_actual_fills.items()
+                if isinstance(pending, dict)
+                and str(pending.get("venue_order_id") or "").lower() == normalized_venue
+            ]
+        if len(pending_matches) > 1:
+            block_reason = (
+                f"venue_order_id={venue_order_id} matches multiple pending actual fills: "
+                + ", ".join(pending_matches)
+            )
+            self._block_live_settlement_ledger(block_reason)
+            raise SettlementLedgerError(block_reason)
+        if len(pending_matches) == 1:
+            self._mark_pending_actual_fill_external_repair(
+                pending_matches[0],
+                payload,
+                repair_reason,
+            )
+
+    def _handle_actual_fill(self, client_order_id: str, payload: Dict[str, Any]) -> None:
+        """Handle adapter-observed actual fill details before Nautilus fill delivery."""
+        payload = dict(payload or {})
+        status = payload.get("status")
+        if status == "ok":
+            required = [key for key in ("filled_qty", "vwap") if payload.get(key) in (None, "")]
+            if required:
+                reason = "actual_fill_ok_missing_required_fields:" + ",".join(required)
+                repair_payload = dict(payload)
+                repair_payload["requires_external_fill_repair"] = True
+                repair_payload["external_fill_repair_reason"] = reason
+                self._mark_pending_actual_fill_external_repair(client_order_id, repair_payload, reason)
+                if client_order_id in (None, ""):
+                    self._mark_pending_actual_fill_external_repair_by_venue(
+                        repair_payload.get("venue_order_id"),
+                        repair_payload,
+                        reason,
+                    )
+                self._create_durable_settlement_unknown_from_actual_fill(client_order_id, repair_payload, reason)
+                self._block_live_settlement_ledger(
+                    f"actual-fill callback for {client_order_id} missing {required}; "
+                    "SETTLEMENT_UNKNOWN created"
+                )
+                return
+
+            if client_order_id in (None, ""):
+                reason = "actual_fill_ok_missing_client_order_id"
+                repair_payload = dict(payload)
+                repair_payload["requires_external_fill_repair"] = True
+                repair_payload["external_fill_repair_reason"] = reason
+                self._mark_pending_actual_fill_external_repair_by_venue(
+                    repair_payload.get("venue_order_id"),
+                    repair_payload,
+                    reason,
+                )
+                self._create_durable_settlement_unknown_from_actual_fill(client_order_id, repair_payload, reason)
+                self._block_live_settlement_ledger(
+                    "actual-fill callback status=ok has no client_order_id; "
+                    "SETTLEMENT_UNKNOWN created for external repair"
+                )
+                return
+
+            try:
+                actual_filled_qty = Decimal(str(payload["filled_qty"]))
+                actual_vwap = Decimal(str(payload["vwap"]))
+            except Exception as exc:
+                reason = f"actual_fill_ok_invalid_decimal:{type(exc).__name__}"
+                repair_payload = dict(payload)
+                repair_payload["requires_external_fill_repair"] = True
+                repair_payload["external_fill_repair_reason"] = reason
+                self._mark_pending_actual_fill_external_repair(client_order_id, repair_payload, reason)
+                self._create_durable_settlement_unknown_from_actual_fill(client_order_id, repair_payload, reason)
+                self._block_live_settlement_ledger(
+                    f"actual-fill callback for {client_order_id} has invalid decimal fields; "
+                    "SETTLEMENT_UNKNOWN created"
+                )
+                return
+            if not actual_filled_qty.is_finite() or not actual_vwap.is_finite():
+                reason = "actual_fill_ok_non_finite_qty_or_vwap"
+                repair_payload = dict(payload)
+                repair_payload["requires_external_fill_repair"] = True
+                repair_payload["external_fill_repair_reason"] = reason
+                self._mark_pending_actual_fill_external_repair(client_order_id, repair_payload, reason)
+                self._create_durable_settlement_unknown_from_actual_fill(client_order_id, repair_payload, reason)
+                self._block_live_settlement_ledger(
+                    f"actual-fill callback for {client_order_id} has non-finite "
+                    f"filled_qty={actual_filled_qty} vwap={actual_vwap}; SETTLEMENT_UNKNOWN created"
+                )
+                return
+            if actual_filled_qty <= 0 or actual_vwap <= 0:
+                reason = "actual_fill_ok_non_positive_qty_or_vwap"
+                repair_payload = dict(payload)
+                repair_payload["requires_external_fill_repair"] = True
+                repair_payload["external_fill_repair_reason"] = reason
+                self._mark_pending_actual_fill_external_repair(client_order_id, repair_payload, reason)
+                self._create_durable_settlement_unknown_from_actual_fill(client_order_id, repair_payload, reason)
+                self._block_live_settlement_ledger(
+                    f"actual-fill callback for {client_order_id} has filled_qty={actual_filled_qty} "
+                    f"vwap={actual_vwap}; SETTLEMENT_UNKNOWN created"
+                )
+                return
+            if actual_vwap > 1:
+                reason = "actual_fill_ok_vwap_above_one"
+                repair_payload = dict(payload)
+                repair_payload["requires_external_fill_repair"] = True
+                repair_payload["external_fill_repair_reason"] = reason
+                self._mark_pending_actual_fill_external_repair(client_order_id, repair_payload, reason)
+                self._create_durable_settlement_unknown_from_actual_fill(client_order_id, repair_payload, reason)
+                self._block_live_settlement_ledger(
+                    f"actual-fill callback for {client_order_id} has vwap={actual_vwap}; "
+                    "SETTLEMENT_UNKNOWN created"
+                )
+                return
+
+            order_id = str(client_order_id)
+            with self._settlement_lock:
+                source_meta = self._submitted_positions.get(order_id) or self._open_live_trades.get(order_id)
+                if source_meta is None:
+                    self._mark_pending_actual_fill_external_repair(
+                        order_id,
+                        payload,
+                        "actual_fill_ok_but_no_local_tracking_with_pending_actual_fill",
+                    )
+                    self._create_durable_settlement_unknown_from_actual_fill(
+                        client_order_id=client_order_id,
+                        payload=payload,
+                        reason="actual_fill_ok_but_no_local_tracking",
+                    )
+                    self._block_live_settlement_ledger(
+                        f"actual fill received for untracked {client_order_id}; "
+                        "SETTLEMENT_UNKNOWN created for manual reconciliation"
+                    )
+                    return
+
+                pending_submitted_size = payload.get("submitted_size")
+                if pending_submitted_size is None:
+                    pending_submitted_size = source_meta.get("submitted_size")
+                pending_actual_fills = dict(self._pending_actual_fills)
+                try:
+                    fill_key = self._actual_fill_unique_key(payload)
+                except SettlementLedgerError as exc:
+                    reason = "actual_fill_ok_missing_unique_fill_key"
+                    repair_payload = dict(payload)
+                    repair_payload["requires_external_fill_repair"] = True
+                    repair_payload["external_fill_repair_reason"] = reason
+                    if order_id in pending_actual_fills:
+                        existing_pending = pending_actual_fills[order_id]
+                        if not isinstance(existing_pending, dict):
+                            block_reason = f"pending_actual_fills[{order_id}] must be a JSON object"
+                            self._block_live_settlement_ledger(block_reason)
+                            raise SettlementLedgerError(block_reason) from exc
+                        if existing_pending.get("requires_external_fill_repair") is True:
+                            block_reason = f"pending actual fill for {order_id} already requires external repair"
+                            self._block_live_settlement_ledger(block_reason)
+                            raise SettlementLedgerError(block_reason) from exc
+                        updated_pending = copy.deepcopy(existing_pending)
+                        repair_evidence = updated_pending.get("external_fill_repair_evidence", [])
+                        if not isinstance(repair_evidence, list):
+                            block_reason = (
+                                f"pending_actual_fills[{order_id}].external_fill_repair_evidence "
+                                "must be a JSON list"
+                            )
+                            self._block_live_settlement_ledger(block_reason)
+                            raise SettlementLedgerError(block_reason) from exc
+                        repair_evidence.append(
+                            {
+                                "reason": reason,
+                                "raw_callback_payload": copy.deepcopy(payload),
+                                "received_at": datetime.now(timezone.utc).isoformat(),
+                            }
+                        )
+                        updated_pending["requires_external_fill_repair"] = True
+                        updated_pending["external_fill_repair_reason"] = reason
+                        updated_pending["external_fill_repair_evidence"] = repair_evidence
+                        pending_actual_fills[order_id] = updated_pending
+                        saved_state = self._save_live_trade_ledger_state(
+                            open_trades=self._open_live_trades,
+                            settled_trades=self._settled_live_trades,
+                            seen_events=self._seen_auto_redeem_events,
+                            seen_order=self._seen_auto_redeem_event_order,
+                            pending_events=self._pending_auto_redeem_events,
+                            pending_actual_fills=pending_actual_fills,
+                            submitted_order_intents=self._submitted_order_intents,
+                        )
+                        self._apply_saved_live_trade_ledger_state(saved_state)
+                        self._block_live_settlement_ledger(
+                            f"actual-fill callback for {order_id} is missing a real unique fill key; "
+                            "existing pending actual fill requires external repair"
+                        )
+                        raise SettlementLedgerError(str(exc)) from exc
+                    self._create_durable_settlement_unknown_from_actual_fill(
+                        client_order_id=client_order_id,
+                        payload=repair_payload,
+                        reason=reason,
+                    )
+                    self._block_live_settlement_ledger(
+                        f"actual-fill callback for {order_id} is missing a real unique fill key; "
+                        "SETTLEMENT_UNKNOWN created for external repair"
+                    )
+                    return
+                fill_entry = self._actual_fill_evidence_entry(fill_key, actual_filled_qty, actual_vwap, payload)
+                if order_id in pending_actual_fills:
+                    reason = (
+                        f"duplicate actual-fill callback for {order_id} while a prior "
+                        "pending actual fill is still unconsumed"
+                    )
+                    existing_pending = pending_actual_fills[order_id]
+                    if not isinstance(existing_pending, dict):
+                        block_reason = f"pending_actual_fills[{order_id}] must be a JSON object"
+                        self._block_live_settlement_ledger(block_reason)
+                        raise SettlementLedgerError(block_reason)
+                    if existing_pending.get("requires_external_fill_repair") is True:
+                        block_reason = (
+                            f"pending actual fill for {order_id} already requires external repair; "
+                            "refusing to append additional fill evidence"
+                        )
+                        self._block_live_settlement_ledger(block_reason)
+                        raise SettlementLedgerError(block_reason)
+                    existing_fills = existing_pending.get("fills")
+                    if not isinstance(existing_fills, list):
+                        block_reason = (
+                            f"pending_actual_fills[{order_id}].fills must be a non-empty JSON list"
+                        )
+                        self._block_live_settlement_ledger(block_reason)
+                        raise SettlementLedgerError(block_reason)
+                    existing_keys = {
+                        str(fill.get("fill_key"))
+                        for fill in existing_fills
+                        if isinstance(fill, dict) and fill.get("fill_key") not in (None, "")
+                    }
+                    updated_pending = copy.deepcopy(existing_pending)
+                    if fill_key in existing_keys:
+                        repair_evidence = updated_pending.get("external_fill_repair_evidence", [])
+                        if not isinstance(repair_evidence, list):
+                            block_reason = (
+                                f"pending_actual_fills[{order_id}].external_fill_repair_evidence "
+                                "must be a JSON list"
+                            )
+                            self._block_live_settlement_ledger(block_reason)
+                            raise SettlementLedgerError(block_reason)
+                        repair_evidence.append(
+                            {
+                                "reason": "duplicate_actual_fill_key",
+                                "fill_key": fill_key,
+                                "raw_callback_payload": copy.deepcopy(payload),
+                                "received_at": datetime.now(timezone.utc).isoformat(),
+                            }
+                        )
+                        updated_pending["requires_external_fill_repair"] = True
+                        updated_pending["external_fill_repair_reason"] = "duplicate_actual_fill_key"
+                        updated_pending["external_fill_repair_evidence"] = repair_evidence
+                        pending_actual_fills[order_id] = updated_pending
+                        saved_state = self._save_live_trade_ledger_state(
+                            open_trades=self._open_live_trades,
+                            settled_trades=self._settled_live_trades,
+                            seen_events=self._seen_auto_redeem_events,
+                            seen_order=self._seen_auto_redeem_event_order,
+                            pending_events=self._pending_auto_redeem_events,
+                            pending_actual_fills=pending_actual_fills,
+                            submitted_order_intents=self._submitted_order_intents,
+                        )
+                        self._apply_saved_live_trade_ledger_state(saved_state)
+                        self._block_live_settlement_ledger(reason)
+                        raise SettlementLedgerError(reason)
+                    try:
+                        effective_venue_order_id = self._validated_effective_venue_order_id(
+                            order_id,
+                            payload.get("venue_order_id"),
+                            updated_pending,
+                            ignore_pending_order_id=order_id,
+                        )
+                    except SettlementLedgerError as exc:
+                        repair_evidence = updated_pending.get("external_fill_repair_evidence", [])
+                        if not isinstance(repair_evidence, list):
+                            block_reason = (
+                                f"pending_actual_fills[{order_id}].external_fill_repair_evidence "
+                                "must be a JSON list"
+                            )
+                            self._block_live_settlement_ledger(block_reason)
+                            raise SettlementLedgerError(block_reason) from exc
+                        repair_evidence.append(
+                            {
+                                "reason": "duplicate_actual_fill_venue_conflict",
+                                "fill_key": fill_key,
+                                "venue_conflict_reason": str(exc),
+                                "raw_callback_payload": copy.deepcopy(payload),
+                                "received_at": datetime.now(timezone.utc).isoformat(),
+                            }
+                        )
+                        updated_pending["requires_external_fill_repair"] = True
+                        updated_pending["external_fill_repair_reason"] = "duplicate_actual_fill_venue_conflict"
+                        updated_pending["external_fill_repair_evidence"] = repair_evidence
+                        pending_actual_fills[order_id] = updated_pending
+                        saved_state = self._save_live_trade_ledger_state(
+                            open_trades=self._open_live_trades,
+                            settled_trades=self._settled_live_trades,
+                            seen_events=self._seen_auto_redeem_events,
+                            seen_order=self._seen_auto_redeem_event_order,
+                            pending_events=self._pending_auto_redeem_events,
+                            pending_actual_fills=pending_actual_fills,
+                            submitted_order_intents=self._submitted_order_intents,
+                        )
+                        self._apply_saved_live_trade_ledger_state(saved_state)
+                        self._block_live_settlement_ledger(str(exc))
+                        raise SettlementLedgerError(str(exc)) from exc
+                    updated_fills = copy.deepcopy(existing_fills)
+                    updated_fills.append(fill_entry)
+                    total_qty, total_notional, aggregate_vwap = self._aggregate_actual_fill_entries(
+                        order_id,
+                        updated_fills,
+                    )
+                    updated_pending["fills"] = updated_fills
+                    updated_pending["total_filled_qty"] = str(total_qty)
+                    updated_pending["total_filled_notional"] = str(total_notional)
+                    updated_pending["vwap"] = str(aggregate_vwap)
+                    if effective_venue_order_id not in (None, ""):
+                        updated_pending["venue_order_id"] = effective_venue_order_id
+                    updated_pending["last_received_at"] = datetime.now(timezone.utc).isoformat()
+                    pending_actual_fills[order_id] = updated_pending
+                    saved_state = self._save_live_trade_ledger_state(
+                        open_trades=self._open_live_trades,
+                        settled_trades=self._settled_live_trades,
+                        seen_events=self._seen_auto_redeem_events,
+                        seen_order=self._seen_auto_redeem_event_order,
+                        pending_events=self._pending_auto_redeem_events,
+                        pending_actual_fills=pending_actual_fills,
+                        submitted_order_intents=self._submitted_order_intents,
+                    )
+                    self._apply_saved_live_trade_ledger_state(saved_state)
+                    if order_id in self._submitted_positions:
+                        self._submitted_positions[order_id]["_actual_filled_qty"] = total_qty
+                        self._submitted_positions[order_id]["_actual_fill_vwap"] = aggregate_vwap
+                    elif order_id in self._open_live_trades:
+                        self._open_live_trades[order_id]["_actual_filled_qty"] = total_qty
+                        self._open_live_trades[order_id]["_actual_fill_vwap"] = aggregate_vwap
+                    else:
+                        disappeared_reason = f"actual-fill local tracking disappeared after durable save for {order_id}"
+                        self._block_live_settlement_ledger(disappeared_reason)
+                        raise SettlementLedgerError(disappeared_reason)
+                    return
+                try:
+                    effective_venue_order_id = self._validated_effective_venue_order_id(
+                        order_id,
+                        payload.get("venue_order_id"),
+                        source_meta,
+                        ignore_pending_order_id=order_id,
+                    )
+                except SettlementLedgerError as exc:
+                    conflict_payload = dict(payload)
+                    conflict_payload["venue_conflict_reason"] = str(exc)
+                    self._create_durable_settlement_unknown_from_actual_fill(
+                        client_order_id=client_order_id,
+                        payload=conflict_payload,
+                        reason="actual_fill_ok_venue_conflict",
+                        ignore_pending_order_id=order_id,
+                        skip_venue_validation=True,
+                    )
+                    reason = (
+                        f"actual-fill callback for {client_order_id} has venue conflict: {exc}; "
+                        "SETTLEMENT_UNKNOWN created"
+                    )
+                    self._block_live_settlement_ledger(reason)
+                    raise SettlementLedgerError(reason) from exc
+                actual_fill_notional = actual_filled_qty * actual_vwap
+                pending_entry = {
+                    "fills": [fill_entry],
+                    "total_filled_qty": str(actual_filled_qty),
+                    "total_filled_notional": str(actual_fill_notional),
+                    "vwap": str(actual_vwap),
+                    "venue_order_id": effective_venue_order_id,
+                    "condition_id": payload.get("condition_id", source_meta.get("condition_id")),
+                    "token_id": payload.get("token_id", source_meta.get("token_id")),
+                    "slug": payload.get("slug", source_meta.get("slug")),
+                    "direction": payload.get("direction", source_meta.get("direction")),
+                    "trade_label": payload.get("trade_label", source_meta.get("trade_label")),
+                    "submitted_at": payload.get("submitted_at", source_meta.get("submitted_at")),
+                    "raw_status_report": payload.get("raw_status_report"),
+                    "raw_callback_payload": payload,
+                    "received_at": datetime.now(timezone.utc).isoformat(),
+                }
+                if pending_submitted_size not in (None, ""):
+                    pending_entry["submitted_size"] = pending_submitted_size
+                pending_actual_fills[order_id] = pending_entry
+                saved_state = self._save_live_trade_ledger_state(
+                    open_trades=self._open_live_trades,
+                    settled_trades=self._settled_live_trades,
+                    seen_events=self._seen_auto_redeem_events,
+                    seen_order=self._seen_auto_redeem_event_order,
+                    pending_events=self._pending_auto_redeem_events,
+                    pending_actual_fills=pending_actual_fills,
+                    submitted_order_intents=self._submitted_order_intents,
+                )
+                self._apply_saved_live_trade_ledger_state(saved_state)
+                if order_id in self._submitted_positions:
+                    self._submitted_positions[order_id]["_actual_filled_qty"] = actual_filled_qty
+                    self._submitted_positions[order_id]["_actual_fill_vwap"] = actual_vwap
+                elif order_id in self._open_live_trades:
+                    self._open_live_trades[order_id]["_actual_filled_qty"] = actual_filled_qty
+                    self._open_live_trades[order_id]["_actual_fill_vwap"] = actual_vwap
+                else:
+                    reason = f"actual-fill local tracking disappeared after durable save for {order_id}"
+                    self._block_live_settlement_ledger(reason)
+                    raise SettlementLedgerError(reason)
+            return
+
+        if status == "failed":
+            reason = payload.get("reason")
+            if not reason:
+                malformed_reason = f"malformed actual-fill callback for {client_order_id}: missing reason"
+                self._mark_pending_actual_fill_external_repair(client_order_id, payload, malformed_reason)
+                if client_order_id in (None, ""):
+                    self._mark_pending_actual_fill_external_repair_by_venue(
+                        payload.get("venue_order_id"),
+                        payload,
+                        malformed_reason,
+                    )
+                self._block_live_settlement_ledger(malformed_reason)
+                raise SettlementLedgerError(malformed_reason)
+            reason = str(reason)
+        else:
+            reason = f"unknown_status:{status!r}"
+        self._mark_pending_actual_fill_external_repair(client_order_id, payload, reason)
+        if client_order_id in (None, ""):
+            self._mark_pending_actual_fill_external_repair_by_venue(
+                payload.get("venue_order_id"),
+                payload,
+                reason,
+            )
+        self._create_durable_settlement_unknown_from_actual_fill(client_order_id, payload, reason)
+        self._block_live_settlement_ledger(
+            f"actual-fill callback failed for {client_order_id}: {reason}; "
+            "SETTLEMENT_UNKNOWN created"
+        )
 
     def _matching_open_live_trades(self, payload: Dict[str, Any]) -> List[str]:
         """Find pending live trades that correspond to an auto_redeem payload."""
@@ -1105,9 +2745,13 @@ class IntegratedBTCStrategy(Strategy):
         payout: Decimal,
         matches: List[tuple[str, Dict[str, Any]]],
     ) -> Dict[str, Decimal]:
-        """Allocate wallet-level auto_redeem payout across bot trades, capped by bot tokens."""
+        """Allocate wallet-level auto_redeem payout after validating tracked bot tokens."""
         if not matches:
             return {}
+
+        match_order_ids = [order_id for order_id, _meta in matches]
+        if len(set(match_order_ids)) != len(match_order_ids):
+            raise SettlementLedgerError("auto_redeem allocation has duplicate matched order ids")
 
         expected_by_order = {
             order_id: self._trade_payout_units(meta)
@@ -1119,17 +2763,19 @@ class IntegratedBTCStrategy(Strategy):
                 raise SettlementLedgerError("cannot allocate positive auto_redeem payout without known token units")
             return {order_id: Decimal("0") for order_id, _ in matches}
 
-        capped_payout = min(payout, total_expected)
         if payout > total_expected:
-            logger.warning(
-                "auto_redeem payout exceeds tracked bot tokens; capping allocation "
-                f"from ${float(payout):.6f} to ${float(capped_payout):.6f}"
+            raise SettlementLedgerError(
+                "auto_redeem payout exceeds tracked bot tokens: "
+                f"payout={payout} tracked_units={total_expected}"
             )
 
-        return {
-            order_id: capped_payout * expected_by_order[order_id] / total_expected
+        allocations = {
+            order_id: payout * expected_by_order[order_id] / total_expected
             for order_id, _ in matches
         }
+        if set(allocations) != set(match_order_ids):
+            raise SettlementLedgerError("auto_redeem allocation did not cover every matched order")
+        return allocations
 
     def _unknown_positive_auto_redeem_units_reason(
         self,
@@ -1165,24 +2811,11 @@ class IntegratedBTCStrategy(Strategy):
     ) -> None:
         """Record final P&L for a filled live trade."""
         with self._settlement_lock:
-            size = Decimal(str(meta.get("size", "0")))
-            entry_price = Decimal(str(meta.get("entry_price", "0")))
-            filled_qty = Decimal(str(meta.get("filled_qty") or meta.get("estimated_tokens") or "0"))
-            if entry_price <= 0 and filled_qty > 0 and size > 0:
-                entry_price = size / filled_qty
-            if entry_price <= 0:
-                entry_price = Decimal("1")
-            if filled_qty > 0:
-                exit_price = payout / filled_qty
-            else:
-                exit_price = Decimal("1") if payout > 0 else Decimal("0")
+            size, filled_qty, entry_price = self._settlement_accounting_values(order_id, meta)
+            exit_price = payout / filled_qty
 
             pnl = payout - size
-            entry_time = (
-                self._parse_utc_datetime(meta.get("filled_at"))
-                or self._parse_utc_datetime(meta.get("submitted_at"))
-                or exit_time
-            )
+            entry_time = self._settlement_entry_time(order_id, meta)
 
             settled = dict(meta)
             settled.update(
@@ -1198,11 +2831,27 @@ class IntegratedBTCStrategy(Strategy):
                     "auto_redeem_event_key": event_key,
                 }
             )
-            self._settled_live_trades.append(settled)
-            self._open_live_trades.pop(order_id, None)
             if save:
-                if not self._try_save_live_trade_ledger("Failed to persist settled live trade"):
-                    return
+                settled_trades = list(self._settled_live_trades)
+                settled_trades.append(settled)
+                open_trades = dict(self._open_live_trades)
+                open_trades.pop(order_id, None)
+                saved_state = self._try_save_live_trade_ledger_state(
+                    "Failed to persist settled live trade",
+                    open_trades=open_trades,
+                    settled_trades=settled_trades,
+                    seen_events=self._seen_auto_redeem_events,
+                    seen_order=self._seen_auto_redeem_event_order,
+                    pending_events=self._pending_auto_redeem_events,
+                    pending_actual_fills=self._pending_actual_fills,
+                    submitted_order_intents=self._submitted_order_intents,
+                )
+                if saved_state is None:
+                    raise SettlementLedgerError(f"failed to persist settled live trade for {order_id}")
+                self._apply_saved_live_trade_ledger_state(saved_state)
+            else:
+                self._settled_live_trades.append(settled)
+                self._open_live_trades.pop(order_id, None)
             if record_accounting:
                 self._record_settlement_accounting(
                     order_id=order_id,
@@ -1246,7 +2895,8 @@ class IntegratedBTCStrategy(Strategy):
     ) -> None:
         """Book risk/performance accounting after the settlement ledger is durable."""
         try:
-            token_buy_direction = "buy_yes" if meta.get("direction") == "long" else "buy_no"
+            direction = self._settlement_trade_direction(order_id, meta)
+            token_buy_direction = "buy_yes" if direction == "long" else "buy_no"
             self.performance_tracker.record_trade(
                 trade_id=order_id,
                 direction=token_buy_direction,
@@ -1269,18 +2919,29 @@ class IntegratedBTCStrategy(Strategy):
                 },
             )
         except Exception as e:
-            logger.warning(f"Failed to record performance trade for {order_id}: {e}")
+            reason = f"failed to record performance settlement accounting for {order_id}: {e}"
+            self._block_live_settlement_ledger(reason)
+            raise SettlementLedgerError(reason) from e
 
         try:
             risk_pnl = self.risk_engine.remove_position(order_id, exit_price)
-            if risk_pnl is None and hasattr(self.risk_engine, "record_realized_pnl"):
-                self.risk_engine.record_realized_pnl(
+            if risk_pnl is None:
+                if source != "late_auto_redeem":
+                    raise SettlementLedgerError(f"risk_engine.remove_position returned None for {order_id}")
+                record_realized_pnl = getattr(self.risk_engine, "record_realized_pnl", None)
+                if not callable(record_realized_pnl):
+                    raise SettlementLedgerError(
+                        f"risk_engine.record_realized_pnl unavailable for late settlement correction {order_id}"
+                    )
+                record_realized_pnl(
                     pnl,
                     source=f"polymarket_{source}",
                     metadata={"order_id": order_id, "slug": meta.get("slug")},
                 )
         except Exception as e:
-            logger.warning(f"Failed to record risk P&L for {order_id}: {e}")
+            reason = f"failed to record risk settlement accounting for {order_id}: {e}"
+            self._block_live_settlement_ledger(reason)
+            raise SettlementLedgerError(reason) from e
 
     def _book_settlement_accounting_from_record(
         self,
@@ -1292,20 +2953,10 @@ class IntegratedBTCStrategy(Strategy):
         payload: Dict[str, Any],
     ) -> None:
         """Compute and book settlement accounting after the ledger save succeeds."""
-        size = Decimal(str(meta.get("size", "0")))
-        entry_price = Decimal(str(meta.get("entry_price", "0")))
-        filled_qty = Decimal(str(meta.get("filled_qty") or meta.get("estimated_tokens") or "0"))
-        if entry_price <= 0 and filled_qty > 0 and size > 0:
-            entry_price = size / filled_qty
-        if entry_price <= 0:
-            entry_price = Decimal("1")
-        exit_price = payout / filled_qty if filled_qty > 0 else (Decimal("1") if payout > 0 else Decimal("0"))
+        size, filled_qty, entry_price = self._settlement_accounting_values(order_id, meta)
+        exit_price = payout / filled_qty
         pnl = payout - size
-        entry_time = (
-            self._parse_utc_datetime(meta.get("filled_at"))
-            or self._parse_utc_datetime(meta.get("submitted_at"))
-            or exit_time
-        )
+        entry_time = self._settlement_entry_time(order_id, meta)
         self._record_settlement_accounting(
             order_id=order_id,
             meta=meta,
@@ -1347,22 +2998,13 @@ class IntegratedBTCStrategy(Strategy):
             logger.warning("Late auto_redeem matched a settled trade without order_id; ignoring")
             return
 
-        size = Decimal(str(trade.get("size", "0")))
-        filled_qty = self._trade_payout_units(trade)
-        entry_price = Decimal(str(trade.get("entry_price", "0") or "0"))
-        if entry_price <= 0 and filled_qty > 0 and size > 0:
-            entry_price = size / filled_qty
-        if entry_price <= 0:
-            entry_price = Decimal("1")
-        exit_price = payout / filled_qty if filled_qty > 0 else (Decimal("1") if payout > 0 else Decimal("0"))
+        size, filled_qty, entry_price = self._settlement_accounting_values(order_id, trade)
+        exit_price = payout / filled_qty
         pnl = payout - size
-        entry_time = (
-            self._parse_utc_datetime(trade.get("filled_at"))
-            or self._parse_utc_datetime(trade.get("submitted_at"))
-            or exit_time
-        )
+        entry_time = self._settlement_entry_time(order_id, trade)
 
-        trade.update(
+        corrected_trade = dict(trade)
+        corrected_trade.update(
             {
                 "settled_at": exit_time.isoformat(),
                 "settlement_source": "late_auto_redeem",
@@ -1376,12 +3018,37 @@ class IntegratedBTCStrategy(Strategy):
             }
         )
         if save:
-            if not self._try_save_live_trade_ledger("Failed to persist late settlement correction"):
-                return
+            settled_trades = []
+            replaced = False
+            for existing_trade in self._settled_live_trades:
+                if existing_trade is trade and not replaced:
+                    settled_trades.append(corrected_trade)
+                    replaced = True
+                else:
+                    settled_trades.append(existing_trade)
+            if not replaced:
+                reason = f"late settlement correction target not found in settled ledger for {order_id}"
+                self._block_live_settlement_ledger(reason)
+                raise SettlementLedgerError(reason)
+            saved_state = self._try_save_live_trade_ledger_state(
+                "Failed to persist late settlement correction",
+                open_trades=self._open_live_trades,
+                settled_trades=settled_trades,
+                seen_events=self._seen_auto_redeem_events,
+                seen_order=self._seen_auto_redeem_event_order,
+                pending_events=self._pending_auto_redeem_events,
+                pending_actual_fills=self._pending_actual_fills,
+                submitted_order_intents=self._submitted_order_intents,
+            )
+            if saved_state is None:
+                raise SettlementLedgerError(f"failed to persist unknown settlement for {order_id}")
+            self._apply_saved_live_trade_ledger_state(saved_state)
+        else:
+            trade.update(corrected_trade)
         if record_accounting:
             self._record_settlement_accounting(
                 order_id=order_id,
-                meta=trade,
+                meta=corrected_trade,
                 payout=payout,
                 exit_time=exit_time,
                 source="late_auto_redeem",
@@ -1412,14 +3079,10 @@ class IntegratedBTCStrategy(Strategy):
     ) -> None:
         """Move an unresolved trade out of active exposure without fabricating P&L."""
         with self._settlement_lock:
-            try:
-                if hasattr(self.risk_engine, "release_position"):
-                    self.risk_engine.release_position(order_id)
-                else:
-                    self.risk_engine.remove_position(order_id, Decimal(str(meta.get("entry_price", "1"))))
-            except Exception as e:
-                logger.warning(f"Failed to release unknown-settlement risk for {order_id}: {e}")
-
+            release_position = self._risk_release_position_callable(
+                order_id,
+                "unknown-settlement risk release",
+            )
             settled = dict(meta)
             settled.update(
                 {
@@ -1432,10 +3095,29 @@ class IntegratedBTCStrategy(Strategy):
                     "pnl": "UNKNOWN",
                 }
             )
-            self._settled_live_trades.append(settled)
-            self._open_live_trades.pop(order_id, None)
-            if not self._try_save_live_trade_ledger("Failed to persist unknown settlement"):
-                return
+            settled_trades = list(self._settled_live_trades)
+            settled_trades.append(settled)
+            open_trades = dict(self._open_live_trades)
+            open_trades.pop(order_id, None)
+            saved_state = self._try_save_live_trade_ledger_state(
+                "Failed to persist unknown settlement",
+                open_trades=open_trades,
+                settled_trades=settled_trades,
+                seen_events=self._seen_auto_redeem_events,
+                seen_order=self._seen_auto_redeem_event_order,
+                pending_events=self._pending_auto_redeem_events,
+                pending_actual_fills=self._pending_actual_fills,
+                submitted_order_intents=self._submitted_order_intents,
+            )
+            if saved_state is None:
+                raise SettlementLedgerError(f"failed to persist unknown settlement for {order_id}")
+            self._apply_saved_live_trade_ledger_state(saved_state)
+            try:
+                release_position(order_id)
+            except Exception as exc:
+                block_reason = f"unknown-settlement risk release: risk position release failed for {order_id}: {exc}"
+                self._block_live_settlement_ledger(block_reason)
+                raise SettlementLedgerError(block_reason) from exc
 
             logger.warning(
                 f"Settlement still unknown for {order_id}; released open exposure without "
@@ -1443,17 +3125,35 @@ class IntegratedBTCStrategy(Strategy):
             )
             self._retry_pending_auto_redeems("settlement marked unknown")
 
-    def _handle_auto_redeem_event(self, payload: Dict[str, Any], store_pending: bool = True) -> bool:
+    def _handle_auto_redeem_event(
+        self,
+        payload: Dict[str, Any],
+        store_pending: bool = True,
+        event_key_override: Optional[str] = None,
+    ) -> bool:
         """Settle matching live trades when Polymarket reports an auto-redeem payout."""
         with self._settlement_lock:
-            event_key = self._auto_redeem_event_key(payload)
+            event_key = event_key_override or self._auto_redeem_event_key(payload)
             if event_key in self._seen_auto_redeem_events:
                 return False
 
+            raw_amount = payload.get("amount")
+            if raw_amount in (None, ""):
+                logger.warning("auto_redeem missing amount; leaving event pending")
+                if store_pending:
+                    self._store_pending_auto_redeem_event(event_key, payload, "missing auto_redeem amount")
+                return False
             try:
-                payout = Decimal(str(payload.get("amount", "0")))
+                payout = Decimal(str(raw_amount))
             except Exception:
                 logger.warning(f"auto_redeem had invalid amount: {payload.get('amount')}")
+                if store_pending:
+                    self._store_pending_auto_redeem_event(event_key, payload, "invalid auto_redeem amount")
+                return False
+            if not payout.is_finite() or payout < 0:
+                logger.warning(f"auto_redeem had impossible amount: {payload.get('amount')}")
+                if store_pending:
+                    self._store_pending_auto_redeem_event(event_key, payload, "invalid auto_redeem amount")
                 return False
 
             if self._require_auto_redeem_token_hint() and not self._payload_has_token_hint(payload):
@@ -1489,6 +3189,16 @@ class IntegratedBTCStrategy(Strategy):
                         self._store_pending_auto_redeem_event(event_key, payload, unknown_units_reason)
                     return False
 
+                accounting_gap_reason = self._settlement_accounting_gap_reason(matched_open)
+                if accounting_gap_reason:
+                    logger.warning(
+                        f"{accounting_gap_reason}; leaving auto_redeem pending for manual review "
+                        f"(slug={payload.get('slug')}, amount={payload.get('amount')})"
+                    )
+                    if store_pending:
+                        self._store_pending_auto_redeem_event(event_key, payload, accounting_gap_reason)
+                    return False
+
                 exit_time = self._parse_event_time(payload)
                 if exit_time is None:
                     reason = "missing/invalid auto_redeem timestamp"
@@ -1500,11 +3210,21 @@ class IntegratedBTCStrategy(Strategy):
                     if store_pending:
                         self._store_pending_auto_redeem_event(event_key, payload, reason)
                     return False
-                allocations = self._allocated_auto_redeem_payouts(payout, matched_open)
+                try:
+                    allocations = self._allocated_auto_redeem_payouts(payout, matched_open)
+                except SettlementLedgerError as exc:
+                    reason = str(exc)
+                    logger.warning(
+                        f"{reason}; leaving auto_redeem pending for manual review "
+                        f"(slug={payload.get('slug')}, amount={payload.get('amount')})"
+                    )
+                    if store_pending:
+                        self._store_pending_auto_redeem_event(event_key, payload, reason)
+                    return False
                 snapshot = self._snapshot_settlement_state()
                 accounting_records = []
                 for order_id, meta in list(matched_open):
-                    allocated_payout = allocations.get(order_id, Decimal("0"))
+                    allocated_payout = allocations[order_id]
                     accounting_records.append((order_id, copy.deepcopy(meta), allocated_payout))
                     self._record_settled_live_trade(
                         order_id=order_id,
@@ -1520,12 +3240,9 @@ class IntegratedBTCStrategy(Strategy):
                 self._mark_auto_redeem_seen(event_key)
                 if not self._try_save_live_trade_ledger("Failed to persist auto_redeem settlement"):
                     self._restore_settlement_state(snapshot)
-                    self._keep_auto_redeem_pending_after_failed_save(
-                        event_key,
-                        payload,
-                        "ledger save failed after auto_redeem settlement",
-                    )
-                    return False
+                    reason = "ledger save failed after auto_redeem settlement; auto_redeem not durably recorded"
+                    self._block_live_settlement_ledger(reason)
+                    raise SettlementLedgerError(reason)
                 for order_id, meta, allocated_payout in accounting_records:
                     self._book_settlement_accounting_from_record(
                         order_id=order_id,
@@ -1554,6 +3271,15 @@ class IntegratedBTCStrategy(Strategy):
                     for trade in unknown_matches
                     if trade.get("order_id")
                 ]
+                if len(matched_unknown) != len(unknown_matches):
+                    reason = "late auto_redeem matched SETTLEMENT_UNKNOWN record without order_id"
+                    logger.warning(
+                        f"{reason}; keeping redeem pending for manual review "
+                        f"(slug={payload.get('slug')}, amount={payload.get('amount')})"
+                    )
+                    if store_pending:
+                        self._store_pending_auto_redeem_event(event_key, payload, reason)
+                    return False
                 unknown_units_reason = self._unknown_positive_auto_redeem_units_reason(payout, matched_unknown)
                 if unknown_units_reason:
                     logger.warning(
@@ -1564,7 +3290,27 @@ class IntegratedBTCStrategy(Strategy):
                         self._store_pending_auto_redeem_event(event_key, payload, unknown_units_reason)
                     return False
 
-                allocations = self._allocated_auto_redeem_payouts(payout, matched_unknown)
+                accounting_gap_reason = self._settlement_accounting_gap_reason(matched_unknown)
+                if accounting_gap_reason:
+                    logger.warning(
+                        f"{accounting_gap_reason}; keeping SETTLEMENT_UNKNOWN record(s) for manual review "
+                        f"(slug={payload.get('slug')}, amount={payload.get('amount')})"
+                    )
+                    if store_pending:
+                        self._store_pending_auto_redeem_event(event_key, payload, accounting_gap_reason)
+                    return False
+
+                try:
+                    allocations = self._allocated_auto_redeem_payouts(payout, matched_unknown)
+                except SettlementLedgerError as exc:
+                    reason = str(exc)
+                    logger.warning(
+                        f"{reason}; keeping SETTLEMENT_UNKNOWN record(s) for manual review "
+                        f"(slug={payload.get('slug')}, amount={payload.get('amount')})"
+                    )
+                    if store_pending:
+                        self._store_pending_auto_redeem_event(event_key, payload, reason)
+                    return False
                 exit_time = self._parse_event_time(payload)
                 if exit_time is None:
                     reason = "missing/invalid late auto_redeem timestamp"
@@ -1578,7 +3324,7 @@ class IntegratedBTCStrategy(Strategy):
                 snapshot = self._snapshot_settlement_state()
                 accounting_records = []
                 for order_id, trade in matched_unknown:
-                    allocated_payout = allocations.get(order_id, Decimal("0"))
+                    allocated_payout = allocations[order_id]
                     accounting_records.append((order_id, copy.deepcopy(trade), allocated_payout))
                     self._record_late_auto_redeem_correction(
                         trade=trade,
@@ -1592,12 +3338,9 @@ class IntegratedBTCStrategy(Strategy):
                 self._mark_auto_redeem_seen(event_key)
                 if not self._try_save_live_trade_ledger("Failed to persist late auto_redeem correction"):
                     self._restore_settlement_state(snapshot)
-                    self._keep_auto_redeem_pending_after_failed_save(
-                        event_key,
-                        payload,
-                        "ledger save failed after late auto_redeem correction",
-                    )
-                    return False
+                    reason = "ledger save failed after late auto_redeem correction; auto_redeem not durably recorded"
+                    self._block_live_settlement_ledger(reason)
+                    raise SettlementLedgerError(reason)
                 for order_id, trade, allocated_payout in accounting_records:
                     self._book_settlement_accounting_from_record(
                         order_id=order_id,
@@ -1669,6 +3412,10 @@ class IntegratedBTCStrategy(Strategy):
             register_auto_redeem_handler(self._auto_redeem_handler)
             self._auto_redeem_registered = True
             logger.info("Registered Polymarket auto_redeem settlement handler")
+        if not self._actual_fill_registered:
+            register_actual_fill_handler(self._actual_fill_handler)
+            self._actual_fill_registered = True
+            logger.info("Registered Polymarket actual-fill handler")
 
         self._retry_pending_auto_redeems("startup ledger replay")
 
@@ -2281,35 +4028,96 @@ class IntegratedBTCStrategy(Strategy):
 
         Position size is a fixed USD amount. The market price is used only as a
         late-window trend filter; fused signals must still confirm the side.
+
+        Phase 2.4 wiring: every early-return path records exactly one
+        decisions.jsonl line via the `rec` DecisionRecord context manager.
+        Reject branches call ``rec.reject(gate, reason)`` immediately before
+        ``return False``; the positive path calls ``rec.decided(...)`` before
+        delegating to the simulation/live executor.
         """
         # --- Mode check ---
         is_simulation = await self.check_simulation_mode()
+        observation_mode = "simulation" if is_simulation else "live_gate"
+
+        with DecisionRecord(
+            current_price=current_price,
+            strategy_observation_mode=observation_mode,
+        ) as rec:
+            return await self._make_trading_decision_body(
+                current_price, trade_key, is_simulation, rec
+            )
+
+    async def _make_trading_decision_body(
+        self,
+        current_price: Decimal,
+        trade_key,
+        is_simulation: bool,
+        rec: DecisionRecord,
+    ) -> bool:
         logger.info(f"Mode: {'SIMULATION' if is_simulation else 'LIVE TRADING'}")
         if not is_simulation:
             unresolved = self._unresolved_settlement_unknowns()
             if unresolved:
                 logger.error(
                     "LIVE TRADING PAUSED: unresolved settlement reconciliation exists "
-                    f"({len(unresolved)} trade(s)). Resolve SETTLEMENT_UNKNOWN records "
+                    f"({len(unresolved)} item(s)). Resolve or repair unresolved ledger state "
                     f"in {LIVE_TRADE_LEDGER_PATH.name} before placing new live orders."
+                )
+                rec.reject(
+                    "live_paused_unresolved_settlement",
+                    f"{len(unresolved)} unresolved item(s)",
                 )
                 return False
 
         # --- Minimum history guard ---
         if len(self.price_history) < 20:
             logger.warning(f"Not enough price history ({len(self.price_history)}/20)")
+            rec.reject(
+                "history_too_short",
+                f"len(price_history)={len(self.price_history)} < 20",
+            )
             return False
 
         logger.info(f"Current price: ${float(current_price):,.4f}")
 
         # --- Phase 4a: Build real metadata for processors ---
         metadata = await self._fetch_market_context(current_price)
+        market_meta = self._current_market_metadata() or {}
+        rec.update(
+            slug=market_meta.get("slug"),
+            condition_id=market_meta.get("condition_id"),
+            yes_token_id=market_meta.get("yes_token_id"),
+            no_token_id=market_meta.get("no_token_id"),
+            market_end_time=market_meta.get("end_time"),
+        )
+
+        # --- Phase 4.5 timing/price-band observability ---
+        market_end_iso = market_meta.get("end_time")
+        end_dt = self._parse_utc_datetime(market_end_iso) if market_end_iso else None
+        if end_dt is not None:
+            now_utc = datetime.now(timezone.utc)
+            # The 15-min sub-interval started 900 seconds before the close.
+            sub_interval_start = end_dt - timedelta(seconds=900)
+            seconds_into = (now_utc - sub_interval_start).total_seconds()
+            rec.update(
+                seconds_into_sub_interval=seconds_into,
+                trade_window_label=trade_window_label_for_seconds_into_sub_interval(
+                    seconds_into
+                ),
+            )
+        try:
+            rec.update(trend_price_band=trend_price_band_for(float(current_price)))
+        except (TypeError, ValueError):
+            # current_price wasn't numeric — leave the band null; the
+            # downstream trend filter will already short-circuit.
+            pass
 
         # --- Phase 4b: Run all three signal processors ---
         signals = self._process_signals(current_price, metadata)
 
         if not signals:
             logger.info("No signals generated — no trade this interval")
+            rec.reject("no_signals", "_process_signals returned empty list")
             return False
 
         logger.info(f"Generated {len(signals)} signal(s):")
@@ -2318,16 +4126,32 @@ class IntegratedBTCStrategy(Strategy):
                 f"  [{sig.source}] {sig.direction.value}: "
                 f"score={sig.score:.1f}, confidence={sig.confidence:.2%}"
             )
+        rec.update(
+            model_signals=[
+                {
+                    "source": str(getattr(sig, "source", "")),
+                    "direction": str(getattr(sig.direction, "value", sig.direction)),
+                    "score": float(getattr(sig, "score", 0.0)),
+                    "confidence": float(getattr(sig, "confidence", 0.0)),
+                }
+                for sig in signals
+            ]
+        )
 
         # --- Phase 4c: Fuse signals into one consensus ---
         fused = self.fusion_engine.fuse_signals(signals, min_signals=2, min_score=55.0)
         if not fused:
             logger.info("Fusion produced no actionable signal — no trade this interval")
+            rec.reject("fusion_no_consensus", "fusion_engine.fuse_signals returned None")
             return False
 
         logger.info(
             f"FUSED SIGNAL: {fused.direction.value} "
             f"(score={fused.score:.1f}, confidence={fused.confidence:.2%})"
+        )
+        rec.update(
+            fused_confidence=float(fused.confidence),
+            fused_direction=str(fused.direction.value),
         )
 
         # --- Phase 5: Position size is a fixed USD amount ---
@@ -2365,7 +4189,14 @@ class IntegratedBTCStrategy(Strategy):
                 f"⏭ TREND: NEUTRAL ({price_float:.2%}) — price too close to 0.50, SKIPPING trade "
                 f"(coin flip territory: {TREND_DOWN_THRESHOLD:.0%}–{TREND_UP_THRESHOLD:.0%})"
             )
+            rec.reject(
+                "trend_filter_neutral",
+                f"price {price_float:.4f} in neutral band [0.40, 0.60]",
+            )
             return False
+        # ``trend_price_band`` was already populated with the granular
+        # Phase 4.5 band above; the coarse trend-filter band is implicit in
+        # the rejection gate name for neutral trades.
 
         if get_env_bool("REQUIRE_SIGNAL_CONFIRMATION", True):
             expected_signal = "bullish" if direction == "long" else "bearish"
@@ -2376,30 +4207,60 @@ class IntegratedBTCStrategy(Strategy):
                     f"SKIP: trend wants {direction.upper()} but fused signal is "
                     f"{actual_signal.upper()} — no independent confirmation"
                 )
+                rec.reject(
+                    "signal_confirmation_mismatch",
+                    f"trend={direction} but fused={actual_signal}",
+                )
                 return False
             if fused.confidence < min_confidence:
                 logger.info(
                     f"SKIP: fused confidence {fused.confidence:.2%} below "
                     f"MIN_SIGNAL_CONFIDENCE={min_confidence:.2%}"
                 )
+                rec.reject(
+                    "min_signal_confidence",
+                    f"fused.confidence={fused.confidence:.4f} < {float(min_confidence):.4f}",
+                )
                 return False
 
         last_tick = getattr(self, "_last_bid_ask", None)
         if not last_tick:
             logger.warning("SKIP: no executable YES quote cached")
+            rec.reject("no_yes_quote", "self._last_bid_ask is None")
             return False
         yes_bid, yes_ask = last_tick
+        rec.update(yes_ask=yes_ask)
         if direction == "long":
-            executable_entry = yes_ask
+            top_of_book_entry = yes_ask
             entry_source = "YES ask"
+            side_token_id = market_meta.get("yes_token_id")
         else:
             no_tick = getattr(self, "_last_no_bid_ask", None)
             if not no_tick:
                 logger.warning("SKIP: no executable NO ask cached")
+                rec.reject("no_no_quote", "self._last_no_bid_ask is None")
                 return False
             _, no_ask = no_tick
-            executable_entry = no_ask
+            top_of_book_entry = no_ask
             entry_source = "NO ask"
+            side_token_id = market_meta.get("no_token_id")
+            rec.update(no_ask=no_ask)
+
+        # Phase 5A — depth-aware executable_entry. Replace top-of-book ask
+        # with the VWAP estimate_market_ioc_fill returns for the selected
+        # token's asks at the configured POSITION_SIZE_USD budget. Fail
+        # closed (reject the trade) when the book is unavailable, has
+        # invalid level data, or is too thin to fill the full budget.
+        executable_entry = await self._compute_depth_aware_entry(
+            side_token_id=side_token_id,
+            entry_source=entry_source,
+            position_size_usd=POSITION_SIZE_USD,
+            top_of_book_entry=top_of_book_entry,
+            rec=rec,
+        )
+        if executable_entry is None:
+            return False
+        rec.update(executable_entry=executable_entry)
 
         # This is a heuristic confidence filter, not a calibrated EV model.
         # The processor confidence values are not yet trained settlement probabilities.
@@ -2413,6 +4274,11 @@ class IntegratedBTCStrategy(Strategy):
                 f"({entry_source} {float(executable_entry):.2%} + buffers "
                 f"{float(fee_buffer + spread_buffer):.2%})"
             )
+            rec.reject(
+                "ev_gate",
+                f"fused.confidence={fused.confidence:.4f} < min_required={float(min_required_confidence):.4f} "
+                f"({entry_source}={float(executable_entry):.4f} + buffers={float(fee_buffer + spread_buffer):.4f})",
+            )
             return False
 
         # Risk engine tracks submitted orders plus filled markets until settlement.
@@ -2423,6 +4289,7 @@ class IntegratedBTCStrategy(Strategy):
         )
         if not is_valid:
             logger.warning(f"Risk engine blocked trade: {error}")
+            rec.reject("risk_engine", str(error))
             return False
 
         logger.info(f"Position size: ${POSITION_SIZE_USD:.2f} (fixed) | Direction: {direction.upper()}")
@@ -2441,6 +4308,10 @@ class IntegratedBTCStrategy(Strategy):
                     f"is at or below the ${float(MIN_LIQUIDITY):.2f} liquidity floor. "
                     "Market is too thin/extreme; will retry next tick."
                 )
+                rec.reject(
+                    "liquidity_floor_yes_ask",
+                    f"YES ask={float(last_ask):.4f} <= {float(MIN_LIQUIDITY):.2f}",
+                )
                 return False
             if direction == "short":
                 no_tick = getattr(self, "_last_no_bid_ask", None)
@@ -2449,6 +4320,7 @@ class IntegratedBTCStrategy(Strategy):
                         "⚠ Skipping DOWN/NO trade: no direct NO quote available yet. "
                         "Waiting for NO ask; will retry next tick."
                     )
+                    rec.reject("no_no_quote_at_liquidity_check", "_last_no_bid_ask is None")
                     return False
                 no_bid, no_ask = no_tick
                 if no_ask <= MIN_LIQUIDITY:
@@ -2457,17 +4329,112 @@ class IntegratedBTCStrategy(Strategy):
                         f"is at or below the ${float(MIN_LIQUIDITY):.2f} liquidity floor. "
                         "Market is too thin/extreme; will retry next tick."
                     )
+                    rec.reject(
+                        "liquidity_floor_no_ask",
+                        f"NO ask={float(no_ask):.4f} <= {float(MIN_LIQUIDITY):.2f}",
+                    )
                     return False
+
+        # Positive decision — record before delegating to executor.
+        rec.decided(direction=direction)
 
         # --- Phase 5 / 6: Execute ---
         if is_simulation:
             placed = await self._record_paper_trade(fused, POSITION_SIZE_USD, current_price, direction)
         else:
             placed = await self._place_real_order(fused, POSITION_SIZE_USD, current_price, direction)
+        if not placed:
+            # Reject reason tracked at the executor layer; surface a generic
+            # late-stage rejection so the record still reflects the outcome.
+            rec.reject("executor_returned_false", "place_real_order or paper_trade returned False")
         if placed and trade_key is not None:
             self.last_trade_time = trade_key
         return placed
-            
+
+    async def _compute_depth_aware_entry(
+        self,
+        side_token_id: Optional[str],
+        entry_source: str,
+        position_size_usd: Decimal,
+        top_of_book_entry: Decimal,
+        rec: DecisionRecord,
+    ) -> Optional[Decimal]:
+        """Phase 5A — return the VWAP executable entry for the selected
+        token's asks, or None when the book cannot be evaluated.
+
+        Fail-closed semantics: if the token id is unknown, if the HTTP book
+        fetch fails or yields no asks, if any book level is malformed, or
+        if the book is too thin to fill the full position size, this
+        method logs the reason via ``rec.reject`` and returns None. Callers
+        treat None as "skip the trade."
+
+        No fallback to top-of-book ask under any error condition; per the
+        plan's No-Fallback policy, a corrupt/missing book is an actionable
+        error, not noise to ignore.
+        """
+        if not side_token_id:
+            logger.warning("SKIP: missing side token id for depth-aware EV gate")
+            rec.reject(
+                "depth_aware_missing_token_id",
+                f"{entry_source} side has no token_id in market metadata",
+            )
+            return None
+        try:
+            book = await asyncio.to_thread(
+                self.orderbook_processor.fetch_order_book, side_token_id
+            )
+        except Exception as exc:
+            logger.warning(f"SKIP: depth-aware book fetch raised: {exc}")
+            rec.reject(
+                "depth_aware_book_fetch_error",
+                f"fetch_order_book({entry_source}) raised {type(exc).__name__}: {exc}",
+            )
+            return None
+        if not book:
+            logger.warning("SKIP: depth-aware book fetch returned no book")
+            rec.reject(
+                "depth_aware_no_book",
+                f"fetch_order_book({entry_source}) returned None/empty",
+            )
+            return None
+        asks = book.get("asks") or []
+        if not asks:
+            logger.warning("SKIP: depth-aware book has no asks")
+            rec.reject(
+                "depth_aware_empty_asks",
+                f"{entry_source} book has no ask levels",
+            )
+            return None
+        try:
+            vwap, tokens_filled, fully_filled = estimate_market_ioc_fill(
+                asks, Decimal(str(position_size_usd))
+            )
+        except InvalidBookLevelError as exc:
+            logger.warning(f"SKIP: depth-aware book has invalid level: {exc}")
+            rec.reject(
+                "depth_aware_invalid_book_level",
+                f"{entry_source}: {exc}",
+            )
+            return None
+        if vwap is None or not fully_filled:
+            tokens_str = f"{float(tokens_filled):.6f}" if tokens_filled else "0"
+            logger.warning(
+                f"SKIP: depth-aware book too thin for ${float(position_size_usd):.2f} "
+                f"{entry_source} sweep (tokens fillable: {tokens_str})"
+            )
+            rec.reject(
+                "depth_aware_book_too_thin",
+                f"{entry_source} cannot fill ${float(position_size_usd):.2f} "
+                f"(tokens fillable: {tokens_str})",
+            )
+            return None
+        logger.info(
+            f"DEPTH-AWARE entry: {entry_source} VWAP=${float(vwap):.4f} "
+            f"(top-of-book ${float(top_of_book_entry):.4f}, "
+            f"fills {float(tokens_filled):.4f} tokens at ${float(position_size_usd):.2f})"
+        )
+        return vwap
+
     async def _record_paper_trade(self, signal, position_size, current_price, direction) -> bool:
         exit_delta = timedelta(minutes=1) if self.test_mode else timedelta(minutes=15)
         exit_time = datetime.now(timezone.utc) + exit_delta
@@ -2514,6 +4481,30 @@ class IntegratedBTCStrategy(Strategy):
     async def _place_real_order(self, signal, position_size, current_price, direction) -> bool:
         if not self.instrument_id:
             logger.error("No instrument available")
+            return False
+
+        # Phase 0.3 runtime gate: enforce MARKET_BUY_USD > 5.50 before any live
+        # order submission. Defends against Redis-driven sim->live transitions
+        # bypassing the startup gate in main(). Uses the non-raising validator
+        # so the live path is a structured fail-closed "reject the trade" (an
+        # explicitly allowed fail-closed outcome per the No-Fallback Policy),
+        # not a try/except that hides the underlying error.
+        gate_ok, gate_err, gate_amount = validate_live_market_buy_usd()
+        if not gate_ok:
+            logger.error(f"LIVE ORDER BLOCKED: {gate_err}")
+            return False
+
+        # Cycle-2 reviewer #2 finding: caller passes `position_size` derived
+        # from get_market_buy_usd() (ROUND_HALF_EVEN), while the gate quantizes
+        # with ROUND_DOWN. For values like 5.515 the two could diverge by one
+        # cent. Reject the order rather than silently sizing differently from
+        # what the gate validated.
+        if Decimal(str(position_size)).quantize(Decimal("0.01"), rounding=ROUND_DOWN) != gate_amount:
+            logger.error(
+                f"LIVE ORDER BLOCKED: caller-supplied position_size={position_size} "
+                f"does not match gate-validated amount {gate_amount}. Restart with a "
+                f"consistent MARKET_BUY_USD."
+            )
             return False
 
         try:
@@ -2569,7 +4560,10 @@ class IntegratedBTCStrategy(Strategy):
                 price_source = "NO ask"
 
             trade_price = float(quoted_price)
-            estimated_tokens = max_usd_amount / trade_price if trade_price > 0 else 0.0
+            if not math.isfinite(trade_price) or trade_price <= 0:
+                logger.error(f"Live order rejected: invalid {price_source} price {quoted_price!r}")
+                return False
+            estimated_tokens = max_usd_amount / trade_price
             logger.info(
                 f"BUY {trade_label}: spending ${max_usd_amount:.2f} USDC.e "
                 f"(estimated {estimated_tokens:.6f} tokens at ${trade_price:.4f} from {price_source})"
@@ -2626,10 +4620,15 @@ class IntegratedBTCStrategy(Strategy):
                 if unresolved:
                     logger.error(
                         "LIVE ORDER BLOCKED: unresolved settlement reconciliation appeared "
-                        f"before submit_order ({len(unresolved)} trade(s)). Resolve "
-                        f"SETTLEMENT_UNKNOWN records in {LIVE_TRADE_LEDGER_PATH.name}."
+                        f"before submit_order ({len(unresolved)} item(s)). Resolve or repair "
+                        f"unresolved ledger state in {LIVE_TRADE_LEDGER_PATH.name}."
                     )
                     return False
+                self._persist_submitted_order_intent_locked(
+                    order_id=unique_id,
+                    meta=submitted_meta,
+                    price_source=price_source,
+                )
                 self._submitted_positions[unique_id] = submitted_meta
                 self.risk_engine.add_position(
                     position_id=unique_id,
@@ -2743,8 +4742,8 @@ class IntegratedBTCStrategy(Strategy):
         """
         Safely track an order event on the performance tracker.
 
-        PerformanceTracker does not expose `increment_order_counter`, so we
-        use whichever method is actually available, or fall back to a no-op.
+        Order-event metrics are best-effort observability and do not affect
+        trading, settlement, risk, or ledger state.
         Supported event_type values: "placed", "filled", "rejected".
         """
         try:
@@ -2771,41 +4770,632 @@ class IntegratedBTCStrategy(Strategy):
         with self._settlement_lock:
             return self._submitted_positions.pop(order_id, None)
 
-    def _release_submitted_position(self, client_order_id) -> Optional[Dict[str, Any]]:
+    def _risk_release_position_callable(self, order_id: str, context: str):
+        """Return the explicit risk release method required for cleanup paths."""
+        release_position = getattr(self.risk_engine, "release_position", None)
+        if not callable(release_position):
+            reason = (
+                f"{context}: risk_engine.release_position unavailable for {order_id}; "
+                "refusing to use settlement-accounting remove_position as a release path"
+            )
+            self._block_live_settlement_ledger(reason)
+            raise SettlementLedgerError(reason)
+        return release_position
+
+    def _release_risk_position_without_pnl(self, order_id: str, context: str) -> None:
+        """Release reserved exposure; never book settlement P&L from cleanup paths."""
+        release_position = self._risk_release_position_callable(order_id, context)
+        try:
+            release_position(order_id)
+        except Exception as exc:
+            reason = f"{context}: risk position release failed for {order_id}: {exc}"
+            self._block_live_settlement_ledger(reason)
+            raise SettlementLedgerError(reason) from exc
+
+    def _build_submitted_order_intent(
+        self,
+        order_id: str,
+        meta: Dict[str, Any],
+        price_source: str,
+    ) -> Dict[str, Any]:
+        """Build the durable pre-submit intent record without exchange-fill data."""
+        required = (
+            "direction",
+            "trade_label",
+            "size",
+            "estimated_tokens",
+            "entry_price",
+            "instrument_id",
+            "token_id",
+            "slug",
+            "condition_id",
+            "market_start_time",
+            "market_end_time",
+            "submitted_at",
+        )
+        missing = [key for key in required if meta.get(key) in (None, "")]
+        if missing:
+            reason = f"submitted_order_intent_missing_required_fields:{','.join(missing)}"
+            self._block_live_settlement_ledger(reason)
+            raise SettlementLedgerError(reason)
+        direction = str(meta["direction"])
+        if direction not in {"long", "short"}:
+            reason = f"submitted_order_intent_invalid_direction:{direction!r}"
+            self._block_live_settlement_ledger(reason)
+            raise SettlementLedgerError(reason)
+        return {
+            "client_order_id": order_id,
+            "order_id": order_id,
+            "status": "INTENT_PERSISTED",
+            "order_side": "BUY",
+            "order_type": "market_ioc",
+            "quote_quantity": True,
+            "quantity_mode": "quote_quantity",
+            "direction": direction,
+            "outcome_side": "YES" if direction == "long" else "NO",
+            "trade_label": meta["trade_label"],
+            "spend_amount": meta["size"],
+            "size": meta["size"],
+            "estimated_tokens": meta["estimated_tokens"],
+            "estimated_price": meta["entry_price"],
+            "entry_price": meta["entry_price"],
+            "price_source": price_source,
+            "instrument_id": meta["instrument_id"],
+            "token_id": meta["token_id"],
+            "slug": meta["slug"],
+            "condition_id": meta["condition_id"],
+            "market_start_time": meta["market_start_time"],
+            "market_end_time": meta["market_end_time"],
+            "submitted_at": meta["submitted_at"],
+            "intent_persisted_at": datetime.now(timezone.utc).isoformat(),
+            "signal_score": meta.get("signal_score"),
+            "signal_confidence": meta.get("signal_confidence"),
+        }
+
+    def _persist_submitted_order_intent_locked(
+        self,
+        order_id: str,
+        meta: Dict[str, Any],
+        price_source: str,
+    ) -> None:
+        """Persist order intent before exchange submission without mutating first."""
+        intent = self._build_submitted_order_intent(order_id, meta, price_source)
+        submitted_order_intents = dict(self._submitted_order_intents)
+        submitted_order_intents[order_id] = intent
+        saved_state = self._save_live_trade_ledger_state(
+            open_trades=self._open_live_trades,
+            settled_trades=self._settled_live_trades,
+            seen_events=self._seen_auto_redeem_events,
+            seen_order=self._seen_auto_redeem_event_order,
+            pending_events=self._pending_auto_redeem_events,
+            pending_actual_fills=self._pending_actual_fills,
+            submitted_order_intents=submitted_order_intents,
+        )
+        self._apply_saved_live_trade_ledger_state(saved_state)
+
+    def _terminal_event_audit_payload(self, event) -> Dict[str, Any]:
+        """Capture terminal event fields for submitted-intent audit."""
+        payload = {"event_type": type(event).__name__}
+        for key in (
+            "client_order_id",
+            "venue_order_id",
+            "reason",
+            "ts_event",
+            "ts_init",
+            "account_id",
+            "instrument_id",
+        ):
+            if hasattr(event, key):
+                value = getattr(event, key)
+                payload[key] = str(value) if value is not None else None
+        return payload
+
+    def _decimal_from_terminal_event_field(self, field: str, value) -> Decimal:
+        try:
+            parsed = Decimal(str(value.as_decimal() if hasattr(value, "as_decimal") else value))
+        except Exception as exc:
+            raise SettlementLedgerError(f"terminal event field {field} is not decimal: {value!r}") from exc
+        if not parsed.is_finite():
+            raise SettlementLedgerError(f"terminal event field {field} is not finite: {value!r}")
+        return parsed
+
+    def _verify_terminal_event_no_fill(self, order_id: str, status: str, event) -> Dict[str, str]:
+        """Require explicit zero-fill quantity evidence before classifying terminal no-fill."""
+        zero_quantity_fields = {}
+        non_zero_evidence = {}
+        for key in ("last_qty", "filled_qty", "filled"):
+            if not hasattr(event, key):
+                continue
+            value = getattr(event, key)
+            if value in (None, ""):
+                non_zero_evidence[key] = str(value)
+                continue
+            try:
+                parsed = self._decimal_from_terminal_event_field(key, value)
+            except SettlementLedgerError as exc:
+                reason = (
+                    f"terminal order event for {order_id} has invalid fill quantity field; "
+                    f"status={status} field={key} value={value!r}: {exc}"
+                )
+                self._block_live_settlement_ledger(reason)
+                raise SettlementLedgerError(reason) from exc
+            if parsed == 0:
+                zero_quantity_fields[key] = str(value)
+            else:
+                non_zero_evidence[key] = str(value)
+
+        for key in ("avg_px", "last_px"):
+            if not hasattr(event, key):
+                continue
+            value = getattr(event, key)
+            if value in (None, ""):
+                continue
+            try:
+                parsed = self._decimal_from_terminal_event_field(key, value)
+            except SettlementLedgerError as exc:
+                reason = (
+                    f"terminal order event for {order_id} has invalid fill price field; "
+                    f"status={status} field={key} value={value!r}: {exc}"
+                )
+                self._block_live_settlement_ledger(reason)
+                raise SettlementLedgerError(reason) from exc
+            if parsed != 0:
+                non_zero_evidence[key] = str(value)
+
+        if hasattr(event, "trade_id"):
+            value = getattr(event, "trade_id")
+            if value not in (None, ""):
+                non_zero_evidence["trade_id"] = str(value)
+
+        if non_zero_evidence:
+            reason = (
+                f"terminal order event for {order_id} had fill evidence; "
+                f"status={status} evidence={non_zero_evidence}"
+            )
+            self._block_live_settlement_ledger(reason)
+            raise SettlementLedgerError(reason)
+        if not zero_quantity_fields:
+            reason = (
+                f"terminal order event for {order_id} lacks verified zero-fill quantity; "
+                f"status={status}"
+            )
+            self._block_live_settlement_ledger(reason)
+            raise SettlementLedgerError(reason)
+        return zero_quantity_fields
+
+    def _mark_submitted_order_intent_terminal_no_fill(
+        self,
+        order_id: str,
+        status: str,
+        event,
+        reason: str,
+        context: str,
+        zero_fill_evidence: Dict[str, str],
+    ) -> bool:
+        """Persist terminal no-fill submitted intent audit without deleting the intent."""
+        if status not in TERMINAL_NO_FILL_INTENT_STATUSES or status == "SUBMISSION_NOT_SEEN":
+            raise SettlementLedgerError(f"invalid terminal no-fill intent status: {status}")
+        with self._settlement_lock:
+            if order_id not in self._submitted_order_intents:
+                block_reason = f"submitted order intent missing for terminal no-fill audit: {order_id}"
+                self._block_live_settlement_ledger(block_reason)
+                raise SettlementLedgerError(block_reason)
+            submitted_order_intents = dict(self._submitted_order_intents)
+            existing_intent = submitted_order_intents[order_id]
+            if not isinstance(existing_intent, dict):
+                block_reason = f"submitted order intent for terminal no-fill audit is not a JSON object: {order_id}"
+                self._block_live_settlement_ledger(block_reason)
+                raise SettlementLedgerError(block_reason)
+            intent = dict(existing_intent)
+            intent.update(
+                {
+                    "status": status,
+                    "needs_reconciliation": False,
+                    "terminal_no_fill_at": datetime.now(timezone.utc).isoformat(),
+                    "terminal_no_fill_reason": reason,
+                    "terminal_no_fill_event": self._terminal_event_audit_payload(event),
+                    "terminal_no_fill_zero_quantity_evidence": dict(zero_fill_evidence),
+                }
+            )
+            submitted_order_intents[order_id] = intent
+            saved_state = self._try_save_live_trade_ledger_state(
+                context,
+                open_trades=self._open_live_trades,
+                settled_trades=self._settled_live_trades,
+                seen_events=self._seen_auto_redeem_events,
+                seen_order=self._seen_auto_redeem_event_order,
+                pending_events=self._pending_auto_redeem_events,
+                pending_actual_fills=self._pending_actual_fills,
+                submitted_order_intents=submitted_order_intents,
+            )
+            if saved_state is None:
+                return False
+            self._apply_saved_live_trade_ledger_state(saved_state)
+            return True
+
+    def _release_submitted_position(
+        self,
+        client_order_id,
+        terminal_intent_status: Optional[str] = None,
+        terminal_event=None,
+    ) -> Optional[Dict[str, Any]]:
         """Release locally tracked exposure for an order that did not stay open."""
         order_id = str(client_order_id)
-        meta = self._pop_submitted_position(order_id)
-        if not meta:
-            return None
-        try:
-            if hasattr(self.risk_engine, "release_position"):
-                self.risk_engine.release_position(order_id)
-            else:
-                self.risk_engine.remove_position(order_id, meta["entry_price"])
-        except Exception as e:
-            logger.warning(f"Failed to release risk position for {order_id}: {e}")
+        with self._settlement_lock:
+            meta = self._submitted_positions.get(order_id)
+            has_submitted_intent = order_id in self._submitted_order_intents
+        zero_fill_evidence = None
+        if terminal_intent_status is not None:
+            zero_fill_evidence = self._verify_terminal_event_no_fill(
+                order_id,
+                terminal_intent_status,
+                terminal_event,
+            )
+            if has_submitted_intent:
+                saved = self._mark_submitted_order_intent_terminal_no_fill(
+                    order_id=order_id,
+                    status=terminal_intent_status,
+                    event=terminal_event,
+                    reason=str(getattr(terminal_event, "reason", "")),
+                    context="Failed to persist terminal submitted order intent audit",
+                    zero_fill_evidence=zero_fill_evidence,
+                )
+                if not saved:
+                    raise SettlementLedgerError(
+                        f"failed to persist terminal submitted order intent audit for {order_id}"
+                    )
+            elif meta:
+                block_reason = f"submitted order intent missing for terminal no-fill audit: {order_id}"
+                self._block_live_settlement_ledger(block_reason)
+                raise SettlementLedgerError(block_reason)
+        if meta:
+            self._release_risk_position_without_pnl(order_id, "submitted-order risk release")
+            with self._settlement_lock:
+                self._submitted_positions.pop(order_id, None)
         return meta
+
+    def _record_invalid_live_fill_unknown(
+        self,
+        order_id: str,
+        fill_price,
+        fill_qty,
+        reason: str,
+    ) -> bool:
+        payload = {
+            "status": "failed",
+            "reason": reason,
+            "fill_price": str(fill_price),
+            "fill_qty": str(fill_qty),
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._create_direct_fill_unknown_preserving_pending(order_id, payload)
+        self._block_live_settlement_ledger(
+            f"refused fill for {order_id}: {reason}; "
+            "SETTLEMENT_UNKNOWN created for manual reconciliation"
+        )
+        return False
+
+    def _create_direct_fill_unknown_preserving_pending(self, order_id: str, payload: Dict[str, Any]) -> None:
+        payload = dict(payload)
+        reason = str(payload["reason"])
+        payload["requires_external_fill_repair"] = True
+        payload["external_fill_repair_reason"] = reason
+        self._mark_pending_actual_fill_external_repair(order_id, payload, reason)
+        self._create_durable_settlement_unknown_from_actual_fill(
+            client_order_id=order_id,
+            payload=payload,
+            reason=reason,
+        )
 
     def _record_live_order_fill(self, order_id: str, fill_price: Decimal, fill_qty: Decimal) -> bool:
         """Track cumulative live fills until final market settlement."""
         with self._settlement_lock:
             if self._settlement_ledger_blocked_reason:
-                logger.error(
-                    f"LIVE FILL IGNORED: settlement ledger is blocked for {order_id}; "
-                    f"{self._settlement_ledger_blocked_reason}"
+                blocked_reason = self._settlement_ledger_blocked_reason
+                pending_actual_fill = self._pending_actual_fills.get(order_id)
+                if (
+                    isinstance(pending_actual_fill, dict)
+                    and pending_actual_fill.get("requires_external_fill_repair") is True
+                ):
+                    reason = (
+                        f"live fill received for {order_id} while pending actual fill requires external repair: "
+                        f"{blocked_reason}"
+                    )
+                    self._block_live_settlement_ledger(reason)
+                    raise SettlementLedgerError(reason)
+                payload = {
+                    "status": "failed",
+                    "reason": "live_fill_received_while_settlement_ledger_blocked",
+                    "fill_price": str(fill_price),
+                    "fill_qty": str(fill_qty),
+                    "received_at": datetime.now(timezone.utc).isoformat(),
+                    "blocked_reason": blocked_reason,
+                }
+                if order_id not in self._open_live_trades:
+                    payload["filled_qty"] = str(fill_qty)
+                    payload["vwap"] = str(fill_price)
+                self._create_direct_fill_unknown_preserving_pending(order_id, payload)
+                reason = (
+                    f"live fill received while settlement ledger is blocked for {order_id}: "
+                    f"{blocked_reason}; SETTLEMENT_UNKNOWN created"
                 )
-                return False
+                self._block_live_settlement_ledger(reason)
+                raise SettlementLedgerError(reason)
 
+            try:
+                fill_price = Decimal(str(fill_price))
+                fill_qty = Decimal(str(fill_qty))
+            except Exception:
+                return self._record_invalid_live_fill_unknown(
+                    order_id,
+                    fill_price,
+                    fill_qty,
+                    "invalid_fill_price_or_qty_from_nautilus",
+                )
+            if not fill_price.is_finite() or not fill_qty.is_finite():
+                return self._record_invalid_live_fill_unknown(
+                    order_id,
+                    fill_price,
+                    fill_qty,
+                    "non_finite_fill_price_or_qty_from_nautilus",
+                )
+            if fill_price <= Decimal("0"):
+                return self._record_invalid_live_fill_unknown(
+                    order_id,
+                    fill_price,
+                    fill_qty,
+                    "non_positive_fill_price_from_nautilus",
+                )
+            if fill_qty <= Decimal("0"):
+                return self._record_invalid_live_fill_unknown(
+                    order_id,
+                    fill_price,
+                    fill_qty,
+                    "non_positive_fill_qty_from_nautilus",
+                )
+            if fill_price > Decimal("1"):
+                return self._record_invalid_live_fill_unknown(
+                    order_id,
+                    fill_price,
+                    fill_qty,
+                    "fill_price_above_one_from_nautilus",
+                )
+
+            source_kind = "submitted"
             source_meta = self._submitted_positions.get(order_id)
             if source_meta is None:
+                source_kind = "open"
                 source_meta = self._open_live_trades.get(order_id)
             if source_meta is None:
-                logger.warning(f"Received fill for untracked order {order_id}; settlement mapping unavailable")
+                payload = {
+                    "status": "failed",
+                    "reason": "untracked_nautilus_fill",
+                    "filled_qty": str(fill_qty),
+                    "vwap": str(fill_price),
+                    "fill_price": str(fill_price),
+                    "fill_qty": str(fill_qty),
+                    "received_at": datetime.now(timezone.utc).isoformat(),
+                }
+                self._create_direct_fill_unknown_preserving_pending(order_id, payload)
+                self._block_live_settlement_ledger(
+                    f"received fill for untracked order {order_id}; "
+                    "SETTLEMENT_UNKNOWN created for manual reconciliation"
+                )
                 return False
             meta = copy.deepcopy(source_meta)
+            submitted_intent = self._submitted_order_intents.get(order_id)
+            if submitted_intent is not None:
+                if isinstance(submitted_intent, dict):
+                    meta["submitted_order_intent"] = copy.deepcopy(submitted_intent)
+                else:
+                    meta["submitted_order_intent_malformed"] = True
+                    meta["submitted_order_intent_raw"] = copy.deepcopy(submitted_intent)
+            direction_raw = str(meta.get("direction") or "").lower()
+            if direction_raw not in {"long", "short"}:
+                payload = {
+                    "status": "failed",
+                    "reason": "invalid_fill_direction_metadata",
+                    "fill_price": str(fill_price),
+                    "fill_qty": str(fill_qty),
+                    "direction": meta.get("direction"),
+                    "received_at": datetime.now(timezone.utc).isoformat(),
+                }
+                if source_kind != "open":
+                    payload["filled_qty"] = str(fill_qty)
+                    payload["vwap"] = str(fill_price)
+                self._create_direct_fill_unknown_preserving_pending(order_id, payload)
+                self._block_live_settlement_ledger(
+                    f"refused fill for {order_id}: invalid direction metadata {meta.get('direction')!r}; "
+                    "SETTLEMENT_UNKNOWN created for manual reconciliation"
+                )
+                return False
+            actual_qty = meta.pop("_actual_filled_qty", None)
+            actual_px = meta.pop("_actual_fill_vwap", None)
+            if (actual_qty is None) != (actual_px is None):
+                payload = {
+                    "status": "failed",
+                    "reason": "actual_fill_override_incomplete",
+                    "fill_price": str(fill_price),
+                    "fill_qty": str(fill_qty),
+                    "received_at": datetime.now(timezone.utc).isoformat(),
+                }
+                self._create_direct_fill_unknown_preserving_pending(order_id, payload)
+                self._block_live_settlement_ledger(
+                    f"refused fill for {order_id}: incomplete actual-fill override; "
+                    "SETTLEMENT_UNKNOWN created for manual reconciliation"
+                )
+                return False
+            if actual_qty is not None and actual_px is not None:
+                try:
+                    fill_qty = Decimal(str(actual_qty))
+                    fill_price = Decimal(str(actual_px))
+                except Exception:
+                    payload = {
+                        "status": "failed",
+                        "reason": "actual_fill_override_invalid_decimal",
+                        "fill_price": str(actual_px),
+                        "fill_qty": str(actual_qty),
+                        "received_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    self._create_direct_fill_unknown_preserving_pending(order_id, payload)
+                    self._block_live_settlement_ledger(
+                        f"refused fill for {order_id}: actual fill override decimal parsing failed; "
+                        "SETTLEMENT_UNKNOWN created for manual reconciliation"
+                    )
+                    return False
+                if not fill_qty.is_finite() or not fill_price.is_finite():
+                    payload = {
+                        "status": "failed",
+                        "reason": "actual_fill_override_non_finite_qty_or_vwap",
+                        "fill_price": str(fill_price),
+                        "fill_qty": str(fill_qty),
+                        "received_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    self._create_direct_fill_unknown_preserving_pending(order_id, payload)
+                    self._block_live_settlement_ledger(
+                        f"refused fill for {order_id}: actual fill override has non-finite "
+                        f"fill_price={fill_price} fill_qty={fill_qty}; "
+                        "SETTLEMENT_UNKNOWN created for manual reconciliation"
+                    )
+                    return False
+                if fill_qty <= Decimal("0") or fill_price <= Decimal("0"):
+                    payload = {
+                        "status": "failed",
+                        "reason": "actual_fill_override_non_positive_qty_or_vwap",
+                        "fill_price": str(fill_price),
+                        "fill_qty": str(fill_qty),
+                        "received_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    self._create_direct_fill_unknown_preserving_pending(order_id, payload)
+                    self._block_live_settlement_ledger(
+                        f"refused fill for {order_id}: actual fill override has "
+                        f"fill_price={fill_price} fill_qty={fill_qty}; "
+                        "SETTLEMENT_UNKNOWN created for manual reconciliation"
+                    )
+                    return False
+                if fill_price > Decimal("1"):
+                    payload = {
+                        "status": "failed",
+                        "reason": "actual_fill_override_vwap_above_one",
+                        "fill_price": str(fill_price),
+                        "fill_qty": str(fill_qty),
+                        "received_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    self._create_direct_fill_unknown_preserving_pending(order_id, payload)
+                    self._block_live_settlement_ledger(
+                        f"refused fill for {order_id}: actual fill override has "
+                        f"fill_price={fill_price} > 1; "
+                        "SETTLEMENT_UNKNOWN created for manual reconciliation"
+                    )
+                    return False
 
-            previous_qty = Decimal(str(meta.get("filled_qty") or "0"))
-            previous_notional = Decimal(str(meta.get("filled_notional") or "0"))
+            pending_actual_fill = self._pending_actual_fills.get(order_id)
+            if isinstance(pending_actual_fill, dict):
+                if pending_actual_fill.get("requires_external_fill_repair") is True:
+                    reason = f"pending actual fill for {order_id} already requires external repair"
+                    self._block_live_settlement_ledger(reason)
+                    raise SettlementLedgerError(reason)
+                for key in ("venue_order_id", "condition_id", "token_id", "slug"):
+                    value = pending_actual_fill.get(key)
+                    if value not in (None, ""):
+                        meta[key] = value
+                if pending_actual_fill.get("raw_callback_payload") not in (None, ""):
+                    meta["raw_actual_fill_payload"] = copy.deepcopy(pending_actual_fill["raw_callback_payload"])
+
+            if source_kind == "open":
+                try:
+                    open_size, open_filled_qty, _open_entry_price = self._settlement_accounting_values(order_id, meta)
+                    raw_filled_notional = meta.get("filled_notional")
+                    if raw_filled_notional in (None, ""):
+                        raise SettlementLedgerError(f"{order_id} missing verified filled_notional")
+                    filled_notional = Decimal(str(raw_filled_notional))
+                    if (
+                        not filled_notional.is_finite()
+                        or filled_notional <= 0
+                        or abs(filled_notional - open_size) > SETTLEMENT_ACCOUNTING_COST_TOLERANCE
+                    ):
+                        raise SettlementLedgerError(
+                            f"{order_id} has inconsistent filled_notional: {raw_filled_notional!r}"
+                        )
+                    previous_qty = open_filled_qty
+                    previous_notional = open_size
+                except Exception as exc:
+                    payload = {
+                        "status": "failed",
+                        "reason": "invalid_open_fill_accounting",
+                        "fill_price": str(fill_price),
+                        "fill_qty": str(fill_qty),
+                        "received_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    self._create_direct_fill_unknown_preserving_pending(order_id, payload)
+                    self._block_live_settlement_ledger(
+                        f"refused fill for {order_id}: invalid open fill accounting: {exc}; "
+                        "SETTLEMENT_UNKNOWN created for manual reconciliation"
+                    )
+                    return False
+            else:
+                raw_previous_qty = meta.get("filled_qty")
+                raw_previous_notional = meta.get("filled_notional")
+                if raw_previous_qty in (None, "") and raw_previous_notional in (None, ""):
+                    previous_qty = Decimal("0")
+                    previous_notional = Decimal("0")
+                elif raw_previous_qty in (None, "") or raw_previous_notional in (None, ""):
+                    payload = {
+                        "status": "failed",
+                        "reason": "missing_previous_fill_accounting",
+                        "fill_price": str(fill_price),
+                        "fill_qty": str(fill_qty),
+                        "previous_filled_qty": str(raw_previous_qty),
+                        "previous_filled_notional": str(raw_previous_notional),
+                        "received_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    self._create_direct_fill_unknown_preserving_pending(order_id, payload)
+                    self._block_live_settlement_ledger(
+                        f"refused fill for {order_id}: missing previous fill accounting; "
+                        "SETTLEMENT_UNKNOWN created for manual reconciliation"
+                    )
+                    return False
+                else:
+                    try:
+                        previous_qty = Decimal(str(raw_previous_qty))
+                        previous_notional = Decimal(str(raw_previous_notional))
+                    except Exception:
+                        payload = {
+                            "status": "failed",
+                            "reason": "invalid_previous_fill_accounting",
+                            "fill_price": str(fill_price),
+                            "fill_qty": str(fill_qty),
+                            "previous_filled_qty": str(raw_previous_qty),
+                            "previous_filled_notional": str(raw_previous_notional),
+                            "received_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                        self._create_direct_fill_unknown_preserving_pending(order_id, payload)
+                        self._block_live_settlement_ledger(
+                            f"refused fill for {order_id}: invalid previous fill accounting; "
+                            "SETTLEMENT_UNKNOWN created for manual reconciliation"
+                        )
+                        return False
+            if (
+                not previous_qty.is_finite()
+                or not previous_notional.is_finite()
+                or previous_qty < 0
+                or previous_notional < 0
+            ):
+                payload = {
+                    "status": "failed",
+                    "reason": "impossible_previous_fill_accounting",
+                    "fill_price": str(fill_price),
+                    "fill_qty": str(fill_qty),
+                    "previous_filled_qty": str(previous_qty),
+                    "previous_filled_notional": str(previous_notional),
+                    "received_at": datetime.now(timezone.utc).isoformat(),
+                }
+                self._create_direct_fill_unknown_preserving_pending(order_id, payload)
+                self._block_live_settlement_ledger(
+                    f"refused fill for {order_id}: impossible previous fill accounting; "
+                    "SETTLEMENT_UNKNOWN created for manual reconciliation"
+                )
+                return False
             first_recorded_fill = previous_qty <= 0
             fill_notional = fill_price * fill_qty
             total_qty = previous_qty + fill_qty
@@ -2824,6 +5414,10 @@ class IntegratedBTCStrategy(Strategy):
 
             open_trades = dict(self._open_live_trades)
             open_trades[order_id] = meta
+            pending_actual_fills = dict(self._pending_actual_fills)
+            pending_actual_fills.pop(order_id, None)
+            submitted_order_intents = dict(self._submitted_order_intents)
+            submitted_order_intents.pop(order_id, None)
             saved_state = self._try_save_live_trade_ledger_state(
                 "Failed to persist live order fill",
                 open_trades=open_trades,
@@ -2831,15 +5425,13 @@ class IntegratedBTCStrategy(Strategy):
                 seen_events=self._seen_auto_redeem_events,
                 seen_order=self._seen_auto_redeem_event_order,
                 pending_events=self._pending_auto_redeem_events,
+                pending_actual_fills=pending_actual_fills,
+                submitted_order_intents=submitted_order_intents,
             )
             if saved_state is None:
-                return False
+                raise SettlementLedgerError(f"failed to persist live order fill for {order_id}")
 
-            self._open_live_trades = dict(saved_state["open"])
-            self._settled_live_trades = list(saved_state["settled"])
-            self._seen_auto_redeem_events = set(saved_state["seen"])
-            self._seen_auto_redeem_event_order = list(saved_state["seen_order"])
-            self._pending_auto_redeem_events = dict(saved_state["pending"])
+            self._apply_saved_live_trade_ledger_state(saved_state)
             self._submitted_positions.pop(order_id, None)
 
             try:
@@ -2847,10 +5439,12 @@ class IntegratedBTCStrategy(Strategy):
                     position_id=order_id,
                     size=total_notional,
                     entry_price=average_price,
-                    direction="buy_yes" if meta.get("direction") == "long" else "buy_no",
+                    direction="buy_yes" if direction_raw == "long" else "buy_no",
                 )
             except Exception as e:
-                logger.warning(f"Failed to adjust risk position for fill {order_id}: {e}")
+                reason = f"failed to adjust risk position for fill {order_id}: {e}"
+                self._block_live_settlement_ledger(reason)
+                raise SettlementLedgerError(reason) from e
             logger.info(
                 f"Tracking live trade for settlement: {order_id} "
                 f"filled_qty={total_qty:.6f} notional=${total_notional:.6f} "
@@ -2880,7 +5474,11 @@ class IntegratedBTCStrategy(Strategy):
         logger.error(f"  Order: {event.client_order_id}")
         logger.error(f"  Reason: {event.reason}")
         logger.error("=" * 80)
-        self._release_submitted_position(event.client_order_id)
+        self._release_submitted_position(
+            event.client_order_id,
+            terminal_intent_status="ORDER_DENIED_NO_FILL",
+            terminal_event=event,
+        )
         reason_lower = str(event.reason).lower()
         if (
             "no-price-to-convert-quote-qty" in reason_lower
@@ -2905,7 +5503,27 @@ class IntegratedBTCStrategy(Strategy):
             self.last_trade_time = -1  # Allow retry on next quote tick
         else:
             logger.warning(f"Order rejected: {reason}")
-        self._release_submitted_position(getattr(event, "client_order_id", ""))
+        self._release_submitted_position(
+            getattr(event, "client_order_id", ""),
+            terminal_intent_status="ORDER_REJECTED_NO_FILL",
+            terminal_event=event,
+        )
+
+    def on_order_canceled(self, event):
+        logger.warning(f"Order canceled: {getattr(event, 'client_order_id', '')}")
+        self._release_submitted_position(
+            getattr(event, "client_order_id", ""),
+            terminal_intent_status="ORDER_CANCELED_NO_FILL",
+            terminal_event=event,
+        )
+
+    def on_order_expired(self, event):
+        logger.warning(f"Order expired: {getattr(event, 'client_order_id', '')}")
+        self._release_submitted_position(
+            getattr(event, "client_order_id", ""),
+            terminal_intent_status="ORDER_EXPIRED_NO_FILL",
+            terminal_event=event,
+        )
 
     # ------------------------------------------------------------------
     # Grafana / stop
@@ -2924,8 +5542,21 @@ class IntegratedBTCStrategy(Strategy):
     def on_stop(self):
         logger.info("Integrated BTC strategy stopped")
         logger.info(f"Total simulation decision observations recorded: {len(self.paper_trades)}")
+        unregister_error = None
+        if self._actual_fill_registered:
+            try:
+                unregister_actual_fill_handler(self._actual_fill_handler)
+            except Exception as exc:
+                logger.exception("Failed to unregister Polymarket actual-fill handler")
+                unregister_error = exc
+            self._actual_fill_registered = False
         if self._auto_redeem_registered:
-            unregister_auto_redeem_handler(self._auto_redeem_handler)
+            try:
+                unregister_auto_redeem_handler(self._auto_redeem_handler)
+            except Exception as exc:
+                logger.exception("Failed to unregister Polymarket auto-redeem handler")
+                if unregister_error is None:
+                    unregister_error = exc
             self._auto_redeem_registered = False
         try:
             self._save_live_trade_ledger()
@@ -2938,10 +5569,23 @@ class IntegratedBTCStrategy(Strategy):
                 loop.run_until_complete(self.grafana_exporter.stop())
             except Exception:
                 pass
+        if unregister_error is not None:
+            raise SettlementLedgerError("failed to unregister Polymarket handler") from unregister_error
 
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
+
+def ensure_live_market_order_patch() -> None:
+    """Apply/verify the market-order adapter patch before live execution starts."""
+    global patch_applied
+    if patch_applied:
+        return
+    patch_applied = apply_market_order_patch()
+    if not patch_applied:
+        raise RuntimeError("Live mode requires market order patch to be applied")
+    logger.info("Market order patch applied successfully")
+
 
 def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, test_mode: bool = False):
     """Run the integrated BTC 15-min trading bot - LOADS ALL BTC MARKETS FOR THE DAY"""
@@ -2952,8 +5596,7 @@ def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, tes
     print("=" * 80)
 
     if not simulation:
-        if not patch_applied:
-            raise RuntimeError("Live mode requires market order patch to be applied")
+        ensure_live_market_order_patch()
         if not v2_patch_applied:
             raise RuntimeError("Live mode requires Polymarket CLOB v2 compatibility patch")
 
@@ -2980,7 +5623,12 @@ def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, tes
     print(f"  Initial Mode: {'SIMULATION' if simulation else 'LIVE TRADING'}")
     print(f"  Redis Control: {'Enabled' if redis_client else 'Disabled'}")
     print(f"  Grafana: {'Enabled' if enable_grafana else 'Disabled'}")
-    print(f"  Max Trade Size: ${os.getenv('MARKET_BUY_USD', '1.00')}")
+    # Print the validated MARKET_BUY_USD. In live mode the Phase 0.3 gate has
+    # already raised before reaching here if the env value is missing/invalid,
+    # so get_market_buy_usd() returns a real value. In simulation the existing
+    # legacy default applies (tracked in the AGENTS.md/CLAUDE.md no-fallback
+    # audit as a pre-existing item, not introduced by Phase 0.3).
+    print(f"  Max Trade Size: ${get_market_buy_usd()}")
     print(f"  Quote stability gate: {QUOTE_STABILITY_REQUIRED} valid ticks")
     print()
 
@@ -3028,6 +5676,8 @@ def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, tes
     polymarket_api_secret = str(polymarket_creds["api_secret"])
     polymarket_passphrase = str(polymarket_creds["passphrase"])
     polymarket_signature_type = int(polymarket_creds["signature_type"])
+    # Phase 0.5a / 1.227.0 migration: Polymarket config field was renamed
+    # `instrument_provider` -> `instrument_config` in nautilus_trader 1.227.0.
     poly_data_cfg = PolymarketDataClientConfig(
         private_key=polymarket_private_key,
         api_key=polymarket_api_key,
@@ -3035,7 +5685,7 @@ def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, tes
         passphrase=polymarket_passphrase,
         signature_type=polymarket_signature_type,
         funder=polymarket_funder,
-        instrument_provider=instrument_cfg,
+        instrument_config=instrument_cfg,
     )
 
     poly_exec_cfg = None
@@ -3047,7 +5697,7 @@ def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, tes
             passphrase=polymarket_passphrase,
             signature_type=polymarket_signature_type,
             funder=polymarket_funder,
-            instrument_provider=instrument_cfg,
+            instrument_config=instrument_cfg,
         )
 
     config = TradingNodeConfig(
@@ -3060,7 +5710,6 @@ def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, tes
         data_engine=LiveDataEngineConfig(qsize=6000),
         exec_engine=LiveExecEngineConfig(
             qsize=6000,
-            convert_quote_qty_to_base=False,
         ),
         risk_engine=LiveRiskEngineConfig(bypass=simulation),
         data_clients={POLYMARKET: poly_data_cfg},
@@ -3105,8 +5754,47 @@ def parse_runtime_args(argv=None):
                             help="Run in LIVE mode (real money at risk!). Default is simulation.")
     mode_group.add_argument("--test-mode", action="store_true",
                             help="Run in TEST MODE (decision observations every minute)")
+    parser.add_argument(
+        "--confirm-live",
+        action="store_true",
+        help=(
+            "Skip the interactive 'LIVE' confirmation prompt for --live. "
+            "Only valid alongside --live; no env var, config file, or default "
+            "replaces this flag."
+        ),
+    )
     parser.add_argument("--no-grafana", action="store_true", help="Disable Grafana metrics")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.confirm_live and not args.live:
+        parser.error("--confirm-live is only valid alongside --live")
+    return args
+
+
+def _prompt_for_live_confirmation() -> None:
+    """Require the operator to type 'LIVE' to acknowledge --live startup.
+
+    Phase 0.3 live startup gate: --live alone requires the operator to type
+    exactly the literal string 'LIVE' (case sensitive, no whitespace tolerance).
+    --live --confirm-live skips this prompt with a logged audit line instead.
+
+    EOFError on non-interactive stdin (piped, daemonized via systemd without
+    a TTY, Docker without -it, etc.) is treated as "operator did not confirm"
+    and aborts startup with the same SystemExit shape as a wrong literal. The
+    operator must pass --confirm-live for unattended startup.
+    """
+    print("=" * 80)
+    print("LIVE TRADING MODE — REAL MONEY AT RISK")
+    print("Type LIVE (in uppercase) to confirm, anything else to abort.")
+    print("=" * 80)
+    try:
+        confirm = input("Confirm live startup: ")
+    except EOFError:
+        raise SystemExit(
+            "Live startup cancelled: stdin is not a TTY; use --confirm-live "
+            "for unattended (systemd/cron/Docker) startup"
+        )
+    if confirm != "LIVE":
+        raise SystemExit("Live startup cancelled: operator did not type LIVE")
 
 
 def main():
@@ -3117,6 +5805,18 @@ def main():
     simulation = not args.live
 
     if not simulation:
+        # Phase 0.3 gate (1): MARKET_BUY_USD > 5.50 strict before any node startup
+        enforce_live_market_buy_usd_gate()
+
+        # Phase 0.3 gate (2): interactive LIVE confirmation unless --confirm-live
+        if args.confirm_live:
+            logger.warning(
+                "Live confirmation provided by explicit --confirm-live CLI flag; "
+                "skipping interactive LIVE prompt"
+            )
+        else:
+            _prompt_for_live_confirmation()
+
         logger.warning("=" * 80)
         logger.warning("LIVE TRADING MODE — REAL MONEY AT RISK!")
         logger.warning("=" * 80)

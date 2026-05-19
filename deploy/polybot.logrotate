@@ -1,0 +1,16 @@
+# Phase 8 — logrotate config for the Polymarket BTC bot.
+# Copy to /etc/logrotate.d/polybot (root:root, mode 0644).
+#
+# Rotates the bot's stdout/stderr log (if you redirect journalctl to a file)
+# and the decisions.jsonl observation log produced by Phase 2.4 wiring.
+
+/opt/polybot/logs/bot.log /opt/polybot/ledger/decisions.jsonl {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 polybot polybot
+    sharedscripts
+}

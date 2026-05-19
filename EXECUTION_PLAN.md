@@ -2,6 +2,62 @@
 
 This document lays out the full sequence of fixes and enhancements before the next live run. Each phase has a clear purpose, scope, exit criteria, and effort estimate. Phases are ordered by criticality, not by ambition.
 
+## Implementation status snapshot
+
+| Phase | Status | Notes |
+| --- | --- | --- |
+| 0.1 actual-fill scaffold + durable unknown + pre-submit intent audit | **SHIPPED** | `bot.py`, `mark_settlement_resolved.py`, `patch_market_orders.py` |
+| 0.2 zero-price ledger guard | **SHIPPED** | `bot.py` `_record_live_order_fill` |
+| 0.3 live startup gates (`MARKET_BUY_USD > 5.50` + `--confirm-live`) | **SHIPPED** | `bot.py` `enforce_live_market_buy_usd_gate` + `_prompt_for_live_confirmation` |
+| 0.3 VWAP `avg_px` injection | **RESOLVED upstream** | `nautilus_trader==1.227.0` ships `_weighted_average_price` |
+| 0.4 token-dust normalization | **RESOLVED upstream** | 1.227.0 ships `_fill_tracker.snap_fill_qty` |
+| 0.4 UUID4 client-id fallback removal at 3 sites | **SHIPPED in-tree** | `patch_market_orders.apply_uuid_fallback_guard_patch` (pinned to 1.227.0) |
+| 0.5 `quote_quantity=True` units mismatch | **RESOLVED upstream** | 1.227.0 ships `base_quantity = takerAmount/1e6` |
+| 0.5a Nautilus 1.227.0 clean-env audit + upgrade | **SHIPPED** | `requirements.txt`, `bot.py` `instrument_config` rename |
+| 0.6 regression tests | **SHIPPED for 0.1-0.4 + 0.5a** | 290 passing tests |
+| 0.7 manual recovery of the lost `$11` trade | **operator action** | Awaiting operator + Polymarket UI verification |
+| 1.1 wire/remove `STOP_LOSS_PCT` / `TAKE_PROFIT_PCT` / `SPIKE_THRESHOLD` / `DIVERGENCE_THRESHOLD` | **SHIPPED — Option B** | Removed from README/.env.example; remain code-owned constants |
+| 1.2 README env-section docs | **SHIPPED** | New "Env vars that are NOT wired" + "Live startup gates" sections |
+| 1.3 `.env.example` | **SHIPPED** | With warning banner; `.gitignore` exception added |
+| 2.4 structured `decisions.jsonl` writer | **SHIPPED + WIRED** | `decision_log.py:DecisionRecord` + 10 tests; wiring landed in `bot.py` `_make_trading_decision_body` with `rec.reject(gate, reason)` at every early-return and `rec.decided(direction=...)` at the positive path |
+| 2.5 dynamic sizing + balance freshness | **VALIDATORS SHIPPED** | `bot.py:get_sizing_mode_for_live` + `get_pct_of_free_collateral_per_trade` + 6 tests; AccountState freshness hook + sizing-mode integration in `_make_trading_decision` still pending |
+| 3 ORDER_TYPE (market_ioc / limit_ioc) | **VALIDATORS + LIMIT HELPERS SHIPPED** | `bot.py:get_order_type_for_live`, `get_validated_limit_required_edge`, `compute_limit_price`, `compute_limit_order_token_qty` + 15 tests. LIMIT order-factory branch in `_place_real_order` + 1.227.0 wire-format verification deferred (still blocked by Phase 4/4.5 data gates per plan) |
+| 4 calibration analysis | **SCRIPT SHIPPED, DATA PENDING** | `analyze_calibration.py` + 16 tests; needs `n>=100` settled live trades to decide |
+| 4.5 strategy timing / price-band evaluation | **OBSERVABILITY FIELDS SHIPPED** | `bot.py:trade_window_label_for_seconds_into_sub_interval` + `trend_price_band_for` populate `seconds_into_sub_interval`, `trade_window_label`, `trend_price_band` on every `decisions.jsonl` record. Full shadow-policy observation mode (run candidate windows without submitting) deferred — needs accumulated data and a separate review cycle |
+| 5A market-depth estimator helpers + EV-gate WIRING | **SHIPPED + WIRED** | `depth_estimator.py` + 22 tests; EV-gate now uses `_compute_depth_aware_entry` to compute VWAP via `estimate_market_ioc_fill` on the SELECTED token's asks (YES book for long, NO book for short). Fail-closed on missing token id, fetch error, empty asks, invalid book level, or book too thin. 5 new wiring tests covering each fail-closed branch. |
+| 5B LIMIT_IOC depth integration | **UNIFIED HELPER SHIPPED** | `depth_estimator.estimate_fill_for_order_type` dispatches by ORDER_TYPE + 7 tests; EV-gate caller wiring in `_make_trading_decision` deferred (needs own review cycle per CLAUDE.md rule #5) |
+| 6 SOPS credential management | **GUARD MODULE + TEMPLATES SHIPPED** | `phase_6_sops_check.py:refuse_plaintext_env_in_live_mode` (Pattern A check, 9 tests) + `deploy/.env.sops.yaml.example` + `deploy/polybot.service` SOPS variant + `deploy/README.md` SOPS section. Wiring into `bot.py` is a one-line operator opt-in (per plan: "Operator must approve exactly one implementation before Phase 6 work starts") |
+| 7 live env reload | **DECIDED — Option C** | "Don't implement"; restart-driven config workflow documented in `README.md` + `deploy/README.md`. Effort: 0 days per plan |
+| 7.5 multi-asset evaluation | **EVALUATION TEMPLATE SHIPPED** | `deploy/PHASE_7_5_multi_asset_evaluation_template.md` — operator fills in asset selection + topology + per-asset calibration decision; follow-up implementation effort sized in the template by topology choice |
+| 8 Linux deployment | **TEMPLATES SHIPPED** | `deploy/polybot.service` + `deploy/polybot.logrotate` + `deploy/polybot-ledger-backup.cron` + `deploy/README.md` (install runbook + monitoring + security checklist). Operator copies into place on the target server |
+
+**Live mode is technically unblocked.** All Phase 0 defects that would have blocked or corrupted live trading are now fixed (either upstream via 1.227.0 or in-tree via the Phase 0.4 UUID guard patch). Operator must still complete Phase 0.7 manual recovery of the lost `$11` trade before resuming any live trading.
+
+
+
+---
+
+## No-Fallback Policy For This Plan
+
+This plan contains no approved fallback implementation path. A fallback path means substituting alternate trading data, synthetic identifiers, default policy, default configuration, default price/size, or alternate control flow and then continuing normal operation.
+
+Allowed fail-closed outcomes are not fallback paths: reject the trade, block live settlement, create a durable `SETTLEMENT_UNKNOWN` with real identifiers or `null`, fail startup, or fail-stop the process. Those outcomes stop normal trading and require explicit operator reconciliation.
+
+Any future fallback proposal must be added as an explicit open decision with the exact code path, exact substituted data, every trigger condition, and the operational reason it is unavoidable. Without that approval, the implementation must fail closed.
+
+Additional Phase 0 prohibitions:
+- Admin tools must require an explicit `--ledger` path for every read or write. No `LIVE_TRADE_LEDGER_PATH`, repo-root, current-directory, or other default ledger path is approved for admin tooling.
+- Missing settlement accounting fields must never be coerced into usable values. Missing `size`, `filled_qty`, `entry_price`, `payout`, or `pnl` must either be repaired from externally verified data through an explicit admin command or keep the record unresolved.
+- Submitted or intended spend must never become accounting cost. `submitted_size`, `spend_amount`, `estimated_tokens`, and `estimated_price` are audit-only unless and until actual fill accounting verifies cost and units.
+- Terminal submitted-order events must preserve explicit audit records. Deleting the submitted intent is not an approved terminal path.
+- Stale-flag repair may only clear `needs_reconciliation` after the same sanity checks used by normal reconciliation pass: finite non-negative cost basis, known positive filled units, no overpayout unless a prior explicit overpayout marker exists, and exact `pnl == payout - size`.
+
+## No-Migration Policy For This Plan
+
+This project is treated as a new app deployment. No existing user ledger, configuration, schema, or runtime state needs to be upgraded in place.
+
+Do **not** implement any migration, backfill, upgrade-on-read, upgrade-on-write, key rename, value rewrite, version transform, or compatibility shim for older ledger shapes. If an existing file is not in the current required shape, the app and admin tools must fail closed with a clear error. The operator may replace that file with a freshly initialized current-shape ledger outside the application; application code must not transform old state into new state.
+
 ---
 
 ## Phase 0 — Lost Live Fill Reconciliation
@@ -20,11 +76,26 @@ Phase 0 is **not** a claim that all live trading is currently broken. It is a cl
 
 ### Symptoms observed in production log
 
+The sanitized excerpts below are the canonical incident evidence in this plan. The original local console log is intentionally not linked because `console_logs/` is ignored and not tracked; linking to it would create a broken evidence reference for anyone reviewing the committed plan. Two distinct fill-failure incidents are visible in the captured excerpts:
+
+**Incident A — original $11 trade (the lost fill that triggered this plan):**
+
 ```
 report.avg_px was None
 Generated inferred OrderFilled ... last_qty=17.460316, last_px=0.00
 Order overfill rejected ... quantity=17.460300
 ```
+
+**Incident B — operator's $55 trade (second symptom class, exposes a units-mismatch bug):**
+
+```
+10:43:38.26 ERROR: Order overfill rejected ... potential_overfill=21.388885,
+                   last_qty=76.388885, quantity=55.00            ← units mismatch (tokens vs USDC)
+10:43:43.83 ERROR: Order overfill rejected ... potential_overfill=0.000085,
+                   last_qty=76.388885, quantity=76.388800        ← dust after OrderUpdated
+```
+
+Both incidents are addressed across Phase 0 sub-steps below — Incident A by 0.3 (avg_px) and 0.4 (dust); Incident B by 0.5 (units mismatch) and 0.4 (dust).
 
 ### Root cause
 
@@ -48,91 +119,207 @@ condition_id:      0xd55ee02c5080428bab05c89cf861e347c3a94306d8e0c999b87068f3145
 token_id:          13493549868196599328875182057608566347488679426659046670938216865177784647005
 ```
 
-### Fix order — corrected per reviewer feedback (resolves prior ordering contradictions)
+### Fix order — canonical Phase 0 sequence
 
-Earlier drafts had two ordering problems:
-- 0.3 (dust normalization with callback) depended on VWAP from 0.2.
-- 0.4 (zero-price guard) was listed first, but the guard's durable-unknown call requires `_create_durable_settlement_unknown_from_actual_fill` which is introduced in 0.3a's scaffold.
+Earlier drafts used lettered dependency labels and then tried to execute them out of numeric order. That made the plan hard to implement safely. Phase 0 is now renumbered in the exact order it must ship:
 
-The guard is no longer a "standalone 10-line first commit" — it depends on the durable helper. Corrected sequence:
+1. **0.1: actual-fill callback scaffold + durable unknown helper + pre-submit intent audit.** Adds `register_actual_fill_handler`, `_dispatch_actual_fill`, the strategy-side handler, `_create_durable_settlement_unknown_from_actual_fill`, a fresh v3 ledger schema contract, first-class `venue_order_id` admin-tool support, `pending_actual_fills`, durable `submitted_order_intents`, and `on_stop` unregister. No adapter integration yet.
+2. **0.2: zero-price ledger guard.** Depends on 0.1 because it calls `_create_durable_settlement_unknown_from_actual_fill`.
+3. **0.3: avg_px / VWAP injection.** Uses `get_trades` and dispatches through the callback from 0.1.
+4. **0.4: token-dust normalization.** Clips only adapter-local dust for Nautilus while preserving actual filled units through the side channel.
+5. **0.5: `quote_quantity=True` units-mismatch overfill patch.** Fixes the first, larger overfill in the $55 production log before the 0.4 dust tolerance can apply.
+6. **0.5a: Nautilus 1.227.0 dependency audit for one-sided quote drops.** Ultra-critical because current-instrument quote drops can reduce trade frequency by starving the strategy before `on_quote_tick`.
+7. **0.6: regression tests.** Covers scaffold, guard, VWAP injection, dust, units mismatch, UUID fallback removal, 1.227.0 audit decisions, and fresh-schema validation.
+8. **0.7: manual recovery of the lost `$11` trade.** Done last, after code and tests are in place.
 
-1. **0.3a (now first): scaffold** — `register_actual_fill_handler`, `_dispatch_actual_fill`, the strategy-side handler, AND `_create_durable_settlement_unknown_from_actual_fill`. The full callback + durable-unknown machinery, with no adapter integration yet. The callback signature is `(client_order_id: str, payload: dict)`. Includes the ledger-schema migration for `pending_actual_fills`. Includes `on_stop` unregister. Sized at ~1 day.
-2. **0.4: zero-price ledger guard.** Now depends on 0.3a's `_create_durable_settlement_unknown_from_actual_fill`. The guard's call site uses the helper to create a durable record when a non-positive `fill_price` reaches the recorder.
-3. **0.2:** `get_trades`-based VWAP injection in the adapter report normalization (`PolymarketExecutionClient.generate_order_status_report` per 0.2 above). The adapter dispatches VWAP through the callback wired in 0.3a.
-4. **0.3b:** dust normalization in the same adapter patch. Adapter clips for Nautilus but uses the callback (already wired in 0.3a, populated in 0.2) to carry the actual filled units through to the ledger.
-5. **0.5:** regression tests covering all of the above (zero-price guard, scaffold, get_trades injection, dust normalization, pending_actual_fills schema migration).
-6. **0.1 (last):** manual recovery of the lost `$11` trade. By this point all adapter normalization is in place and tests are green. Running the admin tool last means no further bad fills can corrupt the ledger during the recovery window.
+**Why 0.5 is critical for the operator's target trade sizes:** the spurious overfill at the unit-mismatch stage scales with token count. At `MARKET_BUY_USD=55` and ask=$0.72, the matched size is ~76 tokens, producing a spurious overfill of ~21. The dust-tolerance check in 0.4 is `<=0.001 tokens` — it cannot rescue this. Without 0.5, every $55 trade in the operator's intended sizing config will hit the same lost-fill class as the original $11 incident. Phase 0 is incomplete without 0.5. Phase 0 is also incomplete without 0.5a because current-instrument one-sided quote drops can suppress trade decisions.
 
-**Why this order works:** 0.3a builds the seam (callback + durable helper + schema migration) that everything else uses. 0.4 (the zero-price guard) is no longer "ship first as a 10-line commit" — it's ship-second-and-still-small, because the durable helper it calls must exist first. 0.2 and 0.3b are independent commits that both produce events through the seam.
+#### 0.1 — Actual-fill callback scaffold and durable unknown helper
 
-**Reviewer-flagged earlier mistake:** the previous draft promised "0.4 ships first as ~10 lines" but the actual implementation needs `_create_durable_settlement_unknown_from_actual_fill` to be defined. Either we ship 0.4 with only the process-local block (no durable record — defeats the point), or we ship the helper first. The corrected ordering above does the latter.
+**Scope:** create the callback and durable-ledger machinery that later Phase 0 steps call. This ships first with no adapter integration.
 
-#### 0.1 — Recover the lost trade (done last, after 0.2-0.5 are merged)
+Required pieces:
 
-**Operational prerequisites:**
+- `register_actual_fill_handler`, `unregister_actual_fill_handler`, and `_dispatch_actual_fill(client_order_id, payload)`.
+- Strategy-side handler for `payload["status"] in {"ok", "failed"}` plus an explicit unknown-status branch.
+- `_create_durable_settlement_unknown_from_actual_fill(...)` with first-class `venue_order_id` reconciliation support and no UUID/synthetic-id fallback.
+- Fresh v3 ledger schema contract with load/save support, transactional rollback support, startup unresolved-state detection, and live-blocking behavior. No migration, backfill, compatibility upgrade, startup conversion, or old-ledger rewrite is allowed.
+- Durable pre-submit `submitted_order_intents` persistence so YES/NO intent is on disk before `self.submit_order(order)`.
+- `mark_settlement_resolved.py` support for identifying/listing `pending_actual_fills` as unresolved state and resolving records by `--venue-order-id`.
+- `on_stop` unregister behavior that logs and raises on unregister failure.
 
-- **Stop the bot first.** Run `kill -TERM <pid>` against both the wrapper and `bot.py`. Confirm no `python bot.py` process remains. The admin tool acquires the `live_trades.json.lock` and refuses to run while the bot holds it.
-- **Use the venv Python.** Always `venv/bin/python mark_settlement_resolved.py`, never system `python`. The admin tool depends on the same `Decimal` discipline as the bot.
-- **Pass `--ledger` if the bot was running with a custom `LIVE_TRADE_LEDGER_PATH`.** The tool defaults to `LIVE_TRADE_LEDGER_PATH` env var, then `./live_trades.json`. If the operator ran the bot with `LIVE_TRADE_LEDGER_PATH=/var/lib/bot/live_trades.json`, the tool needs the same path.
+The detailed side-channel contract is expanded in the 0.4 section below because 0.3/0.4 consume it, but the scaffold, durable unknown helper, fresh `pending_actual_fills` ledger section, durable `submitted_order_intents`, admin-tool visibility, first-class `venue_order_id` reconciliation, and UUID-fallback guard are 0.1 deliverables. Implement these before any adapter patch or guard calls them.
 
-**Command (operator must fill in real values, not placeholders):**
+##### Pre-submit YES/NO order-intent persistence
 
-```bash
-venv/bin/python mark_settlement_resolved.py \
-  --ledger /path/to/live_trades.json \
-  --create-unknown-from-external-order 'BTC-15MIN-$11-1779093783343' \
-  --confirm-external-order \
-  --external-size 11.00 \
-  --external-entry-price 0.63 \
-  --external-filled-qty 17.460316 \
-  --external-direction short \
-  --external-trade-label "NO (DOWN)" \
-  --external-instrument-id "0xd55ee02c5080428bab05c89cf861e347c3a94306d8e0c999b87068f3145b7b2b-13493549868196599328875182057608566347488679426659046670938216865177784647005.POLYMARKET" \
-  --external-token-id 13493549868196599328875182057608566347488679426659046670938216865177784647005 \
-  --external-slug "<derive from Polymarket order/condition record for condition_id 0xd55ee02c... — do NOT guess>" \
-  --external-condition-id 0xd55ee02c5080428bab05c89cf861e347c3a94306d8e0c999b87068f3145b7b2b \
-  --external-submitted-at "<actual ISO timestamp with tz, e.g. 2026-05-18T07:43:03+00:00>" \
-  --external-filled-at "<actual ISO timestamp with tz, e.g. 2026-05-18T07:43:05+00:00>" \
-  --external-market-end-time "<actual ISO timestamp with tz, e.g. 2026-05-18T07:45:00+00:00>" \
-  --reason "Nautilus dropped fill event due to missing avg_px and 0.000016 token dust overfill"
+Current code derives `trade_label = "YES (UP)"` / `"NO (DOWN)"` before order construction and keeps that metadata in `_submitted_positions` until a fill path succeeds. That is not durable. If the process crashes after exchange submission but before a fill reaches `_record_live_order_fill`, the operator may lose the YES/NO side, token id, and submitted spend context needed for reconciliation.
+
+Phase 0.1 must add a top-level ledger section named `submitted_order_intents`. The strategy must write one record to this section immediately before `self.submit_order(order)`. If the intent write fails, the bot must reject/fail closed before exchange submission. This is audit persistence, not a fallback path: it records submitted intent only, and it must never be used to invent fills, settlement, P&L, or profitability.
+
+Required persisted fields:
+
+```json
+{
+  "submitted_order_intents": {
+    "BTC-15MIN-$55-1779...": {
+      "client_order_id": "BTC-15MIN-$55-1779...",
+      "trade_label": "YES (UP)",
+      "outcome_side": "YES",
+      "direction": "long",
+      "order_side": "BUY",
+      "order_type": "market_ioc",
+      "quote_quantity": true,
+      "spend_amount": "55.00",
+      "estimated_tokens": "76.388885",
+      "estimated_price": "0.72",
+      "price_source": "YES ask",
+      "instrument_id": "<Nautilus instrument id>",
+      "token_id": "<CLOB token id>",
+      "slug": "<market slug>",
+      "condition_id": "<condition id>",
+      "market_start_time": "<ISO timestamp>",
+      "market_end_time": "<ISO timestamp>",
+      "submitted_at": "<UTC ISO timestamp>",
+      "signal_score": "<numeric score>",
+      "signal_confidence": "<numeric confidence>",
+      "status": "INTENT_PERSISTED"
+    }
+  }
+}
 ```
 
-**Operator must replace every `<...>` placeholder with the real value from Polymarket UI / bot logs.** Do not run the command as written — the slug, instrument-id full form, and timestamps must come from the actual trade.
+For NO orders, the same schema is used with `"trade_label": "NO (DOWN)"`, `"outcome_side": "NO"`, and `"direction": "short"`.
 
-Note: the validation will **pass** because `0.63 * 17.460316 ≈ 11.00000` and `--external-size 11.00` differ by `≈ 0.0000001`, well within the dual tolerance.
+Lifecycle rules:
+- Write `submitted_order_intents[client_order_id]` before calling `self.submit_order(order)`.
+- If `submit_order` raises, leave the intent record durable and mark it as requiring operator review; do not assume the exchange did or did not receive the order.
+- When a fill is recorded into `open` or `settled`, copy the persisted intent fields into that trade record and remove the matching `submitted_order_intents` entry in the same atomic ledger write.
+- Terminal no-fill events must be persisted as audit, not deleted. If Nautilus/exchange emits `OrderDenied`, `OrderRejected`, `OrderCanceled`, or `OrderExpired` with verified zero fill, update the matching intent in `submitted_order_intents` to a terminal non-blocking audit status such as `ORDER_DENIED_NO_FILL`, `ORDER_REJECTED_NO_FILL`, `ORDER_CANCELED_NO_FILL`, or `ORDER_EXPIRED_NO_FILL`, set `needs_reconciliation=false`, and preserve the raw event/report plus any real `venue_order_id` and reason. Do not create P&L and do not remove the audit record.
+- If a terminal order event has any fill quantity, average price, trade id, or ambiguous fill state, it is not a no-fill event. Route it through the normal fill/actual-fill path when fill details are valid; otherwise keep the intent unresolved and block live trading until admin reconciliation. Do not mark it terminal no-fill from status name alone.
+- On startup, any active `submitted_order_intents` entry whose status is not an approved terminal no-fill status is unresolved state. Live trading must stay blocked until the operator lists and resolves the intent through an admin command. Manual JSON inspection is not an accepted resolution path.
+- The admin tool must support listing submitted intents and converting one explicit intent into SETTLEMENT_UNKNOWN only after the operator verifies an exchange fill exists. If the operator verifies no exchange order/fill exists, the admin tool must mark that intent `SUBMISSION_NOT_SEEN` without creating P&L; that terminal status remains in the intent audit section but does not block live trading.
+- `estimated_tokens` is audit-only order intent. It is not a verified fill unit count and must not be used for payout validation, auto-redeem matching, settlement accounting, or manual reconciliation.
 
-**Live-trading pause expectation:** creating a `SETTLEMENT_UNKNOWN` record activates the live-trading pause gate ([bot.py:2289](bot.py:2289)). Live trading remains paused until the second step (`--order-id ... --payout ...`) resolves the unknown with a verified payout. This is intentional — Phase 0 does not "unblock" live trading by itself; it only prepares the ledger for a clean second-step resolution.
+Acceptance criteria:
+- [ ] A live order cannot call `self.submit_order(order)` unless the YES/NO intent record has already been durably written.
+- [ ] The persisted record distinguishes YES from NO with both `trade_label` and `outcome_side`.
+- [ ] A save failure before submit rejects/fail-stops before any exchange order submission.
+- [ ] A successful fill consumes the intent exactly once in the same atomic ledger write that records the fill.
+- [ ] `OrderDenied` / `OrderRejected` / `OrderCanceled` / `OrderExpired` with verified zero fill preserve a terminal no-fill audit entry and do not block live trading.
+- [ ] Ambiguous terminal events with missing/uncertain fill state remain unresolved and block live trading.
+- [ ] Startup with any unresolved submitted intent blocks live trading and provides an admin-tool listing/resolution path; startup with only terminal no-fill audit intents does not block.
 
-**Do NOT wait for `auto_redeem` on a market that has already resolved.** The lost trade's market has already ended in production. Polymarket's websocket does not replay missed `auto_redeem` events on reconnect. If the bot was down or rejected the event when it fired, it is gone. The operator must:
+#### 0.2 — Defensive hard guard in `_record_live_order_fill`
 
-1. Open the Polymarket UI (or query the on-chain redemption record) and verify the actual payout for the affected token holding.
-2. Resolve the SETTLEMENT_UNKNOWN record immediately with the verified payout — do not wait for the grace timeout to fire and book a $0 loss.
+File: `bot.py`, method `_record_live_order_fill`. Avoid exact line-number references in implementation notes; this file is changing rapidly during Phase 0.
 
-```bash
-venv/bin/python mark_settlement_resolved.py \
-  --ledger /path/to/live_trades.json \
-  --order-id 'BTC-15MIN-$11-1779093783343' \
-  --payout <verified-payout-from-Polymarket-UI> \
-  --reason "Verified from Polymarket UI after lost-fill incident"
+Insert after the existing blocked-ledger check. The guard must (a) block process-local state AND (b) create a durable SETTLEMENT_UNKNOWN with enough identifiers to be operator-reconcilable across restart:
+
+```python
+if fill_price <= Decimal("0"):
+    # Process-local block
+    self._block_live_settlement_ledger(
+        f"refused fill for {order_id}: fill_price={fill_price} is non-positive; "
+        "Polymarket fill event has invalid avg_px"
+    )
+    logger.error(
+        f"LIVE FILL REJECTED: non-positive fill_price={fill_price} for {order_id}; "
+        "ledger blocked to prevent zero-notional bookkeeping"
+    )
+
+    # Durable unknown so the pause survives restart. Do not look up or invent
+    # missing venue metadata here; this guard only records the invalid Nautilus
+    # fill fields it was explicitly given.
+    payload = {
+        "status": "failed",
+        "reason": "non_positive_fill_price_from_nautilus",
+        "fill_price": str(fill_price),
+        "fill_qty": str(fill_qty),
+        "received_at": datetime.now(timezone.utc).isoformat(),
+    }
+    self._create_durable_settlement_unknown_from_actual_fill(
+        client_order_id=order_id,
+        payload=payload,
+        reason=payload["reason"],
+    )
+    return False
 ```
 
-Use the same `venv/bin/python` and the same `--ledger` path as the prerequisite above. Do not use system `python`.
+This resolves the previous-draft contradiction. The earlier text said "stay process-blocked AND propagate" but also "Process is blocked; manual intervention required before restart" — which silently relied on the operator noticing the LOG before restarting. The corrected behavior is:
 
-#### 0.2 — Patch order-status report to populate avg_px (single deterministic path)
+- **Durable write succeeds:** process-local block + durable SETTLEMENT_UNKNOWN. Restart preserves the pause via the durable record. Operator resolves via admin tool.
+- **Durable write fails:** **fail-stop the process** via `raise SettlementLedgerError`. The bot exits abnormally. Operator MUST inspect ledger and reconcile before any restart. There is no scenario where a restart silently clears the pause.
+- **Order already exists in `open`:** the durable write must atomically convert that existing open trade into one SETTLEMENT_UNKNOWN record by removing the order from the candidate `open` map and appending the unknown to the candidate `settled` list in the same ledger save. For direct-fill failure payloads such as zero price, blocked ledger, invalid direction, or invalid accounting, mark the raw payload `requires_external_fill_repair=true` and do **not** promote the open trade's accounting fields into top-level `size`, `filled_qty`, `entry_price`, or `filled_notional`. The operator must repair those values from verified external data before payout resolution. Do not persist duplicate `open` + `settled` state for the same order. If the conversion cannot be written durably, fail-stop without mutating in-memory state.
+
+This is belt-and-suspenders: even if 0.3 and 0.4 fail, a bad fill cannot corrupt the ledger, AND a restart cannot silently clear the resulting pause.
+
+##### Zero-price guard scope and limits
+
+The zero-price guard in `_record_live_order_fill` rejects any fill that reaches the strategy's recorder with `fill_price <= 0`. This is necessary but **not sufficient**:
+
+- It catches fills that pass through Nautilus and reach the strategy with bad data.
+- It does **NOT** catch the case in the observed production log, where Nautilus rejected the fill at the overfill-check stage and never invoked `on_order_filled` at all — the fill simply vanished.
+
+The complete protection requires the adapter-side callback and normalization series (0.1 + 0.3 + 0.4 + 0.5 + 0.5a, plus the installed Nautilus UUID-fallback guard). The zero-price guard is the last line of defense; the adapter callback is the primary one. Ship `0.1` first so `_create_durable_settlement_unknown_from_actual_fill` exists, then ship `0.2`. Do not ship a process-local-only guard.
+
+#### 0.3 — Patch order-status report to populate avg_px (single deterministic path)
 
 File: `patch_market_orders.py` (or a new patch module).
 
+##### Live startup safety gates added to Phase 0.3
+
+Phase 0.3 must also tighten live-start control before any adapter-patched live order path can run.
+
+**Current implementation status after Phase 0.1-0.2:** these live-start gates are intentionally still pending. Do not mark Phase 0.3 complete until the `MARKET_BUY_USD > 5.50` enforcement and `--confirm-live` parser behavior below are implemented in `bot.py` and covered by tests.
+
+1. **Minimum live trade size gate.** Direct `--live` startup must fail closed unless `MARKET_BUY_USD > 5.50`. The comparison is strict: `5.50` is blocked, `5.51` is allowed. Parse the env value as `Decimal`; missing, malformed, non-finite, zero, negative, or `<= 5.50` values must abort startup before the Nautilus node starts.
+
+   Required operator-facing message shape:
+
+   ```text
+   LIVE STARTUP BLOCKED: MARKET_BUY_USD must be greater than 5.50 USDC for live mode.
+   Current MARKET_BUY_USD=<value>. Increase it to at least 5.51 or run without --live.
+   ```
+
+   This check must not be bypassed by Redis mode switching or any later live-execution transition. If the process starts in observation/simulation and later attempts to enable live execution, the same `MARKET_BUY_USD > 5.50` gate must run before the first live order can be submitted. Do not add an alternate size default or automatic resize.
+
+2. **Explicit non-interactive live confirmation flag.** Keep the current manual `LIVE` typing requirement for `--live` by default. Add exactly one command-line-only argument, `--confirm-live`, that means "the operator intentionally accepts live startup for this invocation" and skips the interactive prompt.
+
+   Required behavior:
+   - `--live` without `--confirm-live`: prompt exactly as today and require the operator to type `LIVE`.
+   - `--live --confirm-live`: do not prompt; log a clear line that live confirmation was provided by explicit CLI flag.
+   - `--confirm-live` without `--live`: fail argument parsing; the flag is only valid for live startup.
+   - No env var, config file key, or default may replace `--confirm-live`. A persistent confirmation source would be a hidden approval path under `AGENTS.md`.
+   - `--confirm-live` does not bypass any other live startup gate, including Redis control seeding, credentials, ledger checks, Nautilus UUID fallback guard, or the `MARKET_BUY_USD > 5.50` check above.
+
+Acceptance criteria:
+- [ ] `venv/bin/python bot.py --live` with `MARKET_BUY_USD=5.50` exits before node startup and prints the clear blocked message.
+- [ ] `venv/bin/python bot.py --live` with `MARKET_BUY_USD=5.51` still requires typing `LIVE`.
+- [ ] `venv/bin/python bot.py --live --confirm-live` with `MARKET_BUY_USD=5.51` starts without the interactive prompt.
+- [ ] `venv/bin/python bot.py --confirm-live` fails argument parsing because `--live` was not supplied.
+- [ ] Any Redis-driven transition into live execution enforces the same minimum trade-size gate before submitting a live order.
+
 **Exact adapter hook point (no more "patch order-status report normalization" ambiguity):**
 
-The hook target is `nautilus_trader.adapters.polymarket.execution.PolymarketExecutionClient.generate_order_status_report` (the method that reads a `py_clob_client` order response and converts it to a Nautilus `OrderStatusReport`). The implementer must:
+The hook targets are every installed Nautilus path that creates a FILLED `OrderStatusReport`, not only the singular helper:
+
+- `PolymarketExecutionClient.generate_order_status_report(...)`, which reads `py_clob_client.get_order(...)` and converts one order response.
+- `PolymarketExecutionClient.generate_order_status_reports(...)`, active-order loop, which calls `polymarket_order.parse_to_order_status_report(...)` for each order returned by `get_orders(...)`.
+- `PolymarketExecutionClient.generate_order_status_reports(... generate_order_history_from_trades ...)`, which builds a FILLED `OrderStatusReport` from fill reports.
+
+If any of these paths creates a FILLED report with `avg_px is None`, it must run the same deterministic VWAP injection or dispatch the same fail-closed callback. Patching only `generate_order_status_report(...)` is insufficient because plural reconciliation can still emit a missing-price filled status report.
+
+The implementer must:
 
 1. Confirm against the installed Nautilus version that this is the method that produces the missing-`avg_px` report. If the actual method name differs (e.g., `parse_to_order_status_report`, `_normalize_order_response`), the plan must be amended with the verified name before implementation.
-2. The monkey patch wraps this method: it calls the original, then if `report.avg_px is None and report.status == FILLED`, it runs the `get_trades` lookup, computes VWAP, and rewrites the report's `avg_px` field before returning.
-3. Inside the patch the implementer has access to `self._cache` (the strategy's order cache) for the `venue_order_id → client_order_id` mapping. This is the prerequisite the `cache.client_order_id(venue_order_id)` call in 0.3 depends on.
+2. Patch/copy the body of each status-report creation path, not just wrap the returned `OrderStatusReport`. The raw Polymarket response is only available inside the adapter method body; a wrapper that calls the original first has already lost `raw_status_report`, `condition_id`, `token_id`, and lookup-window context needed by the durable-unknown path.
+3. The condition is `report.avg_px is None and report.order_status == OrderStatus.FILLED`. `OrderStatusReport` uses `order_status`, not `status`.
+4. Confirm whether installed Nautilus `OrderStatusReport.avg_px` is mutable. If it is mutable, set `report.avg_px = instrument.make_price(vwap)` before returning. If it is immutable, construct and return a replacement `OrderStatusReport` with every original field preserved except `avg_px`. Do not rely on mutation until this is verified in a test.
+5. Inside the patch the implementer has access to `self._cache` (the strategy's order cache) for the `venue_order_id → client_order_id` mapping. This is the prerequisite the `cache.client_order_id(venue_order_id)` call in 0.3 and 0.4 depends on.
 
 **`order_submit_ts` source (explicit, no inferred fallback):**
 
-The `get_trades` time window in 0.2's step 1 uses `order_submit_ts - 5s` as the lower bound. The source is **the `ts_event` recorded by Nautilus when `submit_order` was originally called** — accessible via `order.ts_init` on the order object retrieved from `self._cache.order(client_order_id)`. This is a real, recorded timestamp, not an estimate.
+The `get_trades` time window in 0.3's step 1 uses `order_submit_ts - 5s` as the lower bound. The source is **the `ts_event` recorded by Nautilus when `submit_order` was originally called** — accessible via `order.ts_init` on the order object retrieved from `self._cache.order(client_order_id)`. This is a real, recorded timestamp, not an estimate.
 
 If `order` is `None` or `ts_init` is `None` (rare; would indicate the order was created outside the normal flow), the patch fails closed: dispatch `status=failed, reason=order_submit_ts_unavailable` and let the durable-unknown path handle it. Do NOT invent a fallback window (e.g., `now - 60s`) — that risks matching trades from other orders within the time window.
 
@@ -164,7 +351,7 @@ For a filled order-status report where `avg_px is None`:
 If `get_trades` returns nothing matching the venue order id within the time window, the adapter takes exactly this path:
 
 1. Do **not** infer, do not use the order's submitted `price` (undefined for market orders), do not fabricate.
-2. Dispatch a **structured failure payload** through the actual-fill callback (defined in 0.3a). The payload **must include the following fields at minimum** so the durable SETTLEMENT_UNKNOWN handler has enough context for manual reconciliation:
+2. Dispatch a **structured failure payload** through the actual-fill callback (defined in 0.1). The payload **must include the following fields at minimum** so the durable SETTLEMENT_UNKNOWN handler has enough context for manual reconciliation. `reason` is required; a missing/empty `reason` is a malformed payload and must fail closed instead of defaulting to another reason.
    ```python
    _dispatch_actual_fill(client_order_id, payload={
        # Required: classification
@@ -192,14 +379,19 @@ If `get_trades` returns nothing matching the venue order id within the time wind
    ```
 
    The durable SETTLEMENT_UNKNOWN helper copies these fields directly into the ledger entry. If any required field is missing in the underlying status report (e.g., `condition_id`), set it to `null` in the payload — never fabricate.
-3. The strategy's handler routes any payload with `status == "failed"` to **both**: (a) `_block_live_settlement_ledger(reason)` for the process-local pause, AND (b) `_create_durable_settlement_unknown_from_actual_fill(...)` for a durable SETTLEMENT_UNKNOWN entry that survives restart. `_record_live_order_fill` is **not** called — the only ledger write is the SETTLEMENT_UNKNOWN record (see 0.3 strategy handler below).
-4. Operator manually reconciles via `mark_settlement_resolved.py --create-unknown-from-external-order` once they verify the trade externally on Polymarket.
+3. The strategy's handler validates the failure payload before writing a durable record. If `status == "failed"` and `reason` is present/non-empty, it routes to **both**: (a) `_block_live_settlement_ledger(reason)` for the process-local pause, AND (b) `_create_durable_settlement_unknown_from_actual_fill(...)` for a durable SETTLEMENT_UNKNOWN entry that survives restart. If `reason` is missing/empty, the handler raises `SettlementLedgerError("malformed actual-fill payload: missing reason")`; it does not invent a default reason. `_record_live_order_fill` is **not** called — the only ledger write for a valid failed payload is the SETTLEMENT_UNKNOWN record (see the 0.4 strategy handler details below).
+4. Exact return behavior after the dispatch:
+   - If the callback returns successfully, the patched adapter returns `None` from `generate_order_status_report` or skips appending a report in `generate_order_status_reports(...)`. It does not return a non-filled report and does not let Nautilus generate an inferred fill.
+   - If the durable write fails inside the strategy callback, the callback raises; `_dispatch_actual_fill` re-raises; the adapter method propagates the exception so the bot fail-stops.
+5. Operator manually reconciles via `mark_settlement_resolved.py --create-unknown-from-external-order` once they verify the trade externally on Polymarket.
 
 This is one path, not two. No magic-value sentinels (the previous draft used `vwap=Decimal("0")` as a failure signal — replaced here with an explicit `status` field). Satisfies the `AGENTS.md` no-silent-fallback rule.
 
 **Acceptance:** a market BUY that fills at 0.63 must produce a Nautilus fill event with `last_px=0.63`, derived from the matched-trade VWAP, OR the adapter dispatches a `status=failed` callback and the ledger blocks. The bot never writes a ledger entry with inferred or fabricated price data.
 
-#### 0.3 — Normalize token-dust in Polymarket order-status report (with explicit actual-units side-channel)
+**Risk cleanup rule:** cleanup paths that release reserved/open exposure without final settlement accounting must require `risk_engine.release_position`. They must not call `risk_engine.remove_position(...)` as a substitute because `remove_position` books realized P&L. If `release_position` is unavailable or fails, block live settlement and raise `SettlementLedgerError`.
+
+#### 0.4 — Normalize token-dust in Polymarket order-status report (with explicit actual-units side-channel)
 
 **Scope:** patch the **Polymarket adapter's report normalization**, not Nautilus' global overfill checker. Do NOT set `allow_overfills=True` globally — that would weaken overfill protection for every other order.
 
@@ -224,9 +416,10 @@ if size_matched > original_size:
         # so the strategy creates a durable SETTLEMENT_UNKNOWN. Otherwise the same
         # silent-desync class that we are fixing reappears: real position on chain,
         # zero tracking in the bot.
-        _dispatch_actual_fill(client_oid_or_venue_id, {
+        _dispatch_actual_fill(client_oid, {
             "status": "failed",
             "reason": "real_overfill_rejected",
+            "venue_order_id": str(venue_order_id),
             "order_qty": str(original_size),
             "matched_qty": str(size_matched),
             "overfill_tokens": str(overfill),
@@ -236,7 +429,7 @@ if size_matched > original_size:
 
 **Critical: actual-units side-channel (resolves the prior internal contradiction)**
 
-The reviewer-flagged gap: if the adapter clips `last_qty` so Nautilus accepts the fill, then `on_order_filled()` receives the **clipped** quantity — not the actual Polymarket filled units. The plan previously asserted "the ledger preserves 17.460316" without specifying how. That assertion is only true with an explicit side-channel. Here's the bridge (scaffolded in 0.3a, populated in 0.2 and 0.3b):
+The reviewer-flagged gap: if the adapter clips `last_qty` so Nautilus accepts the fill, then `on_order_filled()` receives the **clipped** quantity — not the actual Polymarket filled units. The plan previously asserted "the ledger preserves 17.460316" without specifying how. That assertion is only true with an explicit side-channel. Here's the bridge (scaffolded in 0.1, populated in 0.3 and 0.4):
 
 1. **`venue_order_id ↔ client_order_id` mapping (use existing Nautilus cache, no invented helpers):**
 
@@ -247,7 +440,7 @@ The reviewer-flagged gap: if the adapter clips `last_qty` so Nautilus accepts th
    client_oid = self._cache.client_order_id(venue_order_id)
    ```
 
-   The earlier draft referenced a `_lookup_order_by_venue_id` helper — that helper does not exist in Nautilus and must not be invented. Use only the existing cache API. If `client_oid` is `None`, fail closed: dispatch `status=failed, reason=unmapped_venue_order_id` and the strategy blocks. No silent inference, no synthesized lookup paths.
+   The earlier draft referenced a `_lookup_order_by_venue_id` helper — that helper does not exist in Nautilus and must not be invented. Use only the existing cache API. If `client_oid` is `None`, fail closed by dispatching `client_order_id=None` with `status=failed, reason=unmapped_venue_order_id` and a real `venue_order_id` field in the payload. No silent inference, no synthesized lookup paths, and no `venue:<...>` or raw `0x...` value in the `client_order_id` parameter.
 
 2. **Strategy-registered callback (structured payload, no magic sentinels):**
 
@@ -267,9 +460,13 @@ The reviewer-flagged gap: if the adapter clips `last_qty` so Nautilus accepts th
            _polymarket_actual_fill_handlers.append(handler)
 
    def _dispatch_actual_fill(client_order_id, payload):
-       for handler in list(_polymarket_actual_fill_handlers):
+       handlers = list(_polymarket_actual_fill_handlers)
+       if not handlers:
+           raise RuntimeError("actual_fill dispatch has no registered handler")
+       normalized_client_order_id = None if client_order_id in (None, "") else str(client_order_id)
+       for handler in handlers:
            try:
-               handler(str(client_order_id), dict(payload))
+               handler(normalized_client_order_id, dict(payload))
            except Exception as exc:
                logger.exception("actual_fill handler failed: %s", exc)
                raise
@@ -299,7 +496,8 @@ The reviewer-flagged gap: if the adapter clips `last_qty` so Nautilus accepts th
 
      This invocation happens BEFORE clipping for Nautilus.
 
-   - **Failure path:** if `get_trades` finds no match (or `client_oid` cannot be resolved), the adapter calls `_dispatch_actual_fill(client_oid_or_venue_id, {"status": "failed", "reason": "no_matching_trade", ...})` and does NOT proceed to generate a fill event.
+   - **Failure path:** if `get_trades` finds no match and `client_oid` is known, the adapter calls `_dispatch_actual_fill(client_oid, {"status": "failed", "reason": "no_matching_trade", ...})` and does NOT proceed to generate a fill event.
+   - **Unmapped venue path:** if `client_oid` cannot be resolved, the adapter calls `_dispatch_actual_fill(None, {"status": "failed", "reason": "unmapped_venue_order_id", "venue_order_id": ...})` and does NOT proceed to generate a fill event.
 
 4. **Bridge mechanism — strategy handler (durable fail-closed, explicit else):**
 
@@ -332,16 +530,24 @@ The reviewer-flagged gap: if the adapter clips `last_qty` so Nautilus accepts th
                        "SETTLEMENT_UNKNOWN created for manual reconciliation"
                    )
        elif status == "failed":
+           reason = payload.get("reason")
+           if not reason:
+               self._block_live_settlement_ledger(
+                   f"malformed actual-fill callback for {client_order_id}: missing reason"
+               )
+               raise SettlementLedgerError(
+                   f"malformed actual-fill callback for {client_order_id}: missing reason"
+               )
            # Failed reconciliation. process-local block + durable unknown so
            # the pause persists across restart.
            self._create_durable_settlement_unknown_from_actual_fill(
                client_order_id=client_order_id,
                payload=payload,
-               reason=payload.get("reason", "actual_fill_failed"),
+               reason=reason,
            )
            self._block_live_settlement_ledger(
                f"actual-fill callback failed for {client_order_id}: "
-               f"{payload.get('reason')}; SETTLEMENT_UNKNOWN created"
+               f"{reason}; SETTLEMENT_UNKNOWN created"
            )
        else:
            # Unknown status value — never silent. Durable + process block.
@@ -358,7 +564,7 @@ The reviewer-flagged gap: if the adapter clips `last_qty` so Nautilus accepts th
 
 **Why durable not just process-local:**
 
-`_block_live_settlement_ledger` is **process-local state** ([bot.py:529](bot.py:529)) — a restart clears it. Without a durable SETTLEMENT_UNKNOWN record, a bot restart after a failed reconciliation would silently resume live trading with phantom exposure. By creating a SETTLEMENT_UNKNOWN entry, the existing live-trading pause gate ([bot.py:784](bot.py:784)) keeps the bot paused after restart until the operator explicitly resolves it.
+`_block_live_settlement_ledger` is **process-local state** in `bot.py` — a restart clears it. Without a durable SETTLEMENT_UNKNOWN record, a bot restart after a failed reconciliation would silently resume live trading with phantom exposure. By creating a SETTLEMENT_UNKNOWN entry, the existing live-trading pause gate in `_unresolved_settlement_unknowns` keeps the bot paused after restart until the operator explicitly resolves it.
 
 **Required schema for `_create_durable_settlement_unknown_from_actual_fill` (no synthesized placeholders):**
 
@@ -381,10 +587,11 @@ The durable record must use only verified-or-explicitly-unknown fields. No "look
     "direction": <from order metadata if known, else null>,
     "trade_label": <from order metadata if known, else null>,
     "submitted_at": <from order metadata if known, else null>,
-    "size": <SUBMITTED size from order, NOT a fabricated estimate>,
+    "size": <verified accounting cost, preserved open-trade accounting cost, or null>,
+    "submitted_size": <original intended/submitted size if known, else omitted>,
 
     # Diagnostic — preserve the raw failure payload verbatim for forensics
-    "unknown_reason": payload.get("reason", "unknown"),
+    "unknown_reason": required_reason,  # required by caller; no payload default
     "raw_callback_payload": payload,    # the entire dict, as-is
     "created_at": <UTC ISO timestamp>,
 }
@@ -392,40 +599,121 @@ The durable record must use only verified-or-explicitly-unknown fields. No "look
 
 Rules:
 - **Never** synthesize `payout` or `pnl` from inferred values. Always literal string `"UNKNOWN"`.
-- **Never** fabricate `size` from price × qty estimates. Use the original submitted size (which the bot logged when the order went out) or `null` if even that is unavailable.
+- **Never** populate submitted-size fields from price × qty or from an accounting `size` field. `submitted_size` is only `payload["submitted_size"]` or a real `source_meta["submitted_size"]`; if neither exists, omit it.
+- If the durable unknown contains validated positive actual fill data (`filled_qty > 0` and `vwap > 0`), top-level `size` is the accounting cost for the filled exposure: `filled_qty * vwap`, and `filled_notional` must equal the same value. This is verified fill accounting, not a submitted-size fallback. Keep intended/submitted spend only in `submitted_size` audit metadata.
+- If creating SETTLEMENT_UNKNOWN from a direct-fill failure or any payload marked `requires_external_fill_repair=true`, do **not** preserve or promote open-trade accounting fields. The normal payout-only reconciliation path must reject the record until the operator repairs `size`, `filled_qty`, `entry_price`, and `filled_notional` from verified external data.
+- If no validated positive actual fill data exists and no already-recorded open-trade accounting cost exists, top-level `size` MUST be `null`. Never use original/intended/submitted size as accounting size. Submitted/intended spend belongs only in `submitted_size` audit metadata.
 - **Always** include `raw_callback_payload` verbatim. The operator's manual reconciliation will join on this.
 
-**Reconciliation key (CRITICAL — fixes earlier unreconcilable-null gap):**
+**Reconciliation selectors (CRITICAL — no synthetic `order_id` fallback):**
 
-`mark_settlement_resolved.py` currently selects records only by `--order-id`. A null `order_id` would make the pause impossible to clear without manual JSON editing. The plan must therefore guarantee a non-null, stable `order_id` for every durable unknown:
+Durable unknowns must be reconcilable, but the plan must not convert `venue_order_id` into a synthetic `order_id`. `mark_settlement_resolved.py` must gain first-class `--venue-order-id` support. A record may have `order_id = None` if the bot cannot resolve a real client order id, as long as `venue_order_id` is present and unique. Resolution uses exactly one selector: `--order-id <client_order_id>` OR `--venue-order-id <venue_order_id>`.
+
+The strategy-side handler must reject venue-like values in the `client_order_id` parameter. If `client_order_id` case-insensitively starts with `venue:` or raw `0x`, or equals the payload's `venue_order_id`, the handler blocks and raises `SettlementLedgerError`; it must not persist that value as `order_id`.
 
 ```python
 if client_order_id_resolved is not None:
     order_id = client_order_id_resolved          # normal case: "BTC-15MIN-$5-1779..."
 elif venue_order_id is not None:
-    order_id = f"venue:{venue_order_id}"          # synthetic but stable: "venue:0x0638..."
+    order_id = None                               # no synthetic id
+    # venue_order_id is persisted as its own field and resolved with:
+    # mark_settlement_resolved.py --venue-order-id 0x0638...
 else:
-    # Both identifiers missing. Fail closed — do NOT generate a uuid fallback.
-    # A uuid would be unreconcilable externally (operator has no way to map it
-    # back to a Polymarket order). Instead, raise hard so the bot fail-stops and
-    # the operator must investigate the raw payload before restarting.
+    # Both identifiers missing. Fail closed — do NOT generate uuid, synthetic,
+    # or placeholder identifiers. The operator must investigate the raw payload
+    # before restarting.
     raise SettlementLedgerError(
         f"actual-fill callback has neither client_order_id nor venue_order_id; "
         f"raw payload: {payload!r}. Cannot create a reconcilable durable record. "
         f"Bot will fail-stop. Operator must inspect logs and reconcile manually "
         f"before restart."
-    )
+)
 ```
 
-The synthetic `venue:<hash>` form is reconcilable via the existing `--order-id "venue:0x..."` flow. **The operator must explicitly approve this synthetic-id format before implementation begins** — it is the only deviation from "use only real identifiers" in the durable schema, and although `venue:<hash>` is fully traceable to a Polymarket transaction (not synthesized noise), it is still a constructed string and falls under the no-fallback rule's approval requirement.
+Admin-tool changes ARE required in Phase 0.1:
+- `mark_settlement_resolved.py --venue-order-id <venue_order_id>` must resolve exactly one durable unknown whose `venue_order_id` matches and whose `order_id` may be null.
+- `mark_settlement_resolved.py --list-pending-actual-fills` must identify pending actual fills as unresolved state. Manual JSON inspection is not an accepted alternate path.
+- `mark_settlement_resolved.py --list-submitted-order-intents` must identify durable pre-submit YES/NO intents. The operator must resolve one explicit intent through `--convert-submitted-intent <order_id>` with verified fill details, or `--resolve-submitted-intent-no-order <order_id> --confirm-no-exchange-order` after verifying no exchange order exists.
 
-No admin-tool changes required for this Phase 0 work. A future Phase can optionally add `--venue-order-id` as a convenience alias, but it is not on the critical path. The earlier draft included a `unknown:{uuid4()}` last-resort path — that has been removed because uuids are not externally reconcilable.
+The earlier draft included `unknown:{uuid4()}` and `venue:<hash>` synthetic order-id paths. Both are removed. UUIDs are externally unreconcilable, and `venue:<hash>` is a fallback from the normal client-order-id path. `venue_order_id` remains a real exchange identifier, but it must be modeled as its own field and admin selector, not disguised as an `order_id`.
+
+**Installed Nautilus UUID fallback removal (REQUIRED, same P0 class):**
+
+Installed Nautilus currently synthesizes `ClientOrderId(str(UUID4()))` when `self._cache.client_order_id(venue_order_id)` is missing in multiple report paths. That creates an unreconcilable client id even if the new durable-unknown helper never generates UUIDs. Phase 0 must remove/guard every installed fallback in `venv/lib/python3.14/site-packages/nautilus_trader/adapters/polymarket/execution.py`.
+
+Do **not** rely on hand-editing `venv/` as the durable fix. The repo must provide either:
+
+- a live-startup-applied monkey patch in tracked repo code that replaces/guards these adapter methods before live execution starts, OR
+- a live-startup verification that inspects the installed adapter behavior and fail-stops live mode if any UUID fallback path remains reachable.
+
+The implementation PR must choose exactly one of those two durability mechanisms and document the choice. Do not implement a runtime fallback from one mechanism to the other.
+
+Decision/test-mode startup should not be blocked by this live adapter guard, because no live execution client is allowed to submit orders in those modes. Live mode must still fail before Redis can switch the strategy into live trading if the UUID guard detects a reachable fallback path.
+
+Because `pip install -r requirements.txt`, venv recreation, or Nautilus upgrades can erase direct site-packages edits, Phase 0 is not complete until this guard is applied from tracked repo code or verified at startup.
+
+Required UUID-generation sites to patch/verify:
+
+- `generate_order_status_reports(...)` active-order loop.
+- `generate_order_status_reports(... generate_order_history_from_trades ...)` when it builds a synthetic filled `OrderStatusReport` from fill reports.
+- `_parse_trades_response_object(...)` fill-report path.
+
+Required behavior at all three sites:
+
+```python
+client_order_id = self._cache.client_order_id(venue_order_id)
+if client_order_id is None:
+    _dispatch_actual_fill(None, {
+        "status": "failed",
+        "reason": "unmapped_venue_order_id",
+        "venue_order_id": str(venue_order_id),
+        "raw_status_report": <verbatim order/fill payload>,
+        "report_source": "<exact adapter method name>",
+        "report_received_at": <UTC ISO timestamp>,
+    })
+    return None  # or continue/skip append in list-producing methods
+```
+
+Do **not** generate a UUID. Do **not** return a Nautilus report with a synthetic client id. Do **not** synthesize `venue:<hash>`. If the callback's durable write fails, let the exception propagate and fail-stop. The durable record is resolved by first-class `venue_order_id`.
 
 **Conflict resolution with `--create-unknown-from-external-order`:**
 
-If a durable SETTLEMENT_UNKNOWN already exists (created at runtime by the bot), the operator does NOT run `--create-unknown-from-external-order` again — that command refuses to overwrite an existing record. The operator instead runs `--order-id <existing-order-id> --payout <verified>` directly, since the bot already produced the unknown record. The `--create-unknown-from-external-order` command is reserved for the case where the bot has zero record of the trade (e.g., a fill that bypassed the callback entirely).
+If a durable SETTLEMENT_UNKNOWN already exists (created at runtime by the bot), the operator does NOT run `--create-unknown-from-external-order` again — that command refuses to overwrite an existing record. If that existing unknown already has verified `filled_qty`, `entry_price`, and accounting `size`, the operator runs `--order-id <existing-order-id> --payout <verified>` directly. If the existing unknown is missing fill accounting fields because the callback was malformed/failed before the actual fill details were available, the operator must use the explicit repair-and-resolve path in one locked admin update:
 
-The earlier draft's "placeholder values" phrasing is replaced by this strict schema: real-or-`null`-or-literal-`"UNKNOWN"`, never a synthesized lookalike — except `order_id`, which uses a synthetic `venue:<hash>` form when `client_order_id` is unresolvable, so the existing admin tool can still resolve it.
+```bash
+venv/bin/python mark_settlement_resolved.py \
+  --ledger /path/to/live_trades.json \
+  --order-id '<existing-order-id>' \
+  --repair-unknown-fill-accounting \
+  --confirm-external-order \
+  --external-size '<verified filled notional>' \
+  --external-entry-price '<verified avg fill price>' \
+  --external-filled-qty '<verified filled token units>' \
+  --payout '<verified payout>' \
+  --reason 'Verified fill accounting and payout from Polymarket/exchange records'
+```
+
+The repair path must validate `external_size == external_entry_price * external_filled_qty` within the same tolerance as external-order reconstruction, must preserve the previous fill-accounting fields under `external_fill_repair_previous_state`, and must then resolve the unknown by applying the payout. This is an explicit operator repair path, not a fallback: no values are inferred from estimates or submitted intent. The `--create-unknown-from-external-order` command is reserved for the case where the bot has zero record of the trade (e.g., a fill that bypassed the callback entirely).
+
+**Inconsistent settlement flags repair:** live startup pauses on either unresolved marker: `needs_reconciliation is true` OR `settlement_source == "SETTLEMENT_UNKNOWN"`. The normal payout/repair resolver is intentionally stricter and only mutates records where both markers are present. To avoid manual JSON edits for half-updated records, `mark_settlement_resolved.py` must include an explicit confirmed repair command:
+
+```bash
+venv/bin/python mark_settlement_resolved.py \
+  --ledger /path/to/live_trades.json \
+  --order-id '<existing-order-id>' \
+  --repair-inconsistent-settlement-flags \
+  --confirm-inconsistent-settlement-flags \
+  --reason 'Verified one-flag settlement inconsistency'
+```
+
+Rules:
+
+- If `settlement_source == "SETTLEMENT_UNKNOWN"` and `needs_reconciliation` is not true, set `needs_reconciliation=true` so the record is consistently unresolved and can go through the normal payout/repair path.
+- If `needs_reconciliation is true` and `settlement_source` is a resolved terminal source (`manual_reconciliation`, `auto_redeem`, or `late_auto_redeem`), clear `needs_reconciliation` only when `payout`, `size`, and `pnl` are finite, `payout >= 0`, `size >= 0`, `pnl == payout - size`, filled units are known and positive, and `payout <= filled_qty` unless the existing record already carries an explicit prior overpayout marker from a confirmed reconciliation.
+- If the record has `needs_reconciliation=true` but no known terminal settlement source, no resolved payout/P&L, missing/invalid cost basis, missing/invalid fill units, or an unapproved overpayout, set `settlement_source="SETTLEMENT_UNKNOWN"`, reset active `payout`/`pnl` to `"UNKNOWN"`, and leave `needs_reconciliation=true` so the normal payout/repair path can resolve it. Do not infer that it is resolved.
+- Always preserve the previous flag state under `settlement_flag_repair_previous_state`.
+
+The earlier draft's "placeholder values" phrasing is replaced by this strict schema: real-or-`null`-or-literal-`"UNKNOWN"`, never a synthesized lookalike. `order_id` is either a real client order id or `null`; `venue_order_id` is stored separately and resolved by `--venue-order-id`.
 
 **Transactional requirement:** the durable write must succeed before the actual-fill event is considered handled. If the durable write fails, the bot **fail-stops the process**:
 
@@ -468,45 +756,69 @@ This matches the settlement-hardening style used elsewhere (`auto_redeem` settle
 
    When the strategy handler receives `status="ok"`, in addition to stashing in `_submitted_positions`, also write a **pending-fill entry to the durable ledger** in a new `_pending_actual_fills` section:
 
-   ```json
-   {
-       "pending_actual_fills": {
-           "BTC-15MIN-$5-1779...": {
-               "filled_qty": "17.460316",
-               "vwap": "0.63",
-               "venue_order_id": "0x0638...",
-               "condition_id": "0xd55ee02c...",
-               "token_id": "13493...",
-               "raw_status_report": {...},
-               "received_at": "2026-05-18T07:43:05+00:00"
-           }
-       }
-   }
-   ```
+	   ```json
+	   {
+	       "pending_actual_fills": {
+	           "BTC-15MIN-$5-1779...": {
+	               "venue_order_id": "0x0638...",
+	               "condition_id": "0xd55ee02c...",
+	               "token_id": "13493...",
+	               "total_filled_qty": "17.460316",
+	               "total_filled_notional": "10.99999908",
+	               "vwap": "0.63",
+	               "fills": [
+	                 {
+	                   "fill_key": "<real venue trade/match id>",
+	                   "filled_qty": "17.460316",
+	                   "price": "0.63",
+	                   "notional": "10.99999908",
+	                   "raw_status_report": {...},
+	                   "received_at": "2026-05-18T07:43:05+00:00"
+	                 }
+	               ]
+	           }
+	       }
+	   }
+	   ```
 
-   The strategy handler MUST write this durable entry BEFORE the in-memory stash. If the disk write fails, treat the entire callback as failed (route to the `status=failed` durable-unknown path).
+	   The strategy handler MUST write this durable entry BEFORE the in-memory stash. If the disk write fails, fail-stop with `SettlementLedgerError`; do not route to an alternate callback path or continue with only memory state.
+	   `submitted_size` in this pending entry follows the same no-fallback rule as durable unknowns: persist it only from `payload["submitted_size"]` or a real `source_meta["submitted_size"]`; never copy `source_meta["size"]`, because open-trade `size` is accounting cost.
+	   Phase 0.1 must write the ordered per-fill structure above from the start: one `pending_actual_fills[order_id]` aggregate containing append-only `fills[]`, plus aggregate `total_filled_qty`, `total_filled_notional`, and `vwap = total_filled_notional / total_filled_qty`. A scalar single-fill pending record is not a valid persisted ledger shape; startup/admin validation must reject it fail-closed rather than treating it as an interim shape.
+	   Each append MUST use a real venue fill/trade/match identifier or another verified unique event key from the adapter payload. If no unique real fill key is available, fail closed and create/keep durable unresolved state for operator reconciliation; do not synthesize a sequence-only identifier to make the append look unique. If an append would duplicate an existing fill key, fail closed before writing anything. Do not overwrite the existing pending entry because it loses previously verified fill data.
 
-   When `on_order_filled` later arrives and `_record_live_order_fill` consumes the actual values, it also removes the matching entry from `pending_actual_fills` and persists the cleanup in the same atomic ledger write.
+   When `on_order_filled` later arrives and `_record_live_order_fill` consumes the actual values, it also copies the real `venue_order_id` from the pending entry onto the durable open trade, removes the matching entry from `pending_actual_fills`, and persists the cleanup in the same atomic ledger write. This keeps future `--venue-order-id` reconciliation available if that open trade later becomes SETTLEMENT_UNKNOWN.
 
-   On startup, the bot scans `pending_actual_fills` for any entries that have aged beyond a short threshold (e.g., 60 seconds — long enough for normal `on_order_filled` delivery, short enough that a true crash is detectable). For each aged entry, it creates a durable SETTLEMENT_UNKNOWN record with reason `pending_actual_fill_orphaned_at_restart` and removes it from `pending_actual_fills`. The live-pause gate then keeps the bot blocked until the operator resolves.
+   On startup, the bot must not convert or remove any existing `pending_actual_fills` entry. A pending actual fill in the ledger means the previous process stopped before `on_order_filled` consumed it; do not wait for an age threshold and do not rewrite it automatically. The live-pause gate must treat every pending actual fill as unresolved and keep live trading blocked until the operator explicitly chooses one pending entry and runs the admin conversion command.
 
-   This closes the memory-only gap. Either the fill flows through normally and the pending entry is removed cleanly, OR the bot restarts mid-flow and the pending entry is converted to a durable unknown for manual reconciliation. No silent loss.
+   The explicit admin conversion command turns one operator-selected `pending_actual_fills` aggregate into a durable SETTLEMENT_UNKNOWN record and removes only that selected pending entry in the same atomic ledger write. The pending aggregate must contain non-empty `fills[]`, positive `total_filled_qty`, positive `total_filled_notional`, positive `vwap`, and exact consistency that `total_filled_notional == total_filled_qty * vwap` within the settlement accounting tolerance. The durable unknown must promote those aggregate values into top-level `filled_qty`, `entry_price`, and `filled_notional` fields so the normal `--order-id` / `--venue-order-id --payout` reconciliation path can resolve it. For this actual-fill recovery path, top-level `size` is the actual accounting cost `total_filled_notional`; any callback/order intended spend is preserved only as `submitted_size` audit metadata when present and positive. A partial fill must not book the full intended spend as cost.
 
-   **Ledger schema migration (REQUIRED — current writer doesn't preserve this):**
+   This closes the memory-only gap without migration behavior. Either the fill flows through normally and the pending entry is removed cleanly, OR startup detects the durable pending entry, blocks live trading, and requires explicit operator/admin conversion. No silent loss and no automatic startup state transformation.
 
-   The current ledger writer at `_save_live_trade_ledger` ([bot.py:624](bot.py:624)) only serializes `open`, `settled`, `seen_auto_redeem_events`, and `pending_auto_redeem_events`. Adding `pending_actual_fills` as a new top-level section requires updating **every** ledger-touching code path:
+   **Fresh ledger schema contract (NO MIGRATION):**
 
-   1. **`_save_live_trade_ledger`**: serialize `self._pending_actual_fills` under the new key.
-   2. **`_load_live_trade_ledger`**: read the new key with default `{}` if missing (backwards-compatible for existing ledgers from before this change).
-   3. **Snapshot/rollback in `_handle_auto_redeem_event` and `_record_live_order_fill`**: when computing a candidate ledger state for transactional save, include `pending_actual_fills` in the snapshot AND in the rollback restore path. Otherwise a save failure could leave inconsistent in-memory state.
-   4. **`mark_settlement_resolved.py`**: when reading the ledger to find unresolved records, treat `pending_actual_fills` entries as another class of unresolved state. Add a `--list-pending-actual-fills` flag (or document that the operator inspects the JSON directly).
+   This is a new-app deployment. Do not support older ledger writer shapes in application code. Do not transform, backfill, upgrade, rename, or rewrite old ledger files. Phase 0.1's canonical ledger schema is `"ledger_schema_version": 3`, where version 3 requires both top-level keys `pending_actual_fills` and `submitted_order_intents`.
+
+   1. **Fresh-schema validation before normal startup**: if `live_trades.json` exists, it must already be schema v3 and must already contain every required top-level section with the required JSON type. Any missing section, wrong `ledger_schema_version`, wrong section type, or malformed entry value is corrupt input and must fail startup/admin tooling with a clear error. Do not add missing sections, do not upgrade a version marker, do not create a backup as part of a transform, and do not silently treat missing keys as `{}` at read time. If no ledger exists, the app may start with empty in-memory ledger state and the first ledger write must create the current v3 shape directly.
+   2. **`_save_live_trade_ledger`**: serialize `self._pending_actual_fills` and `self._submitted_order_intents` under the new keys.
+   3. **Snapshot/rollback in `_handle_auto_redeem_event`, `_record_live_order_fill`, and order submission**: when computing a candidate ledger state for transactional save, include `pending_actual_fills` and `submitted_order_intents` in the snapshot AND in the rollback restore path. Otherwise a save failure could leave inconsistent in-memory state.
+   4. **`mark_settlement_resolved.py`**: when reading the ledger to find unresolved records, treat `pending_actual_fills` entries as another class of unresolved state. Add mandatory `--list-pending-actual-fills` visibility and `--convert-pending-actual-fill <order_id>` so an operator can turn one pending aggregate into SETTLEMENT_UNKNOWN without editing JSON manually. The admin conversion must reject duplicate `venue_order_id` values, resolved or unresolved, so `--venue-order-id` never becomes ambiguous. It must fail closed unless non-empty `fills[]`, positive `total_filled_qty`, positive `total_filled_notional`, and positive `vwap` are present and cost-consistent. It must set accounting `size = total_filled_notional` while preserving `submitted_size` only as audit metadata when present and positive.
    5. **Atomic JSON write**: the same temp-file + os.replace pattern already used must include the new key in the JSON payload.
 
-   Acceptance criteria for this schema migration:
-   - [ ] An existing `live_trades.json` (without `pending_actual_fills`) loads cleanly.
-   - [ ] A round-trip save/load preserves `pending_actual_fills` byte-identical (modulo dict key ordering).
-   - [ ] Snapshot/rollback test: simulate a save failure mid-transaction; assert `pending_actual_fills` state is restored to pre-mutation values.
-   - [ ] The admin tool can identify orders that have `pending_actual_fills` entries.
+   Acceptance criteria for this fresh-schema contract:
+   - [ ] No application or admin-tool code migrates, backfills, upgrades, renames, or rewrites old ledger shapes.
+   - [ ] Any existing `live_trades.json` that is not already exact schema v3 fails startup/admin tooling before normal operation or rewrite.
+   - [ ] Any `ledger_schema_version` other than `3` fails startup/admin tooling; a `ledger_schema_version=3` file missing any required key also fails as corrupt.
+   - [ ] A round-trip save/load preserves `pending_actual_fills` and `submitted_order_intents` byte-identical (modulo dict key ordering).
+   - [ ] Snapshot/rollback test: simulate a save failure mid-transaction; assert `pending_actual_fills` and `submitted_order_intents` state is restored to pre-mutation values.
+   - [ ] The admin tool can identify orders that have `pending_actual_fills` entries and convert one explicit pending entry into SETTLEMENT_UNKNOWN.
+   - [ ] Startup with any `pending_actual_fills` entry keeps live trading blocked and preserves the pending entry unchanged.
+   - [ ] An admin-converted pending actual fill aggregate with positive `total_filled_qty`, positive `total_filled_notional`, positive `vwap`, and non-empty `fills[]` can be resolved through the normal `--venue-order-id --payout` flow without manual JSON edits.
+   - [ ] Admin conversion refuses duplicate `venue_order_id` records.
+   - [ ] Admin conversion refuses pending actual fills with missing/non-positive `total_filled_qty`, missing/non-positive `total_filled_notional`, missing/non-positive `vwap`, empty `fills[]`, inconsistent aggregate math, or scalar-only `filled_qty` records.
+   - [ ] Admin pending-actual-fill conversion books actual partial-fill cost as `total_filled_notional`, not full intended/submitted spend.
+   - [ ] Multi-partial actual fills append to ordered `fills[]` with real unique fill keys and update aggregate totals atomically; scalar overwrite is forbidden.
+   - [ ] A duplicate or keyless `status="ok"` actual-fill callback for an order with an unconsumed `pending_actual_fills` entry blocks/fails, preserves the existing `fills[]` aggregate unchanged, and durably marks that pending entry `requires_external_fill_repair=true` with the duplicate/keyless raw callback evidence.
+   - [ ] The admin tool can identify submitted YES/NO intents and resolve exactly one explicit intent after operator verification.
 
 7. **Lifecycle: unregister handler on `on_stop`.**
 
@@ -519,115 +831,277 @@ This matches the settlement-hardening style used elsewhere (`auto_redeem` settle
            from patch_market_orders import unregister_actual_fill_handler
            unregister_actual_fill_handler(self._actual_fill_handler)
        except Exception:
-           pass
+           logger.exception("failed to unregister actual-fill handler")
+           raise
    ```
+
+   Add a regression test that calls `on_start`, then `on_stop`, then asserts the handler registry no longer contains the strategy handler. Duplicate handler registration across restart/test cycles is a hard failure, not log noise.
 
 **Ledger preservation:** the bot's durable ledger records the **actual Polymarket filled units** (`17.460316` in the production case), guaranteed by the side-channel above. The clipping is local to the adapter/report path so Nautilus' downstream overfill arithmetic is satisfied. Without the side-channel, the ledger would silently record the clipped value — that contradiction is now resolved by explicit data flow.
 
-#### 0.4 — Defensive hard guard in `_record_live_order_fill`
+#### 0.5 — `quote_quantity=True` units-mismatch overfill (REQUIRED for $5+ trades)
 
-File: `bot.py:2789` (`_record_live_order_fill`).
+**Reviewer-flagged from the sanitized production-log excerpt:** Phase 0.4 above handles tiny token-dust overfills (`0.000085`-class). But a second overfill error fires several seconds **earlier** for the same trade, with a much larger `potential_overfill` value. From the operator's $55 trade in that log:
 
-Insert after the existing blocked-ledger check. The guard must (a) block process-local state AND (b) create a durable SETTLEMENT_UNKNOWN with enough identifiers to be operator-reconcilable across restart:
-
-```python
-if fill_price <= Decimal("0"):
-    # Process-local block
-    self._block_live_settlement_ledger(
-        f"refused fill for {order_id}: fill_price={fill_price} is non-positive; "
-        "Polymarket fill event has invalid avg_px"
-    )
-    logger.error(
-        f"LIVE FILL REJECTED: non-positive fill_price={fill_price} for {order_id}; "
-        "ledger blocked to prevent zero-notional bookkeeping"
-    )
-
-    # Durable unknown so the pause survives restart. Pull whatever identifiers
-    # are available from the order metadata cache. Uses synthetic order_id form
-    # if client_oid is unresolvable (see 0.3 reconciliation-key rules).
-    venue_oid = None
-    venue_lookup_error = None
-    try:
-        order = self.cache.order(ClientOrderId(order_id)) if order_id else None
-        if order is not None and order.venue_order_id is not None:
-            venue_oid = str(order.venue_order_id)
-    except Exception as e:
-        # Record the lookup failure in the durable payload; do NOT swallow silently.
-        venue_lookup_error = f"{type(e).__name__}: {e}"
-
-    payload = {
-        "status": "failed",
-        "reason": "non_positive_fill_price_from_nautilus",
-        "fill_price": str(fill_price),
-        "fill_qty": str(fill_qty),
-        "venue_order_id": venue_oid,
-        "venue_lookup_error": venue_lookup_error,   # null if lookup succeeded
-        "received_at": datetime.now(timezone.utc).isoformat(),
-    }
-    try:
-        self._create_durable_settlement_unknown_from_actual_fill(
-            client_order_id=order_id,
-            payload=payload,
-            reason=payload["reason"],
-        )
-    except Exception as e:
-        # If even the durable write fails, the ledger cannot be trusted. Fail-stop
-        # the bot — do NOT continue with only process-local state, because that
-        # state clears on restart and the operator could unknowingly resume live.
-        logger.critical(
-            f"Could not create durable SETTLEMENT_UNKNOWN for {order_id}: {e}. "
-            "Bot fail-stopping. Operator must inspect the ledger and reconcile "
-            "the fill manually BEFORE any restart."
-        )
-        raise SettlementLedgerError(
-            f"durable SETTLEMENT_UNKNOWN write failed for {order_id}: {e}"
-        ) from e
-    return False
+```
+10:43:38.26 ERROR: potential_overfill=21.388885, last_qty=76.388885, quantity=55.00
 ```
 
-This resolves the previous-draft contradiction. The earlier text said "stay process-blocked AND propagate" but also "Process is blocked; manual intervention required before restart" — which silently relied on the operator noticing the LOG before restarting. The corrected behavior is:
+Root cause: the order was submitted with `quote_quantity=True, quantity=55.00` (meaning "spend $55 USDC"). Nautilus stores `quantity=55.00` in the order object as base units. When the trade event arrives reporting `size=76.388885 tokens` ($55 ÷ $0.72), Nautilus' overfill check compares `last_qty (76.388885 tokens) > order.quantity (55.00 USDC)` and computes a spurious overfill of `21.388885`. **The two values are in different units.** Not a real overfill.
 
-- **Durable write succeeds:** process-local block + durable SETTLEMENT_UNKNOWN. Restart preserves the pause via the durable record. Operator resolves via admin tool.
-- **Durable write fails:** **fail-stop the process** via `raise SettlementLedgerError`. The bot exits abnormally. Operator MUST inspect ledger and reconcile before any restart. There is no scenario where a restart silently clears the pause.
+This fires BEFORE the venue's `OrderAccepted` / `OrderUpdated` events arrive and correct `quantity` to the token amount. The dust-tolerance check in 0.4 can't help because `21.388885 >> 0.001`.
 
-This is belt-and-suspenders: even if 0.2 and 0.3 fail, a bad fill cannot corrupt the ledger, AND a restart cannot silently clear the resulting pause.
+**Why this blocks larger trades specifically:** the magnitude of the spurious overfill scales with token quantity. At `MARKET_BUY_USD=1` and ask=$0.72, `tokens = 1.39`, overfill = 0.39 — still might trigger but small. At `MARKET_BUY_USD=55` and ask=$0.72, `tokens = 76.39`, overfill = 21.39 — large and guaranteed to trip the check. Lower target prices make it worse (more tokens per dollar). This is why the lost-fill class shows up at the larger trade sizes the operator is now using.
 
-#### 0.4 (the zero-price guard) — scope and limits
+**Fix (single deterministic path, no global flag, no fallback path):**
 
-The zero-price guard in `_record_live_order_fill` rejects any fill that reaches the strategy's recorder with `fill_price <= 0`. This is necessary but **not sufficient**:
+Patch the Polymarket adapter's websocket trade-event path so that, before any overfill check compares `last_qty` to `order.quantity`, the order's quantity field has been translated from USDC to tokens.
 
-- It catches fills that pass through Nautilus and reach the strategy with bad data.
-- It does **NOT** catch the case in the observed production log, where Nautilus rejected the fill at the overfill-check stage and never invoked `on_order_filled` at all — the fill simply vanished.
+Exact installed Nautilus hook: patch around `PolymarketExecutionClient._handle_user_trade_in_ws_trade_msg(...)`, immediately before it calls `self.generate_order_filled(...)` with `last_qty=instrument.make_qty(msg.last_qty(order_id))`. Do not patch only the later status-report path; the first `$55` failure occurs in this websocket fill path before later order-status reconciliation can repair it.
 
-The complete protection requires the adapter-side callback (0.3a + 0.2 + 0.3b). The zero-price guard is the last line of defense; the adapter callback is the primary one. Ship the guard first because it's a 10-line commit and protects the strategy thread regardless of what the adapter does, then ship the adapter work.
+When a `MATCHED` trade event arrives for an order submitted with `quote_quantity=True`, the patch checks whether Nautilus' cached order still has `quote_quantity=True` and `quantity` matching the original USDC value. If so, it computes the token-denominated order quantity from a **cumulative** source, not just the first fill's `last_qty`, and dispatches an `OrderUpdated` event to Nautilus FIRST, updating `quantity` to that cumulative token amount, BEFORE `generate_order_filled(...)` runs.
 
-#### 0.5 — Regression tests
+The cumulative quantity source must be one of these exact verified sources, chosen during implementation after reading the installed websocket message schema:
+
+1. A total matched / order-size field in the same websocket trade message, if present and verified to mean cumulative token quantity for that venue order id.
+2. The cumulative sum of all unprocessed plus already-processed websocket fills for that `venue_order_id`, maintained in a tracked per-order map keyed by venue order id, and updated before each `generate_order_filled(...)` call.
+
+The implementation PR must choose exactly one source and document the verified message fields or state map. Do not implement a runtime fallback between sources.
+
+Do not use the first fill's `last_qty` as the translated order quantity. A market order can fill across multiple trades before the venue's delayed `OrderUpdated` arrives; setting quantity to the first partial fill would recreate the overfill on the second partial fill.
+
+In practice this means hooking the trade-event handler in the Polymarket adapter so that for quote-quantity orders, every pre-`OrderUpdated` trade event refreshes the cached order quantity to the cumulative matched token quantity before fill processing. The venue already produces an `OrderUpdated` event with the correct token quantity — the issue is that it can arrive seconds after the first trade event, AFTER the overfill check has already rejected the fill. The patch must reorder so the quantity translation happens first.
+
+If this event-reordering path cannot be implemented safely, Phase 0.5 is blocked and the plan must be amended with one exact replacement design for operator approval. Do not add a per-order overfill bypass, delayed reconciliation path, or any other alternative implementation without explicit approval for that exact code path.
+
+**Interaction with 0.4:** after the order's quantity has been translated to tokens via the event-reordering patch, the dust check from 0.4 becomes the operative protection. Any tiny mismatch between `size_matched` (76.388885) and the translated `order.quantity` (76.388800 from the venue) gets clipped per 0.4. The two phases are complementary: 0.5 fixes the units mismatch BEFORE the first overfill check; 0.4 fixes the residual dust AFTER the venue's quantity update.
+
+**Tests (added to Phase 0.6):**
+
+- Submit market BUY with `quote_quantity=True, quantity=$55`. Simulate matched trade `size=76.388885 tokens`. Assert NO overfill error fires; the trade is recorded with `fill_qty=76.388885` via the actual-fill callback.
+- Multi-partial fill: submit market BUY with `quote_quantity=True, quantity=$55`. Simulate two `MATCHED` websocket events before any venue `OrderUpdated`: first `30` tokens, then `46.388885` tokens. Assert no overfill fires on either event, the cached translated quantity is cumulative before each `generate_order_filled(...)` call, and the ledger records cumulative actual units `76.388885`.
+- Submit market BUY with `quote_quantity=True, quantity=$100`. Simulate matched trade at a different price (e.g., `size=200 tokens` at $0.50). Same assertion — no overfill error, correct token quantity in ledger.
+- Edge case: submit market BUY with `quote_quantity=False, quantity=10 tokens`. Verify the existing token-quantity path is unaffected by the new patch.
+
+**Effort:** 1 day.
+
+#### 0.5a — ULTRA CRITICAL: Nautilus 1.227.0 dependency audit for one-sided quote drops
+
+The repeated `DataClient-POLYMARKET: Dropping QuoteTick ... bid_price=0.99, ask_price=None` / `bid_price=None, ask_price=0.01` warnings are no longer treated as harmless log noise. If they are only for rolled-over old instruments, they are operationally noisy but not trade-blocking. If they are for the current active 15-minute YES/NO instruments, the adapter drops the quote before `on_quote_tick`, which can starve `price_history`, YES/NO cache updates, and late-window trade decisions. That can reduce trade frequency and therefore belongs on the Phase 0.5 critical path.
+
+Current repo pin: `nautilus_trader==1.222.0`.
+
+Audit target: `nautilus_trader==1.227.0` (released May 18, 2026; beta-labeled release). Do not describe this as "stable." This upgrade may introduce new dependencies or API changes, so it is not a blind requirements bump. It must be tested in an isolated branch/env and any code updates must be explicit. Re-check the latest available release at implementation time before changing the pin.
+
+Required audit before Phase 0.5 is marked complete:
+
+1. Install/test `nautilus_trader==1.227.0` in a clean environment without modifying the production venv in place.
+2. Record dependency/API changes needed by this repo (`TradingNode`, Polymarket config/factories, order factory calls, execution/data adapter signatures).
+3. Verify whether 1.227.0 still contains any `ClientOrderId(str(UUID4()))` fallback in Polymarket execution paths.
+4. Verify whether 1.227.0 still has the `quote_quantity=True` websocket trade-event units mismatch that Phase 0.5 patches.
+5. Verify whether FILLED status-report paths can still emit `avg_px is None`.
+6. Verify whether Polymarket unsubscribe support is now present and usable for old 15-minute instruments.
+7. Measure whether one-sided quote drops occur for the **current active** BTC 15-minute instruments, not only rolled-over instruments.
+8. Confirm whether current Polymarket websocket subscription-update behavior changed relative to the installed adapter.
+
+Do **not** set `drop_quotes_missing_side=False` as a quick fix. That substitutes boundary prices with zero volume and is a data-substitution fallback under `AGENTS.md`; it requires a separate exact operator approval if ever proposed. Do not suppress the warning as a fix unless metrics prove it only affects non-current instruments and no current-instrument quote starvation occurs.
+
+Decision after audit:
+
+- If Nautilus 1.227.0 removes the UUID fallback, fixes quote-quantity units handling, and supports unsubscribe cleanly, prefer an explicit dependency upgrade plus required code changes over local adapter patching.
+- If 1.227.0 does not fix the Phase 0.5 bug, keep the tracked Phase 0.5 patch plan and add a separate current-instrument one-sided-quote handling task.
+- If 1.227.0 introduces dependency/API churn that blocks quick adoption, document the blockers and keep Phase 0.5 local patching on the critical path.
+
+Acceptance criteria:
+
+- [ ] A clean-env Nautilus 1.227.0 smoke test report is added to the plan or a tracked incident note.
+- [ ] The report explicitly answers UUID fallback, quote-quantity units mismatch, missing `avg_px`, unsubscribe support, and current-instrument one-sided quote-drop behavior.
+- [ ] Any required code changes for 1.227.0 are listed before implementation begins.
+- [ ] No fallback quote synthesis, warning suppression, or dependency upgrade is shipped without tests proving equivalent or stricter behavior.
+
+**Effort:** TBD after clean-env dependency resolution.
+
+##### Installed adapter baseline (Nautilus 1.222.0)
+
+Probed at implementation time against the repo's installed `nautilus_trader==1.222.0`:
+
+- All four Phase 0 target methods are present on `PolymarketExecutionClient`:
+  `generate_order_status_report`, `generate_order_status_reports`,
+  `_handle_user_trade_in_ws_trade_msg`, `_parse_trades_response_object`.
+- `ClientOrderId(str(UUID4()))` client-id fallback occurrences in installed
+  source (note: `UUID4()` is also used in installed Nautilus for
+  `command_id=` and `report_id=` — those are NOT client-id fallbacks and are
+  not in scope for Phase 0.4):
+  - `generate_order_status_reports`: **2 sites** — the active-order loop
+    (line ~420 in installed source) and the
+    `generate_order_history_from_trades` branch (line ~522).
+  - `_parse_trades_response_object`: **1 site** (line ~741).
+  - `generate_order_status_report` and `_handle_user_trade_in_ws_trade_msg`:
+    none observed in the method bodies (the venue→client lookup is upstream).
+  - **Total Phase 0.4 patch sites: 3**, matching Phase 0.4's required UUID
+    guard count.
+- No method body inserts a default `avg_px` itself; the missing-`avg_px` defect
+  observed in production comes from upstream Nautilus inferring fills from a
+  FILLED report whose `avg_px` is `None`.
+
+This baseline confirms Phase 0.4's three required UUID-guard sites and Phase
+0.3's hook points. It does **not** substitute for the clean-env 1.227.0 audit
+required above; it only records what the installed 1.222.0 adapter looks like
+today so the patch implementer has a precise starting point.
+
+##### Clean-env audit findings — Nautilus 1.227.0 (operator-requested upgrade)
+
+Audit performed against the 1.227.0 wheel downloaded into an isolated
+`/tmp/nautilus-1227-audit/extracted/` directory (production venv untouched, per
+the plan's "clean environment" requirement).
+
+| Phase 0 defect | 1.222.0 | 1.227.0 | Source evidence (1.227.0) |
+| --- | --- | --- | --- |
+| 0.3: `avg_px = None` on FILLED report | Present | **FIXED** | `generate_order_status_report` line 698 calls `_weighted_average_price(fills, total_filled)` (imported from `nautilus_trader.adapters.polymarket.schemas.user`). When `not fills`, the status becomes `CANCELED` with `avg_px = None` — no inferred fill triggered. |
+| 0.4: token-dust overfill rejection | Present | **FIXED** | `_handle_user_trade_in_ws_trade_msg` calls `self._fill_tracker.snap_fill_qty(venue_order_id, raw_last_qty)` using `DUST_SNAP_THRESHOLD_DEC`. Same snap also applied to the cached-order quantity in `generate_order_status_report` via `_snap_filled_qty_to_quantity`. |
+| 0.5: `quote_quantity=True` units mismatch | Present | **FIXED** | `_submit_market_order` (around line 1779) for BUY quote-quantity orders computes `base_quantity = signed_order.takerAmount / 1e6` and passes `base_quantity=` + `expected_venue_order_id=` through `_post_signed_order`. The adapter now knows the cached order's base-token quantity at submission time, so the websocket trade-event overfill check compares matching units. |
+| 0.4: `ClientOrderId(str(UUID4()))` client-id fallback | 3 sites | **STILL PRESENT in 1.227.0; PATCHED in tracked code** | Sites unchanged in installed source (lines 431, 534, 879). Tracked Phase 0.4 in-tree patch ``apply_uuid_fallback_guard_patch`` in ``patch_market_orders.py`` replaces all 3 sites with ``_dispatch_actual_fill(None, {status: failed, reason: unmapped_venue_order_id, ...})`` plus a `continue`. ``verify_no_nautilus_client_order_id_uuid_fallback`` then passes on the patched method source. Live startup is unblocked. Patch is pinned to nautilus_trader 1.227.0 and refuses to apply on any other version. |
+| 0.5a: Polymarket unsubscribe support | Limited | **PRESENT** | `_unsubscribe_order_book_deltas`, `_unsubscribe_quote_ticks`, `_unsubscribe_trade_ticks`, `_unsubscribe_bars` defined in `data.py` lines 484–509. |
+| 0.5a: one-sided quote drops on current instruments | Present | **Unchanged** | `data.py` lines 648, 746 keep the same `drop_quotes_missing_side` behavior. Mitigation: keep the config default `True` for now; operator can observe metrics under 1.227.0 before flipping. |
+
+API/dependency changes required to upgrade this repo to 1.227.0:
+
+1. **`requirements.txt`** — bump `nautilus_trader==1.222.0` → `nautilus_trader==1.227.0`. `py-clob-client-v2==1.0.1` is already pinned and remains required (1.227.0 declares it via `Requires-Dist: py-clob-client-v2 (>=1.0.1,<2.0.0); extra == "polymarket"`). The old `py_clob_client==0.34.5` is kept because admin scripts
+   (`check_polymarket_balance.py`, `derive_polymarket_api_creds.py`,
+   `approve_polymarket_clob.py`) still import from it.
+2. **`bot.py` config field rename** — `PolymarketDataClientConfig` and
+   `PolymarketExecClientConfig` both renamed `instrument_provider` →
+   `instrument_config`. Update both call sites in `run_integrated_bot`.
+3. **`polymarket_v2_compat.py`** — the existing compat shim was written to make
+   1.222.0's adapter use `py-clob-client-v2`. 1.227.0 natively imports from
+   `py_clob_client_v2.client`, so the shim's main purpose disappears. Keep the
+   shim's call site for now but treat its `apply_polymarket_v2_patch()` as a
+   no-op-or-already-applied path under 1.227.0.
+4. **`patch_market_orders.py`** — the `_submit_market_order` monkey patch was
+   the workaround for the missing-`base_quantity` defect. 1.227.0 fixes this
+   natively. The patch is still wired to `auto_redeem` dispatch and the actual
+   fill handler scaffold, which remain valuable. Consider trimming the
+   `_submit_market_order` replacement after live smoke testing confirms the
+   1.227.0 native path works.
+5. **`verify_no_nautilus_client_order_id_uuid_fallback`** — still required.
+   1.227.0 retains the 3 UUID4 client-id fallback sites. Live startup remains
+   blocked until those are patched/guarded or upstream removes them.
+
+Plan decision (per the section's "Decision after audit" rubric):
+- 1.227.0 fixes Phase 0.3, 0.4 (dust), and 0.5 natively → **dependency
+  upgrade plus the migration steps above is SHIPPED** in
+  ``requirements.txt`` (`nautilus_trader==1.227.0`) and ``bot.py``
+  (`instrument_provider` → `instrument_config` rename).
+- 1.227.0 does NOT remove the UUID fallback → **in-tree patch SHIPPED** as
+  ``apply_uuid_fallback_guard_patch`` in ``patch_market_orders.py`` (replaces
+  the 3 UUID4 client-id synthesis sites with `_dispatch_actual_fill` +
+  `continue`). ``verify_no_nautilus_client_order_id_uuid_fallback`` passes on
+  the patched class. The patch is pinned to ``nautilus_trader==1.227.0`` so
+  any future version bump triggers a fresh Phase 0.5a audit instead of
+  silently re-using stale verbatim method bodies. Phase 0.6 regression
+  coverage: ``test_zz_uuid_fallback_guard_patch_lets_verify_pass`` and
+  ``test_zz_patched_parse_trades_dispatches_failure_on_unmapped_venue``.
+- 1.227.0 does NOT change `drop_quotes_missing_side` → **no flag flip; observe
+  metrics on the upgraded build before any change to current-instrument quote
+  handling**.
+
+Two intentional deviations from upstream 1.227.0 source in
+``apply_uuid_fallback_guard_patch``:
+- **Site 2 cache lookup.** Upstream unconditionally synthesizes a UUID in the
+  ``generate_order_history_from_trades`` branch; the patch consults
+  ``self._cache.client_order_id(venue_order_id)`` first and reuses the real
+  client_order_id when available. When the cache is empty, the patch fails
+  closed via ``_dispatch_actual_fill`` instead of synthesizing. Strictly
+  safer than upstream and consistent with the No-Fallback policy.
+- **`command` shadowing preserved.** The patch uses the same
+  ``command = GenerateOrderStatusReport(...)`` reassignment inside the loop
+  as upstream, so the subsequent
+  ``fill_command = GenerateFillReports(instrument_id=command.instrument_id, ...)``
+  references the last sub-command's instrument_id (or the outer command's
+  when the loop runs zero iterations). This matches upstream semantics
+  exactly.
+
+#### 0.6 — Regression tests
 
 Add to `tests/test_simulation_mode_safety.py` (or a new `tests/test_polymarket_fill_normalization.py`):
 
 1. **Test: dust overfill is accepted, ledger preserves actual filled units.** Simulate an order for 17.460300 tokens and a report with `size_matched=17.460316`. Mock `client.get_trades(...)` to return one matching trade `[{taker_order_id: <venue_id>, price: "0.63", size: "17.460316"}]`. Assert the actual-fill callback fires with `status="ok"`, `filled_qty=Decimal("17.460316")`, `vwap=Decimal("0.63")`. Assert `_record_live_order_fill` is called with `fill_qty=17.460316` (the actual Polymarket filled units, preserved via the side-channel).
 2. **Test: real overfill is rejected AND dispatches durable failure.** Submit for 17.460300, simulate fill of 18.0, assert the fill is rejected by Nautilus' normal path AND the actual-fill callback fires with `status="failed"`, `reason="real_overfill_rejected"`. Assert a durable SETTLEMENT_UNKNOWN entry is created for the venue order id so the bot stays paused across restart.
-3. **Test: missing avg_px with `get_trades` match succeeds.** Simulate a filled report with `avg_px=None` and mock `client.get_trades(...)` returning a matched trade. Assert the actual-fill callback fires with `status="ok"` and the correct VWAP. Assert the inferred fill carries the matched price.
+3. **Test: missing avg_px with `get_trades` match succeeds in every status-report path.** Simulate a filled report with `avg_px=None` and mock `client.get_trades(...)` returning a matched trade. Cover both `generate_order_status_report(...)` and `generate_order_status_reports(...)` FILLED report creation paths. Assert the actual-fill callback fires with `status="ok"` and the correct VWAP. Assert the inferred fill carries the matched price.
 4. **Test: missing avg_px with no `get_trades` match blocks ledger.** Simulate the same condition but with `client.get_trades(...)` returning no match. Assert the actual-fill callback fires with `status="failed"`, `reason="no_matching_trade"`. Assert `_settlement_ledger_blocked_reason` is set and no fill is committed.
 5. **Test: zero fill_price guard.** Call `_record_live_order_fill(order_id, fill_price=Decimal("0"), fill_qty=Decimal("17"))` directly, assert returns False, asserts `_settlement_ledger_blocked_reason` is set. This test exercises the last-line-of-defense guard independently of the adapter callback.
+6. **Test: installed Nautilus UUID fallback is disabled.** Simulate missing `self._cache.client_order_id(venue_order_id)` in each patched report path and assert no `ClientOrderId(str(UUID4()))` and no synthetic `venue:<hash>` order id is produced. Assert the adapter dispatches `client_order_id=None`, `status="failed"`, `reason="unmapped_venue_order_id"`, includes the real `venue_order_id`, and returns `None` / skips append.
+7. **Test: quote-quantity units mismatch is normalized before overfill check.** Simulate a market BUY with `quote_quantity=True, quantity=$55` and first matched trade `size=76.388885 tokens`. Assert the quantity-translation update happens before fill processing, no overfill error fires, and the ledger records the actual token quantity via the side channel.
+8. **Test: quote-quantity multi-partial fill is cumulative.** Simulate a market BUY with `quote_quantity=True, quantity=$55` and two websocket `MATCHED` events before venue `OrderUpdated`: `30` tokens then `46.388885` tokens. Assert both `generate_order_filled(...)` calls avoid overfill, `pending_actual_fills[order_id].fills[]` contains two ordered real-keyed fill entries before consumption, aggregate actual units total `76.388885`, and the final ledger record preserves the aggregate actual units and VWAP.
 
 All tests mock `client.get_trades(TradeParams(...))`, **NOT** `get_trade_history` (that method does not exist).
+
+#### 0.7 — Recover the lost trade (done last, after 0.1-0.6 are merged)
+
+**Operational prerequisites:**
+
+- **Stop the bot first.** Run `kill -TERM <pid>` against both the wrapper and `bot.py`. Confirm no `python bot.py` process remains. The admin tool acquires the `live_trades.json.lock` and refuses to run while the bot holds it.
+- **Use the venv Python.** Always `venv/bin/python mark_settlement_resolved.py`, never system `python`. The admin tool depends on the same `Decimal` discipline as the bot.
+- **Pass `--ledger` explicitly on every admin-tool invocation.** The plan no longer approves the `LIVE_TRADE_LEDGER_PATH` / `./live_trades.json` default chain for reconciliation tooling. Any mutating action must fail argument parsing if `--ledger` is omitted, so an operator cannot accidentally mutate the wrong ledger. Read-only list actions must also require `--ledger`, so the inspected file and mutated file are always the same explicit path.
+
+**Command (operator must fill in real values, not placeholders):**
+
+```bash
+venv/bin/python mark_settlement_resolved.py \
+  --ledger /path/to/live_trades.json \
+  --create-unknown-from-external-order 'BTC-15MIN-$11-1779093783343' \
+  --confirm-external-order \
+  --external-size 10.99999908 \
+  --external-entry-price 0.63 \
+  --external-filled-qty 17.460316 \
+  --external-direction short \
+  --external-trade-label "NO (DOWN)" \
+  --external-instrument-id "0xd55ee02c5080428bab05c89cf861e347c3a94306d8e0c999b87068f3145b7b2b-13493549868196599328875182057608566347488679426659046670938216865177784647005.POLYMARKET" \
+  --external-token-id 13493549868196599328875182057608566347488679426659046670938216865177784647005 \
+  --external-slug "<derive from Polymarket order/condition record for condition_id 0xd55ee02c... — do NOT guess>" \
+  --external-condition-id 0xd55ee02c5080428bab05c89cf861e347c3a94306d8e0c999b87068f3145b7b2b \
+  --external-submitted-at "<actual ISO timestamp with tz, e.g. 2026-05-18T07:43:03+00:00>" \
+  --external-filled-at "<actual ISO timestamp with tz, e.g. 2026-05-18T07:43:05+00:00>" \
+  --external-market-end-time "<actual ISO timestamp with tz, e.g. 2026-05-18T07:45:00+00:00>" \
+  --reason "Nautilus dropped fill event due to missing avg_px and 0.000016 token dust overfill"
+```
+
+**Operator must replace every `<...>` placeholder with the real value from Polymarket UI / bot logs.** Do not run the command as written — the slug, instrument-id full form, and timestamps must come from the actual trade.
+
+Note: the validation requires exact cost consistency within the settlement accounting tolerance. Do not round the notional to `11.00`. With the observed values above, `0.63 * 17.460316 = 10.99999908`, so `--external-size` must be `10.99999908`. If the verified notional from Polymarket is exactly `11.00`, derive and use the precise average entry price as `11.00 / 17.460316` instead of using rounded `0.63`.
+
+**Live-trading pause expectation:** creating a `SETTLEMENT_UNKNOWN` record activates the live-trading pause gate in `bot.py` (`_unresolved_settlement_unknowns` and the live-start guard). Live trading remains paused until the second step (`--order-id ... --payout ...`) resolves the unknown with a verified payout. This is intentional — Phase 0 does not "unblock" live trading by itself; it only prepares the ledger for a clean second-step resolution.
+
+**Do NOT wait for `auto_redeem` on a market that has already resolved.** The lost trade's market has already ended in production. Polymarket's websocket does not replay missed `auto_redeem` events on reconnect. If the bot was down or rejected the event when it fired, it is gone. The operator must:
+
+1. Open the Polymarket UI (or query the on-chain redemption record) and verify the actual payout for the affected token holding.
+2. Resolve the SETTLEMENT_UNKNOWN record immediately with the verified payout — do not wait for the grace timeout to fire and book a $0 loss.
+
+```bash
+venv/bin/python mark_settlement_resolved.py \
+  --ledger /path/to/live_trades.json \
+  --order-id 'BTC-15MIN-$11-1779093783343' \
+  --payout <verified-payout-from-Polymarket-UI> \
+  --reason "Verified from Polymarket UI after lost-fill incident"
+```
+
+Use the same `venv/bin/python` and the same `--ledger` path as the prerequisite above. Do not use system `python`.
 
 ### Exit criteria
 
 - [ ] Lost trade reconstructed in `live_trades.json` via `--create-unknown-from-external-order`.
 - [ ] **Lost trade fully resolved.** Operator has run `--order-id BTC-15MIN-\$11-... --payout <verified> --reason ...` with the externally verified payout. The ledger entry now has `settlement_source: "manual_reconciliation"` and `needs_reconciliation: false`.
-- [ ] **No remaining `SETTLEMENT_UNKNOWN` records with `needs_reconciliation: true` for this order.** Reconstruction alone is not sufficient — the live-trading pause gate keys off unresolved unknowns, so a reconstructed-but-unresolved entry would keep the bot paused indefinitely.
-- [ ] avg_px present in fill events for new live market BUYs via the deterministic `get_trades` path (verify with one $5 live smoke trade after the lost trade is fully resolved).
+- [ ] **No remaining live-blocking unresolved state for this order.** Reconstruction alone is not sufficient: the live-trading pause gate checks settled-record OR semantics (`needs_reconciliation is True` or `settlement_source == "SETTLEMENT_UNKNOWN"`) plus `pending_actual_fills`, unresolved `submitted_order_intents`, and `LEDGER_BLOCKED`. Confirm this order has no matching unresolved settled record, pending actual fill, or submitted intent before live smoke testing.
+- [ ] avg_px present in fill events for new live market BUYs via the deterministic `get_trades` path (verify with one minimum allowed live smoke trade, e.g. `$5.51`, after the lost trade is fully resolved).
 - [ ] Token-dust overfill within tolerance no longer rejected; ledger preserves actual filled units via the side-channel.
 - [ ] Real overfill (outside tolerance) dispatches `status=failed, reason=real_overfill_rejected` and creates a durable SETTLEMENT_UNKNOWN entry that survives restart.
 - [ ] `_record_live_order_fill` refuses non-positive `fill_price`.
-- [ ] All five regression tests pass.
-- [ ] One deliberately tiny `$5` live smoke trade has been placed and observed to flow cleanly through: order submitted → actual-fill callback fires with `status="ok"` and matching VWAP → ledger records actual filled units → `auto_redeem` resolves → final ledger entry shows correct payout and P&L.
+- [ ] All Phase 0 regression tests pass, including the installed Nautilus UUID-fallback guard and quote-quantity units-mismatch case.
+- [ ] One deliberately tiny allowed live smoke trade (`MARKET_BUY_USD=5.51`, strictly greater than the `5.50` live gate) has been placed and observed to flow cleanly through: order submitted → actual-fill callback fires with `status="ok"` and matching VWAP → ledger records actual filled units → `auto_redeem` resolves → final ledger entry shows correct payout and P&L.
 
 ### Effort
 
-2 days. The Polymarket adapter patch (0.2, 0.3) is the longest piece because it requires reading Nautilus's internal report path and crafting a minimal monkey patch.
+3 days plus the Phase 0.5a clean-env Nautilus 1.227.0 audit. The Polymarket adapter patch (0.3, 0.4, 0.5) is the longest code piece because it requires reading Nautilus's internal report path and crafting a minimal monkey patch. The 0.5a audit may reduce or reshape that patch if 1.227.0 fixes adapter behavior, but it must be verified before live trading resumes.
 
 ---
 
@@ -667,8 +1141,10 @@ Important distinction: these are read **from the running process's environment**
 |---|---|---|
 | `STOP_LOSS_PCT` | "30% stop loss" in README | **Not read.** Risk engine has `_check_stop_loss` but is never called in live flow. |
 | `TAKE_PROFIT_PCT` | "20% take profit" in README | **Not read.** Same. |
-| `SPIKE_THRESHOLD` | spike detector threshold | **Hardcoded in `bot.py:376` to 0.05.** Env value ignored. |
+| `SPIKE_THRESHOLD` | spike detector threshold | **Hardcoded in `bot.py` near the strategy configuration constants to 0.05.** Env value ignored. |
 | `DIVERGENCE_THRESHOLD` | divergence detector threshold | **Hardcoded in `bot.py` to 0.05.** Env value ignored. |
+
+**Current-env operational warning:** if the live `.env` currently contains `STOP_LOSS_PCT`, `TAKE_PROFIT_PCT`, `SPIKE_THRESHOLD=0.15`, or `DIVERGENCE_THRESHOLD=0.05`, those lines do not change runtime behavior today. `STOP_LOSS_PCT` and `TAKE_PROFIT_PCT` do nothing; `SPIKE_THRESHOLD=0.15` is ignored and the code uses `0.05`; `DIVERGENCE_THRESHOLD=0.05` happens to match the hardcoded value but is still ignored. Do not treat those env values as active risk controls until Phase 1.1 either wires them as required env vars or removes them from docs/env files.
 
 ### Fix scope
 
@@ -733,18 +1209,18 @@ Behavior:
 - Stops new trades after $110 realized daily loss (~2 full position-size losses).
 - Drawdown limit relative to bot's internal $1000 starting balance — 15% = ~$150. With $110 daily loss limit, daily cap will trip first under normal loss patterns.
 
-### Smaller starting config (if operator wants to start more conservatively)
+### Smoke-test-only config
 
 ```env
-MARKET_BUY_USD=5.00
-MAX_POSITION_SIZE=5.00
-MAX_TOTAL_EXPOSURE=20.00
+MARKET_BUY_USD=5.51
+MAX_POSITION_SIZE=5.51
+MAX_TOTAL_EXPOSURE=22.04
 MAX_POSITIONS=4
-MAX_LOSS_PER_DAY=10.00
+MAX_LOSS_PER_DAY=11.02
 MAX_DRAWDOWN_PCT=0.15
 ```
 
-Same shape, ~1/11 the exposure. Use this for the first live smoke trade after Phase 0 completes, then scale to the $385 cap after the smoke trade settles cleanly.
+Same shape, slightly above the strict `MARKET_BUY_USD > 5.50` live gate and ~1/10 the normal exposure. This is smoke-test-only: use it for the first live smoke trade after Phase 0 completes, then scale to the intended normal `$55 / $385 / 7 positions / $110 daily loss` config after the smoke trade settles cleanly.
 
 ### Important constraints
 
@@ -770,7 +1246,7 @@ The bot receives Nautilus `AccountState` updates from Polymarket, but those upda
 
 ### Optional future work: live pre-submit balance guard (out of scope for Phase 2)
 
-If the operator wants the bot to refuse trades when free collateral is missing, stale, or below `MARKET_BUY_USD`, this would be a new sub-phase (call it Phase 2.5). Requirements:
+If the operator wants the bot to refuse trades when free collateral is missing, stale, or below `MARKET_BUY_USD`, this is covered by Phase 2.5. Requirements:
 
 - Hook the Nautilus `AccountState` update path to keep `self._latest_free_collateral` and `self._latest_account_state_ts` current.
 - In `_make_trading_decision` (or `_place_real_order`), before order construction:
@@ -781,15 +1257,55 @@ If the operator wants the bot to refuse trades when free collateral is missing, 
 
 This is intentionally not on the Phase 0/1/2 critical path. Document as a future enhancement; ship only if operator decides the existing rejection-as-feedback approach is insufficient.
 
-### Optional non-issue: rollover quote warnings
+### Effort
 
-When the bot rolls from one 15-minute market to the next, the previous instrument may emit a few one-sided `QuoteTick` events that the strategy logs as `Dropping QuoteTick`. These are harmless: the strategy ignores non-current instruments. The Polymarket adapter does not currently support unsubscribe for closed markets, so this log noise will continue briefly after each rollover.
+5 minutes for the balance check. The Nautilus 1.227.0 audit is tracked in Phase 0.5a above and must be estimated after clean-env dependency resolution.
 
-**No urgent code fix.** Optional future cleanup only (would require an adapter-level unsubscribe or an instrument-id filter at the message-receive boundary).
+---
+
+## Phase 2.4 — Structured Decision Writer (prerequisite for Phase 2.5 and Phase 4)
+
+**Status:** Code prerequisite. Promoted ahead of Phase 2.5 because dynamic sizing rejection tests need structured `rejected_at_gate` records, and Phase 4 calibration needs the same decision ledger.
+
+Add a structured `decisions.jsonl` writer in `_make_trading_decision` that emits one JSON object per decision with all join keys:
+
+```python
+{
+  "decision_id": "<unique id>",
+  "ts": "<ISO UTC timestamp>",
+  "slug": "<market slug>",
+  "condition_id": "<condition id>",
+  "yes_token_id": "...",
+  "no_token_id": "...",
+  "market_end_time": "<ISO UTC>",
+  "seconds_into_sub_interval": 812.3,
+  "trade_window_label": "13_14_current",
+  "trend_price_band": "yes_gt_0.60",
+  "strategy_observation_mode": "live_gate",
+  "fused_confidence": 0.7755,
+  "fused_direction": "bearish",
+  "decided_direction": "short",   # null if rejected
+  "rejected_at_gate": null,       # or "trend_filter" | "signal_confirmation" | "ev_gate" | "liquidity" | etc.
+  "rejection_reason": null,
+  "executable_entry": "0.998",
+  "yes_ask": "...",
+  "no_ask": "...",
+  "model_signals": {...},
+}
+```
+
+Use the finalizer-style helper described in Phase 4.1 so every early return emits exactly one record. The time-in-market and price-band fields are required because Phase 4.5 evaluates whether the current late-window/extreme-band policy has lost its edge. Phase 2.5 may then add sizing-specific fields and rejection gates to this existing writer instead of inventing a second logging path.
+
+### Exit criteria
+
+- [ ] Every `_make_trading_decision` invocation appends exactly one `decisions.jsonl` record.
+- [ ] Early-return tests cover representative gates and assert the expected `rejected_at_gate`.
+- [ ] Records contain the join keys Phase 4 needs: `slug`, `condition_id`, token ids, market end time, confidence, direction, executable entry, and processor diagnostics.
+- [ ] Records contain the strategy-policy fields Phase 4.5 needs: `seconds_into_sub_interval`, `trade_window_label`, `trend_price_band`, and `strategy_observation_mode`.
 
 ### Effort
 
-5 minutes (operator sets env file + runs the balance check).
+0.5 day. This effort was previously nested under Phase 4; it is now pulled earlier because Phase 2.5 depends on it.
 
 ---
 
@@ -812,6 +1328,14 @@ Mode selection via required env var (no implicit default in live mode, matching 
 # Required in live mode. Allowed values: fixed | percent
 SIZING_MODE=
 ```
+
+Migration note for the current operator-confirmed fixed-size config: after Phase 2.5 ships, the normal `$55 / $385 / 7 positions / $110 daily loss` env must add:
+
+```env
+SIZING_MODE=fixed
+```
+
+Until Phase 2.5 ships, the current env lacking `SIZING_MODE` is expected and does not change today's fixed `MARKET_BUY_USD=55.00` behavior.
 
 Validation in `run_integrated_bot` when `simulation=False`:
 
@@ -843,9 +1367,34 @@ def _get_pct_of_free_collateral() -> Decimal:
     return value
 ```
 
+### Live account-balance freshness (required for BOTH modes)
+
+Phase 2.5 is also the phase that keeps the bot's view of CLOB free collateral fresh. This is required even when `SIZING_MODE=fixed`: a fixed `$55` order can still fail if previous orders consumed free collateral, and claimed/redeemed markets can increase free collateral before the next decision.
+
+Required account-state cache:
+
+```python
+self._latest_free_collateral: Decimal | None
+self._latest_account_state_ts: datetime | None
+self._account_state_sequence: int
+```
+
+The bot must update this cache from every Nautilus `AccountState` event emitted by the Polymarket adapter. It must store the available/free USDC collateral field that the exchange uses for new CLOB orders, not the bot's internal `_current_balance` risk-accounting number.
+
+Freshness triggers:
+
+1. **Startup:** do not allow live order submission until at least one `AccountState` has been received, unless the operator has explicitly decided that Phase 2.5 is not enabled yet. After Phase 2.5 ships, missing account state is a trade reject, not an exchange-order attempt.
+2. **Before every order:** check that `account_state_age_seconds <= MAX_ACCOUNT_STATE_AGE_SECONDS` and `free_collateral >= per_trade_usd + BALANCE_SAFETY_BUFFER_USD`. This applies to fixed and percent modes.
+3. **After order submission/fill:** mark the cached balance as potentially stale until a newer `AccountState` arrives. If the next decision arrives before the refresh, reject with `rejected_at_gate="stale_balance_after_order"` rather than guessing remaining collateral.
+4. **After `auto_redeem` / late redeem / manual settlement that can release or add funds:** mark the cached balance as potentially stale until a newer `AccountState` arrives. If the next decision arrives before the refresh, reject with `rejected_at_gate="stale_balance_after_redeem"`.
+
+No fallback: do not estimate free collateral from `live_trades.json`, submitted order size, previous balance minus order size, or redemption payout. Those are not the exchange's current CLOB free collateral and can diverge because of partial fills, fees, pending orders, manual trades, or delayed account updates.
+
+If the installed adapter does not emit a fresh `AccountState` after order/fill/redeem, Phase 2.5 must add exactly one explicit refresh mechanism and document it before implementation, for example a known py-clob-client balance endpoint called after those events. Do not implement multiple refresh paths with fallback ordering.
+
 ### Computing the per-trade size at decision time
 
-**For `SIZING_MODE=fixed`:** same as today.
+**For `SIZING_MODE=fixed`:** size is the same as today, but the live pre-submit balance freshness guard above still applies.
 
 ```python
 per_trade_usd = get_market_buy_usd()   # reads MARKET_BUY_USD
@@ -869,7 +1418,7 @@ per_trade_usd = (free_collateral * pct_of_free_collateral_per_trade).quantize(
 )
 ```
 
-The percent-mode computation requires the bot to hook the Nautilus `AccountState` update path (same hook that Phase 2.5-balance-guard would have used). This is now mandatory infrastructure, not optional future work.
+The percent-mode computation uses the same account-state cache as the fixed-mode balance guard. The `AccountState` hook is mandatory infrastructure, not optional future work.
 
 ### Hard constraints that apply to BOTH modes
 
@@ -884,10 +1433,12 @@ The `per_trade_usd > MAX_POSITION_SIZE` rejection is important. If the operator 
 
 ### `decisions.jsonl` integration
 
-The decision record (per Phase 4) gains two fields when `SIZING_MODE=percent` is active:
+The decision record from Phase 2.4 gains these fields:
 - `sizing_mode`: `"fixed"` or `"percent"`
-- `free_collateral_at_decision`: the snapshotted balance used for the computation (null for fixed mode)
-- `account_state_age_seconds`: age of the balance snapshot (null for fixed mode)
+- `free_collateral_at_decision`: the snapshotted exchange free collateral used for the guard/sizing computation
+- `account_state_age_seconds`: age of the balance snapshot
+- `account_state_sequence`: monotonically increasing local sequence for observed `AccountState` events
+- `balance_stale_reason`: null, `"startup"`, `"after_order"`, `"after_redeem"`, or `"too_old"`
 
 These allow Phase 4 calibration to detect whether bigger-vs-smaller positions perform differently — useful for tuning the percent value over time.
 
@@ -897,6 +1448,9 @@ These allow Phase 4 calibration to detect whether bigger-vs-smaller positions pe
 - [ ] `SIZING_MODE=percent` with $1000 free collateral and `PCT=0.05` produces `per_trade_usd=$50.00`.
 - [ ] `SIZING_MODE=percent` with stale account state (>30s old) rejects the trade and logs to `decisions.jsonl` with `rejected_at_gate="stale_balance"`.
 - [ ] `SIZING_MODE=percent` with no account state yet rejects with `rejected_at_gate="no_balance"`.
+- [ ] `SIZING_MODE=fixed` still checks fresh free collateral before submitting a `$55` order.
+- [ ] After a submitted order/fill marks balance stale, the next decision rejects with `rejected_at_gate="stale_balance_after_order"` until a newer `AccountState` arrives.
+- [ ] After `auto_redeem`, late redeem, or manual settlement marks balance stale, the next decision rejects with `rejected_at_gate="stale_balance_after_redeem"` until a newer `AccountState` arrives.
 - [ ] Computed size exceeding `MAX_POSITION_SIZE` rejects (does not clamp) with `rejected_at_gate="size_exceeds_max_position_size"`.
 - [ ] Missing `SIZING_MODE` in live mode raises at startup.
 - [ ] Invalid `SIZING_MODE` value raises at startup.
@@ -904,12 +1458,13 @@ These allow Phase 4 calibration to detect whether bigger-vs-smaller positions pe
 
 ### Effort
 
-1.5 days. Most of the work is the `AccountState` hook (which Phase 2.5-balance-guard would have needed anyway) and the rejection-vs-clamp logic for `MAX_POSITION_SIZE`.
+2 days. Most of the work is the `AccountState` hook, stale-after-order/redeem invalidation, and the rejection-vs-clamp logic for `MAX_POSITION_SIZE`.
 
 ### Exit criteria
 
 - [ ] Both modes work via env var, no implicit default in live mode.
 - [ ] Operator can switch modes by env edit + restart (same constraint as other risk-engine env vars).
+- [ ] Fresh exchange free collateral is required before live submission in both fixed and percent modes.
 - [ ] All four hard constraints (minimum, max position, max exposure, max positions) apply to both modes.
 - [ ] All listed tests pass.
 - [ ] README documents both modes with example env values and the rejection-not-clamp semantics for `MAX_POSITION_SIZE`.
@@ -918,7 +1473,7 @@ These allow Phase 4 calibration to detect whether bigger-vs-smaller positions pe
 
 ## Phase 3 — Configurable Order Type (`MARKET_IOC` vs `LIMIT_IOC`)
 
-**Status:** Strategic. Major change. Depends on Phase 0 (fill reconciliation must work first), Phase 4 (calibration validation), and Phase 5 (depth-aware fill estimator).
+**Status:** Strategic. Major change. Depends on Phase 0 (fill reconciliation must work first), Phase 4 (calibration validation), Phase 4.5 (strategy timing/price-band evaluation), and Phase 5A (market-depth estimator/per-side book infrastructure). Phase 5B limit-depth wiring depends on this Phase 3 order-type scaffold and must ship before `ORDER_TYPE=limit_ioc` is enabled for normal live trading.
 
 ### Motivation
 
@@ -932,7 +1487,7 @@ Both are explicit operator choices. This is not a silent fallback — the operat
 
 ### 3.0a — Decide partial-fill vs all-or-nothing semantics BEFORE the wire-format verification
 
-This is a strategy decision, not a Nautilus question. The plan must pick one explicitly before Phase 3 ships:
+This is a strategy decision, not a Nautilus question. Phase 3 is blocked until the operator explicitly selects one policy. There is no plan default.
 
 **Option FAK (fill-and-kill / partial fill OK):**
 - "Buy up to N tokens at price ≤ cap; whatever fills, fills. Cancel the rest."
@@ -946,29 +1501,25 @@ This is a strategy decision, not a Nautilus question. The plan must pick one exp
 - Simpler accounting (no partial-fill state).
 - Recommended when the strategy's edge depends on a full position; partial fills would distort risk.
 
-**Plan default: FAK.** Rationale:
-- Existing partial-fill machinery in `_record_live_order_fill` is already built and tested.
-- Polymarket book depth at $5 trade sizes is usually thin enough that requiring all-or-nothing would skip a substantial fraction of otherwise profitable trades.
-- The depth estimator in Phase 5 already exposes how many tokens would fill at the limit cap; if the operator wants FOK behavior they can implement it as a strategy-side check (`if tokens_filled < target_token_qty: return False`) without changing the order type.
-
-If the operator wants FOK behavior explicitly, that becomes a Phase 3 sub-flag (`LIMIT_IOC_REQUIRE_FULL_FILL=true`, no default), gating the strategy-side check rather than changing the Polymarket order type. Keep one wire format; layer policy on top.
+Implementation requirement: add a required live-mode env var such as `LIMIT_IOC_FILL_POLICY`, allowed values `partial_ok` or `all_or_nothing`, and fail startup if `ORDER_TYPE=limit_ioc` and the policy is missing/invalid. If `all_or_nothing` is selected, the strategy-side depth check must reject when `tokens_filled < target_token_qty` before order submission. If `partial_ok` is selected, the existing partial-fill ledger path remains valid. Do not silently infer this policy from Nautilus' `FAK/FOK` mapping.
 
 ### 3.0b — HARD PREREQUISITE: verify Nautilus wire format for `OrderType.LIMIT + TimeInForce.IOC`
 
 Before any of the Phase 3 implementation begins, verify experimentally that `self.order_factory.limit(... time_in_force=TimeInForce.IOC ...)` actually produces the wire format we expect when it reaches `py_clob_client`. Three things could go wrong, all of which require **deliberate** action — not fallback:
 
-1. **Nautilus may map `LIMIT + IOC` to Polymarket's `FAK` order type.** This matches the Plan-default FAK strategy choice in 3.0a. Confirm and proceed.
-2. **Nautilus may map `LIMIT + IOC` to `FOK`** (fill-or-kill, all-or-nothing). This **contradicts** the Plan-default FAK choice. If Nautilus maps to FOK, the strategy must either (a) change the default to FOK and revisit 3.0a, or (b) submit a different `TimeInForce` value that maps to FAK. Do not silently accept the mismatch.
+1. **Nautilus may map `LIMIT + IOC` to Polymarket's `FAK` order type.** Proceed only if the operator-selected `LIMIT_IOC_FILL_POLICY` is compatible with that wire behavior, or add an explicit strategy-side pre-submit check that enforces the selected policy.
+2. **Nautilus may map `LIMIT + IOC` to `FOK`** (fill-or-kill, all-or-nothing). Proceed only if the operator-selected `LIMIT_IOC_FILL_POLICY` is compatible with that wire behavior. If not, Phase 3 remains blocked until a deliberate wire-format design is approved.
 3. **Nautilus may reject the combination outright** and require a different `TimeInForce` value (`GTD`, `FAK` explicit, etc.). If so, choose the Polymarket order type deliberately by reading `py_clob_client` source — do NOT pick whichever value happens to make the rejection go away.
 
-A locally-installed Nautilus reviewer sanity-check during plan review showed `TimeInForce.IOC → FAK`, so the Plan-default is consistent with the current Nautilus mapping. Verification step remains required because the mapping is internal to Nautilus and can change between versions.
+A locally-installed Nautilus reviewer sanity-check during plan review showed `TimeInForce.IOC → FAK`, but that is not a policy default. Verification remains required because the mapping is internal to Nautilus and can change between versions.
 
 **Verification method (NOT simulation):**
 
-Write a unit test that constructs the limit order via `order_factory.limit`, intercepts the patched execution path, and asserts the exact `OrderArgs` or `MarketOrderArgs` shape that `py_clob_client.create_order` is invoked with. Specifically assert:
-- `order_args.order_type` is one of: `"FAK"`, `"FOK"`, `"GTC"` (whichever Nautilus maps to).
-- `order_args.price`, `order_args.size`, `order_args.side`, `order_args.token_id` are populated correctly.
-- The call is `create_order(...)`, NOT `create_market_order(...)`.
+Write a unit test that constructs the limit order via `order_factory.limit`, intercepts the patched execution path, and asserts the exact CLOB calls. Installed Nautilus builds `OrderArgs` without an `order_type`; it passes the Polymarket order type later as the second argument to `post_order(...)`. Specifically assert:
+- `create_order(...)` receives `OrderArgs` with `price`, `size`, `side`, `token_id`, and `expiration` populated correctly.
+- `OrderArgs` does **not** carry `order_type`; do not write a test expecting that field.
+- The signing call is `create_order(...)`, NOT `create_market_order(...)`.
+- `post_order(signed_order, <order_type>)` receives the expected mapping (`"FAK"`, `"FOK"`, or `"GTC"`, whichever Nautilus maps from `TimeInForce.IOC`).
 
 Document the actual mapping in the Phase 3 implementation PR. If the mapping doesn't match the intent ("fill at limit or cancel"), file an issue and **block Phase 3** until resolved. Do not ship a workaround.
 
@@ -978,22 +1529,22 @@ Document the actual mapping in the Phase 3 implementation PR. If the mapping doe
 
 Polymarket limit orders require ≥5 tokens. At various target prices with various budget sizes:
 
-| Limit price | $1 budget → tokens | $5 budget → tokens | $11 budget → tokens |
+| Limit price | $1 budget → tokens | $5.51 smoke budget → tokens | $11 budget → tokens |
 |---|---|---|---|
-| $0.20 | 5.0 ✅ | 25.0 ✅ | 55.0 ✅ |
-| $0.30 | 3.3 ❌ | 16.7 ✅ | 36.7 ✅ |
-| $0.50 | 2.0 ❌ | 10.0 ✅ | 22.0 ✅ |
-| $0.62 | 1.6 ❌ | 8.1 ✅ | 17.7 ✅ |
-| $0.80 | 1.25 ❌ | 6.25 ✅ | 13.75 ✅ |
+| $0.20 | 5.0 ✅ | 27.55 ✅ | 55.0 ✅ |
+| $0.30 | 3.3 ❌ | 18.37 ✅ | 36.7 ✅ |
+| $0.50 | 2.0 ❌ | 11.02 ✅ | 22.0 ✅ |
+| $0.62 | 1.6 ❌ | 8.89 ✅ | 17.7 ✅ |
+| $0.80 | 1.25 ❌ | 6.89 ✅ | 13.75 ✅ |
 
-**Implication:** `LIMIT_IOC` is only usable when `MARKET_BUY_USD / limit_price ≥ 5`. At Phase 2's recommended $5 budget, this works for prices ≤ $1.00 (i.e., all valid prices). At $1 budget, only ≤ $0.20 trades qualify.
+**Implication:** `LIMIT_IOC` is only usable when `MARKET_BUY_USD / limit_price ≥ 5`. At Phase 2's smoke budget (`5.51`, the minimum allowed live size), this works for prices ≤ $1.00 (i.e., all valid prices). At $1 budget, only ≤ $0.20 trades qualify.
 
 ### 3.2 — `quote_quantity` correctness per order type
 
 | Order type | `quote_quantity` | `quantity` semantics |
 |---|---|---|
 | Market BUY (current patched path) | `True` | USD amount to spend |
-| Limit BUY | `False` | Token count (per `nautilus_polymarket_integration.py:427`) |
+| Limit BUY | `False` | Token count (per the existing limit-order integration path in `nautilus_polymarket_integration.py`) |
 | Market SELL | `False` | Token count |
 | Limit SELL | `False` | Token count |
 
@@ -1204,8 +1755,8 @@ The current patch intercepts market BUY orders only. Limit orders need to flow t
 
 Per the repo's simulation rule, decision-only simulation/test_mode **cannot prove live-equivalent order submission**. To verify the wire format of limit orders before any live run:
 
-1. **Unit test with a mocked `py_clob_client`.** Build a test that constructs the limit order through `order_factory.limit(...)`, intercepts the patched execution path, and asserts that the mocked client's `create_order` (not `create_market_order`) is called with the expected `OrderArgs(token_id=..., price=Decimal("0.50"), size=Decimal("10"), side="BUY")` shape.
-2. **One deliberately tiny live smoke trade** after Phase 0 is closed: place one $5 limit BUY at a moderate price, observe the actual Polymarket order record matches what we submitted (token quantity, limit price, IOC TIF).
+1. **Unit test with a mocked `py_clob_client`.** Build a test that constructs the limit order through `order_factory.limit(...)`, intercepts the patched execution path, and asserts that the mocked client's `create_order` (not `create_market_order`) is called with the expected `OrderArgs(token_id=..., price=Decimal("0.50"), size=Decimal("10"), side="BUY", expiration=...)` shape. Separately assert `post_order(signed_order, <mapped_order_type>)` receives the expected `FAK/FOK/GTC` mapping.
+2. **One deliberately tiny live smoke trade** after Phase 0 is closed: place one minimum allowed `$5.51` limit BUY at a moderate price, observe the actual Polymarket order record matches what we submitted (token quantity, limit price, IOC TIF).
 
 Do not use simulation mode for this verification. Decision-only simulation cannot exercise the wire format.
 
@@ -1222,7 +1773,8 @@ Do not use simulation mode for this verification. Decision-only simulation canno
 - [ ] `ORDER_TYPE` required env var validated at startup.
 - [ ] Both code paths exist and are exercised by tests.
 - [ ] 5-token minimum guard prevents impossible limit orders.
-- [ ] One $5 live smoke trade with each order type confirms the wire format is right.
+- [ ] `ORDER_TYPE=limit_ioc` is not enabled for routine live trading until Phase 5B limit-depth wiring is complete.
+- [ ] One minimum allowed `$5.51` live smoke trade with each order type confirms the wire format is right.
 - [ ] README documents both modes and their trade-offs.
 
 ### Effort
@@ -1231,7 +1783,7 @@ Do not use simulation mode for this verification. Decision-only simulation canno
 
 ---
 
-## Phase 4 — Calibration Validation (gate for Phase 3's edge claim)
+## Phase 4 — Calibration Validation (gate before Phase 4.5 and Phase 3)
 
 **Status:** Strategic. Prerequisite for trusting `LIMIT_IOC` to capture edge.
 
@@ -1256,9 +1808,9 @@ Do not use simulation mode for this verification. Decision-only simulation canno
 
 **Path B prerequisite: structured decision-observation ledger.**
 
-Reviewer-flagged: the current decision-observation flow ([bot.py:2475](bot.py:2475)) only emits log lines; it does not write a structured ledger with the join keys Path B needs. Without that ledger, joining against Polymarket historical resolutions is fragile parsing of free-text log lines.
+Reviewer-flagged: the current decision-observation flow in `bot.py` only emits log lines; it does not write a structured ledger with the join keys Path B needs. Without that ledger, joining against Polymarket historical resolutions is fragile parsing of free-text log lines.
 
-**New sub-phase (do this before running the calibration script):**
+**Implemented earlier in Phase 2.4 (must exist before running the calibration script):**
 
 Add a structured `decisions.jsonl` writer in `_make_trading_decision` that emits one JSON object per decision with all the join keys:
 
@@ -1271,6 +1823,10 @@ Add a structured `decisions.jsonl` writer in `_make_trading_decision` that emits
   "yes_token_id": "...",
   "no_token_id": "...",
   "market_end_time": "<ISO UTC>",
+  "seconds_into_sub_interval": 812.3,
+  "trade_window_label": "13_14_current",
+  "trend_price_band": "yes_gt_0.60",
+  "strategy_observation_mode": "live_gate",
   "fused_confidence": 0.7755,
   "fused_direction": "bearish",
   "decided_direction": "short",   // null if rejected
@@ -1326,7 +1882,7 @@ class _DecisionRecord:
 
 **Test:** for each early-return branch in `_make_trading_decision`, write a test that drives the strategy down that branch and asserts `decisions.jsonl` gained exactly one new line with the expected `rejected_at_gate` value.
 
-**Effort:** 0.5 day inside Phase 4 (add the writer + rotation). Must be merged and running long enough to accumulate decisions before Path B can produce results.
+**Effort:** writer implementation is accounted for in Phase 2.4. Phase 4 still requires elapsed time for the already-shipped writer to accumulate decisions before Path B can produce results.
 
 **Both paths are required.** Path A alone has selection bias that hides whether the gate thresholds are correct. Path B alone doesn't measure realized P&L (no actual fills). Together they answer:
 - "Is `fused.confidence` a calibrated probability?" (Path B)
@@ -1361,7 +1917,7 @@ with open("live_trades.json") as f:
 buckets = defaultdict(lambda: {
     "outcome_wins": 0,        # bought side won (auto_redeem paid > 0)
     "outcome_losses": 0,      # bought side lost (auto_redeem paid 0 or no payout)
-    "sum_entry_price": Decimal("0"),
+    "sum_entry_price_weighted": Decimal("0"),
     "sum_pnl_usd": Decimal("0"),
     "sum_size_usd": Decimal("0"),
     "trades": 0,
@@ -1370,56 +1926,68 @@ buckets = defaultdict(lambda: {
 for trade in ledger["settled"]:
     if trade.get("settlement_source") not in ("auto_redeem", "late_auto_redeem", "manual_reconciliation"):
         continue
-    conf = float(trade.get("signal_confidence", 0))
-    payout = Decimal(trade.get("payout", "0")) if trade.get("payout") not in ("UNKNOWN", None) else Decimal("0")
-    pnl = Decimal(trade.get("pnl", "0")) if trade.get("pnl") not in ("UNKNOWN", None) else Decimal("0")
-    size = Decimal(trade.get("size", "0"))
-    entry = Decimal(trade.get("entry_price", "0"))
+    if trade.get("payout") in ("UNKNOWN", None) or trade.get("pnl") in ("UNKNOWN", None):
+        continue  # unresolved; exclude from numerator and denominator
+    conf = float(trade["signal_confidence"])
+    payout = Decimal(str(trade["payout"]))
+    pnl = Decimal(str(trade["pnl"]))
+    size = Decimal(str(trade["size"]))
+    entry = Decimal(str(trade["entry_price"]))
+    if size <= 0:
+        raise ValueError(f"settled trade has non-positive size: {trade!r}")
     bucket = round(conf * 10) / 10  # 0.5, 0.6, 0.7, 0.8, 0.9
     b = buckets[bucket]
     if payout > 0:
         b["outcome_wins"] += 1
     else:
         b["outcome_losses"] += 1
-    b["sum_entry_price"] += entry
+    b["sum_entry_price_weighted"] += entry * size
     b["sum_pnl_usd"] += pnl
     b["sum_size_usd"] += size
     b["trades"] += 1
 
-print(f"{'conf':>6} {'n':>5} {'win_rate':>10} {'avg_entry':>10} {'avg_pnl_per_$':>14} {'edge_vs_entry':>14}")
+print(f"{'conf':>6} {'n':>5} {'win_rate':>10} {'w_avg_entry':>12} {'realized_return':>16} {'prob_edge':>12}")
 for bucket in sorted(buckets):
     b = buckets[bucket]
     n = b["trades"]
     if n == 0:
         continue
+    if b["sum_size_usd"] <= 0:
+        raise ValueError(f"bucket {bucket} has no positive traded size")
     win_rate = b["outcome_wins"] / n
-    avg_entry = b["sum_entry_price"] / n
-    avg_pnl_per_dollar = b["sum_pnl_usd"] / b["sum_size_usd"] if b["sum_size_usd"] > 0 else Decimal("0")
-    edge_vs_entry = Decimal(str(win_rate)) - avg_entry
-    print(f"{bucket:>6.1f} {n:>5} {win_rate:>10.1%} {float(avg_entry):>10.4f} {float(avg_pnl_per_dollar):>+14.4f} {float(edge_vs_entry):>+14.4f}")
+    weighted_avg_entry = b["sum_entry_price_weighted"] / b["sum_size_usd"]
+    realized_return = b["sum_pnl_usd"] / b["sum_size_usd"]
+    probability_edge = Decimal(str(win_rate)) - weighted_avg_entry
+    print(f"{bucket:>6.1f} {n:>5} {win_rate:>10.1%} {float(weighted_avg_entry):>12.4f} {float(realized_return):>+16.4f} {float(probability_edge):>+12.4f}")
 ```
 
 Add Brier score `mean((conf - outcome)**2)` and log-loss `-mean(outcome*log(conf) + (1-outcome)*log(1-conf))` if sample size permits.
 
 #### 4.3 — Decision gate
 
-A trade is +EV when **`win_rate > avg_entry_price + fee_buffer + spread_buffer`** (per dollar — fees/spread must be included; ignoring them gives apparent edge where there is none). So:
+A trade cohort is +EV when realized net P&L is positive per dollar actually risked. With Phase 2.5 dynamic sizing, the primary Path A gate is therefore **dollar-weighted realized return**:
+
+```python
+realized_return = sum_pnl_usd / sum_size_usd
+```
+
+`win_rate - weighted_avg_entry_price` remains a probability-calibration diagnostic, but it is not the primary pass/fail metric for live profitability. Unweighted `win_rate` and simple average entry can be misleading once position sizes vary.
 
 **Three gates must all pass to clear Phase 3:**
 
-1. **Point estimate of edge is positive.** `win_rate - avg_entry_price > (fee_buffer + spread_buffer)` in at least one well-sampled bucket. Use the same buffer values as the EV gate (`EV_FEE_BUFFER + EV_SPREAD_BUFFER`, default 1.5%).
+1. **Dollar-weighted realized return is positive.** `sum_pnl_usd / sum_size_usd > 0` in at least one well-sampled bucket using net realized P&L. If the ledger's P&L calculation is later found not to include any fee component, add the explicit fee cost to the numerator before computing this metric; do not compare gross P&L to a net-profit gate.
 
-2. **Lower bound of edge confidence interval is also positive.** Compute a Wilson 95% CI for the win rate at each bucket. The CI lower bound minus `avg_entry_price + buffers` must still be `> 0`. A single positive bucket at n=50 can easily be noise; the CI guards against that. For n=50 and observed 70% win rate, Wilson 95% lower bound is ~56% — so the bucket has to be much better than break-even pointwise to clear the CI test.
+2. **Probability edge cross-check is positive.** Compute a size-weighted average entry price for each bucket: `sum(entry_price * size_usd) / sum(size_usd)`. The Wilson 95% CI lower bound for win rate minus `weighted_avg_entry_price + fee_buffer + spread_buffer` must still be `> 0`. This keeps the probability-calibration claim honest while the realized-return gate remains primary.
 
-3. **Edge persists out-of-sample.** Split the data into two halves (chronologically — first half vs second half). The edge must be positive (point estimate) in BOTH halves. This catches the case where the model fit a transient pattern that doesn't continue.
+3. **Dollar-weighted return persists out-of-sample.** Split the data into two halves (chronologically — first half vs second half). `sum_pnl_usd / sum_size_usd` must be positive in BOTH halves. This catches the case where the model fit a transient pattern that doesn't continue.
 
 **Decision:**
 
-- All three gates pass in ≥1 bucket with n ≥ 100: **proceed to Phase 3.**
-- Point estimate passes but CI lower bound is negative: **collect more data.** The signal might be real but n is too small to confirm.
-- Point estimate passes but out-of-sample half is flat or negative: **no shippable edge.** The apparent edge is overfit. Don't ship `LIMIT_IOC` — the strategy needs signal-processor work.
-- Point estimate is at or below buffers across buckets: **no edge.** Same conclusion.
-- `win_rate < avg_entry_price` across buckets: **negative edge.** Stop the strategy and investigate.
+- All three gates pass in ≥1 bucket with n ≥ 100: **proceed to Phase 4.5.** Phase 3 remains blocked until Phase 4.5 also clears the timing/price-band policy.
+- Realized-return gate passes but probability-edge CI lower bound is negative: **collect more data or investigate sizing effects.** The strategy may be profitable due to sizing/gating rather than calibrated confidence.
+- Realized-return gate passes but out-of-sample half is flat or negative: **no shippable edge.** The apparent edge is overfit. Don't ship `LIMIT_IOC` — the strategy needs signal-processor work.
+- Realized return is at or below zero across buckets: **no realized edge.** Same conclusion.
+- `win_rate < weighted_avg_entry_price` across buckets: **negative probability edge.** Stop the strategy and investigate even if a small realized-return sample looks positive.
 
 The win-rate-alone gate (e.g., "70% confidence → 65% win rate") from earlier drafts is insufficient because it ignores entry price AND ignores noise. A 70% win rate at $0.80 entry is a loser; at $0.50 entry it's a winner — but only if the sample is large enough to trust.
 
@@ -1429,19 +1997,92 @@ The win-rate-alone gate (e.g., "70% confidence → 65% win rate") from earlier d
 
 - [ ] **`decisions.jsonl` writer is shipped and producing structured records** with all join keys (slug, condition_id, market_end_time, fused_confidence, decided_direction, rejected_at_gate, executable_entry, per-processor scores). Verified by reading several days of `decisions.jsonl` output and confirming each record has the documented fields.
 - [ ] Calibration script exists and runs against **both** `live_trades.json` (Path A) **and** `decisions.jsonl` joined to Polymarket historical resolutions (Path B). Two separate analysis outputs, not one.
-- [ ] **Path A:** sample size **≥100** settled live trades in at least one confidence bucket. Reports `win_rate`, `avg_entry_price`, `avg_pnl_per_dollar`, `win_rate - avg_entry_price`. (This is the same `n ≥ 100` threshold used by the three-gate rule in 4.3 — unified across the whole document.)
+- [ ] **Path A:** sample size **≥100** settled live trades in at least one confidence bucket. Reports `win_rate`, `weighted_avg_entry_price`, `realized_return = sum_pnl_usd / sum_size_usd`, and `win_rate - weighted_avg_entry_price`. (This is the same `n ≥ 100` threshold used by the three-gate rule in 4.3 — unified across the whole document.)
 - [ ] **Path B:** sample size ≥200 decision observations (including rejected) in at least one confidence bucket. Reports the same metrics computed from market resolutions, plus Brier score and log-loss across the full set.
-- [ ] **Decision documented with the numbers from both paths.** If Path A shows positive `win_rate - avg_entry_price` but Path B shows the same confidence buckets are uncorrelated with outcomes (i.e., the gates are filtering on noise that happens to correlate with profitable trades), Phase 3 is NOT cleared to ship — the apparent edge is in the gates, not the signal.
+- [ ] **Decision documented with the numbers from both paths.** If Path A shows positive realized return but Path B shows the same confidence buckets are uncorrelated with outcomes (i.e., the gates are filtering on noise that happens to correlate with profitable trades), Phase 4.5 and Phase 3 are NOT cleared to ship — the apparent edge is in the gates or sizing, not the signal.
 
 ### Effort
 
-4 hours of analysis once data is collected. Data collection: 0.5 day to ship the `decisions.jsonl` writer, then days-to-weeks of elapsed time for it to accumulate ≥200 decisions plus ≥100 settled trades.
+4 hours of analysis once data is collected. Data collection requires Phase 2.4 to have shipped first, then days-to-weeks of elapsed time for it to accumulate ≥200 decisions plus ≥100 settled trades.
 
 ---
 
-## Phase 5 — Depth-Aware Fill Estimator
+## Phase 4.5 — Strategy Timing and Price-Band Evaluation (no EV-gate loosening)
 
-**Status:** Improvement. Useful for both `MARKET_IOC` and `LIMIT_IOC`.
+**Status:** Strategic. Addresses the "late-window edge is gone" concern before changing order type or expanding live trade size.
+
+### Current issue
+
+Current live code has two hard-coded strategy gates:
+
+- Trade timing is only minute 13-14 of each 15-minute market: `TRADE_WINDOW_START = 780`, `TRADE_WINDOW_END = 840` in `bot.py`.
+- Trend price bands are only `YES > 0.60` or `YES < 0.40`; anything more extreme than those thresholds can proceed to signal confirmation and the EV gate in `bot.py`.
+
+The EV gate is still required, but it does not by itself answer whether the late window still has edge, or whether very extreme prices (`YES >= 0.70`, `YES <= 0.30`) are worse than moderate continuation bands. The plan must evaluate that policy explicitly instead of assuming "later + more extreme = better."
+
+### Scope
+
+This phase evaluates candidate timing windows and price bands while keeping the EV gate unchanged.
+
+1. **Add decision-observation records for candidate windows.** These records are not trade simulation and must not be described as live-equivalent profitability. They are decision observations: what the unchanged decision stack would have seen at a timestamp, with no order submission, no ledger write, no risk reservation, and no position accounting.
+2. **Compare timing buckets against the current baseline.** Minimum buckets:
+   - `06_09`: 6:00-8:59 into the 15-minute market.
+   - `09_11`: 9:00-10:59.
+   - `11_13`: 11:00-12:59.
+   - `13_14`: current baseline.
+3. **Compare price bands instead of treating all extremes as one class.** Minimum buckets:
+   - YES-side moderate: `0.52 <= yes_price < 0.60`.
+   - YES-side strong: `0.60 <= yes_price < 0.70`.
+   - YES-side extreme: `yes_price >= 0.70`.
+   - NO-side moderate: `0.40 < yes_price <= 0.48`.
+   - NO-side strong: `0.30 < yes_price <= 0.40`.
+   - NO-side extreme: `yes_price <= 0.30`.
+4. **Keep the EV gate intact.** Do not lower `EV_FEE_BUFFER`, `EV_SPREAD_BUFFER`, `MIN_SIGNAL_CONFIDENCE`, or the calibrated-confidence requirement to make earlier windows or moderate bands pass. This phase only changes which observations are evaluated before the existing signal-confirmation and EV gates.
+5. **No implicit live-policy fallback.** If Phase 4.5 later changes live timing/bands, either keep the chosen values as explicit code-owned constants with tests, or replace them with required env values that fail startup when missing/invalid. Do not add optional env vars that silently default back to `780-840` or `0.60/0.40`.
+
+### Analysis method
+
+Use the Phase 2.4 `decisions.jsonl` writer plus the Phase 5A selected-token depth estimator. Each observation must include:
+
+- `seconds_into_sub_interval`
+- `trade_window_label`
+- `trend_price_band`
+- `strategy_observation_mode` (`live_gate` for the current production call path, `shadow_policy` for non-submitting candidate windows)
+- selected token, executable entry, depth-estimated VWAP if available, fused confidence, signal direction, and EV-gate threshold
+
+For candidate windows outside the current live window, the bot may compute the same signal/EV diagnostics, but must stop before any order submission path. This is decision-observation mode only. It cannot be used to claim live-equivalent realized P&L because it does not model fill lifecycle, settlement, ledger writes, or risk accounting.
+
+### Decision rule
+
+Do not change the live trade window or price bands unless the Phase 4.5 report shows:
+
+- The candidate cohort has at least `n >= 200` decision observations joined to market outcomes.
+- The candidate cohort passes the same calibrated-confidence and EV-gate logic used by the baseline.
+- The candidate cohort's counterfactual edge after executable-entry and fee/spread buffers is better than the current `13_14` baseline.
+- A live canary plan is documented before routine use. Counterfactual observations can justify a tiny canary; they do not by themselves prove live profitability.
+
+If no candidate beats the baseline, keep the current `13_14` and `0.60/0.40` policy and focus on signal processors rather than loosening the EV gate.
+
+### Exit criteria
+
+- [ ] `decisions.jsonl` contains timing and price-band fields for current live-gate decisions.
+- [ ] Shadow decision-observation mode records candidate windows without submitting orders, reserving risk, or writing live trade ledger entries.
+- [ ] Analysis report compares baseline vs earlier windows and moderate/strong/extreme price bands using the unchanged EV gate.
+- [ ] Operator explicitly approves any live timing/band change before implementation.
+- [ ] Tests prove that any selected timing/band change only changes candidate eligibility; the EV gate thresholds and buffers remain unchanged.
+
+### Effort
+
+0.5-1 day for observation wiring and analysis script changes, plus elapsed time to collect enough candidate observations.
+
+---
+
+## Phase 5 — Depth-Aware Fill Estimator (split into 5A / 5B)
+
+**Status:** Improvement. Split to remove the Phase 3/Phase 5 dependency loop.
+
+- **Phase 5A:** market-depth estimator + selected-token book cache. Ships before Phase 3 and only wires the current `MARKET_IOC` path.
+- **Phase 5B:** limit-depth integration. Ships after Phase 3 introduces `ORDER_TYPE`, `limit_price`, and target-token sizing. `ORDER_TYPE=limit_ioc` is not enabled for routine live trading until 5B is complete.
 
 ### Motivation
 
@@ -1449,7 +2090,7 @@ Current EV gate uses top-of-book ask. Real market IOC fills sweep multiple book 
 
 ### Scope
 
-#### 5.1 — Fill price estimator
+#### 5.1 — Fill estimators
 
 Add to `core/strategy_brain/signal_processors/orderbook_processor.py` (or a new utility module).
 
@@ -1459,48 +2100,46 @@ Add to `core/strategy_brain/signal_processors/orderbook_processor.py` (or a new 
 class InvalidBookLevelError(ValueError):
     """Raised when a CLOB book level has impossible values."""
 
-def estimate_fill_price(
+def _parse_book_level(level: dict, idx: int) -> tuple[Decimal, Decimal]:
+    """Return (price, size_tokens), or raise on impossible book data."""
+    try:
+        price = Decimal(str(level["price"]))
+        size_tokens = Decimal(str(level["size"]))
+    except (KeyError, TypeError, ValueError, InvalidOperation) as e:
+        raise InvalidBookLevelError(
+            f"book level {idx} has non-numeric or missing price/size: {level!r}"
+        ) from e
+    if price <= 0 or price > 1:
+        raise InvalidBookLevelError(
+            f"book level {idx} price={price} is outside (0, 1]; refusing to compute"
+        )
+    if size_tokens <= 0:
+        raise InvalidBookLevelError(
+            f"book level {idx} size={size_tokens} is non-positive; refusing to compute"
+        )
+    return price, size_tokens
+
+def estimate_market_ioc_fill(
     levels: list[dict],
     usd_to_spend: Decimal,
-    max_price: Optional[Decimal] = None,
-) -> tuple[Decimal, Decimal, bool]:
+) -> tuple[Decimal | None, Decimal, bool]:
     """
-    Walk levels (ascending price for buy-side asks).
-    Each level: {"price": <token price in (0, 1]>, "size": <token quantity, > 0>}.
-
-    If max_price is None: walks the entire book (suitable for MARKET_IOC pre-trade analysis).
-    If max_price is set:  stops at the first level where level.price > max_price
-                          (suitable for LIMIT_IOC; tells you "can a limit at max_price fill this budget").
+    MARKET_IOC estimator: spend up to a USD budget across asks.
 
     Raises InvalidBookLevelError on any level with non-positive price/size, price > 1, or
     non-numeric values. Fail closed; do NOT silently skip bad levels — a corrupt book is
     an actionable error, not noise to be ignored.
 
-    Return (volume_weighted_avg_price, total_tokens_filled, fully_filled).
+    Return (vwap_or_none, total_tokens_filled, fully_filled). vwap_or_none is
+    None when no tokens fill; never return Decimal("0") as a no-fill sentinel.
     """
+    if usd_to_spend <= 0:
+        raise ValueError(f"usd_to_spend must be positive, got {usd_to_spend}")
     remaining = usd_to_spend
     total_tokens = Decimal("0")
     total_cost = Decimal("0")
     for idx, level in enumerate(levels):
-        # Validation: fail-closed on bad data, no silent skip
-        try:
-            price = Decimal(str(level["price"]))
-            size_tokens = Decimal(str(level["size"]))
-        except (KeyError, TypeError, ValueError, InvalidOperation) as e:
-            raise InvalidBookLevelError(
-                f"book level {idx} has non-numeric or missing price/size: {level!r}"
-            ) from e
-        if price <= 0 or price > 1:
-            raise InvalidBookLevelError(
-                f"book level {idx} price={price} is outside (0, 1]; refusing to compute"
-            )
-        if size_tokens <= 0:
-            raise InvalidBookLevelError(
-                f"book level {idx} size={size_tokens} is non-positive; refusing to compute"
-            )
-
-        if max_price is not None and price > max_price:
-            break   # for LIMIT_IOC: cannot fill above the cap
+        price, size_tokens = _parse_book_level(level, idx)
         level_usd_capacity = price * size_tokens
         if remaining >= level_usd_capacity:
             total_tokens += size_tokens
@@ -1512,48 +2151,51 @@ def estimate_fill_price(
             total_cost += remaining
             remaining = Decimal("0")
             break
-    if remaining > 0:
-        return (
-            total_cost / total_tokens if total_tokens > 0 else Decimal("0"),
-            total_tokens,
-            False,
-        )
-    return total_cost / total_tokens, total_tokens, True
-```
+    if total_tokens <= 0:
+        return None, total_tokens, False
+    vwap = total_cost / total_tokens
+    return vwap, total_tokens, remaining <= 0
 
-**Caller behavior:** in `_make_trading_decision`, wrap the call in `try/except InvalidBookLevelError` and on error: log the error, refuse the trade (return False), and optionally trigger a `_block_live_settlement_ledger` if corruption persists. Never fall back to a partial book or a default price.
+def estimate_limit_ioc_fill(
+    levels: list[dict],
+    target_token_qty: Decimal,
+    max_price: Decimal,
+) -> tuple[Decimal | None, Decimal, Decimal, bool]:
+    """
+    LIMIT_IOC estimator: acquire up to a token quantity at price <= max_price.
 
-**Usage per order type (different semantics — DO NOT use one estimator for both):**
-
-The previous draft proposed a single `estimate_fill_price(levels, usd_to_spend, max_price=...)` for both modes. That is wrong for `LIMIT_IOC`. Market orders are budget-driven (spend up to $X, take whatever tokens that buys). Limit orders are token-quantity-driven (acquire up to N tokens at price ≤ cap, spend whatever that costs — usually less than the worst-case budget).
-
-The two estimators have different inputs and different "fully filled" semantics:
-
-```python
-def estimate_market_ioc_fill(levels, usd_to_spend) -> tuple[vwap, tokens_filled, fully_filled]:
-    """For MARKET_IOC: how much does it cost to spend $X across the book."""
-    # Existing logic: walk levels, accumulate cost until usd_to_spend exhausted.
-    # fully_filled = (we spent the entire usd_to_spend).
-
-def estimate_limit_ioc_fill(levels, target_token_qty, max_price) -> tuple[vwap, tokens_filled, actual_cost, fully_filled]:
-    """For LIMIT_IOC: how many tokens can we buy at price <= max_price."""
+    Return (vwap_or_none, total_tokens_filled, actual_cost, fully_filled).
+    vwap_or_none is None when no tokens fill; never return Decimal("0") as a
+    no-fill sentinel.
+    """
+    if target_token_qty <= 0:
+        raise ValueError(f"target_token_qty must be positive, got {target_token_qty}")
+    if max_price <= 0 or max_price > 1:
+        raise ValueError(f"max_price must be in (0, 1], got {max_price}")
     remaining_tokens = target_token_qty
     total_cost = Decimal("0")
     total_tokens = Decimal("0")
-    for level in levels:
-        # ... same validation as before (InvalidBookLevelError on bad data) ...
+    for idx, level in enumerate(levels):
+        price, size_tokens = _parse_book_level(level, idx)
         if price > max_price:
-            break    # stop at the cap
+            break
         tokens_to_take = min(remaining_tokens, size_tokens)
         total_tokens += tokens_to_take
         total_cost += tokens_to_take * price
         remaining_tokens -= tokens_to_take
         if remaining_tokens <= 0:
             break
-    fully_filled = (remaining_tokens <= 0)
-    vwap = total_cost / total_tokens if total_tokens > 0 else Decimal("0")
-    return vwap, total_tokens, total_cost, fully_filled
+    if total_tokens <= 0:
+        return None, total_tokens, total_cost, False
+    vwap = total_cost / total_tokens
+    return vwap, total_tokens, total_cost, remaining_tokens <= 0
 ```
+
+**Caller behavior:** in `_make_trading_decision`, wrap the call in `try/except InvalidBookLevelError` and on error: log the error, refuse the trade (return False), and optionally trigger a `_block_live_settlement_ledger` if corruption persists. Never fall back to a partial book or a default price.
+
+**Usage per order type (different semantics — DO NOT use one estimator for both):**
+
+Market orders are budget-driven (spend up to $X, take whatever tokens that buys). Limit orders are token-quantity-driven (acquire up to N tokens at price ≤ cap, spend whatever that costs — usually less than the worst-case budget). The two estimators have different inputs and different "fully filled" semantics.
 
 **Why the distinction matters (reviewer-flagged P0 scenario):**
 
@@ -1566,7 +2208,7 @@ Suppose the operator wants `LIMIT_IOC` BUY at price ≤ $0.50 with budget $5. Th
 
 #### 5.2 — Wire into EV gate — use the SELECTED token's book
 
-**Critical:** the existing metadata only passes `yes_token_id` into the orderbook processor ([bot.py:2232](bot.py:2232)). For a NO trade the fill estimator must walk the **NO** asks, not the YES asks. Using the YES book for a NO trade evaluates the wrong executable market.
+**Critical:** the existing metadata only passes `yes_token_id` into the orderbook processor in `bot.py`. For a NO trade the fill estimator must walk the **NO** asks, not the YES asks. Using the YES book for a NO trade evaluates the wrong executable market.
 
 Required changes to `_fetch_market_context`:
 1. Fetch both YES and NO books once per decision.
@@ -1574,7 +2216,7 @@ Required changes to `_fetch_market_context`:
 3. The `OrderBookImbalanceProcessor` continues to use the YES book for its imbalance metric (unchanged signal logic).
 4. The EV gate selects the book matching the trade direction.
 
-In `_make_trading_decision` — branch by order type because the estimators take different inputs:
+**Phase 5A wiring (before Phase 3):** apply the market-depth estimator to the current market-IOC path only. This avoids reading `ORDER_TYPE` or `limit_price` before Phase 3 owns those concepts.
 
 ```python
 if direction == "long":
@@ -1584,6 +2226,21 @@ else:
 
 side_label = "NO" if direction == "short" else "YES"
 
+estimated_avg, tokens_filled, fully_filled = estimate_market_ioc_fill(
+    side_levels, POSITION_SIZE_USD
+)
+if not fully_filled:
+    logger.warning(
+        f"MARKET_IOC: book too thin for full ${POSITION_SIZE_USD} {side_label} sweep — "
+        f"only ${tokens_filled * estimated_avg:.2f} available"
+    )
+    return False
+executable_entry = estimated_avg
+```
+
+**Phase 5B wiring (after Phase 3):** once Phase 3 introduces `ORDER_TYPE`, `limit_price`, and target-token sizing, replace the Phase 5A market-only call with an explicit order-type branch:
+
+```python
 if order_type == "market_ioc":
     estimated_avg, tokens_filled, fully_filled = estimate_market_ioc_fill(
         side_levels, POSITION_SIZE_USD
@@ -1595,23 +2252,21 @@ if order_type == "market_ioc":
         )
         return False
     executable_entry = estimated_avg
-    # Use existing $1-budget semantics; nothing else changes for market.
-
-else:  # order_type == "limit_ioc"
-    # limit_price was computed once earlier in _make_trading_decision.
-    # See Phase 3.1 sizing math for the target_token_qty derivation.
+elif order_type == "limit_ioc":
     target_token_qty = Decimal(str(POSITION_SIZE_USD)) / limit_price
     estimated_avg, tokens_filled, actual_cost, fully_filled = estimate_limit_ioc_fill(
         side_levels, target_token_qty, max_price=limit_price
     )
     if not fully_filled:
         logger.warning(
-            f"LIMIT_IOC: insufficient {side_label} liquidity at price ≤ {limit_price} "
+            f"LIMIT_IOC: insufficient {side_label} liquidity at price <= {limit_price} "
             f"for {target_token_qty} target tokens — only {tokens_filled} fillable "
             f"(actual cost would be ${actual_cost:.2f})"
         )
         return False
-    executable_entry = estimated_avg   # VWAP — may be strictly below limit_price
+    executable_entry = estimated_avg
+else:
+    raise RuntimeError(f"unexpected ORDER_TYPE after validation: {order_type!r}")
 ```
 
 The LIMIT_IOC path uses `target_token_qty` and reports the actual cost (which may be less than the budget) in the log. The EV gate downstream uses `executable_entry` (VWAP), which is the same field name as before — only the upstream computation differs by order type.
@@ -1626,7 +2281,8 @@ Current state: `OrderBookImbalanceProcessor` fetches the book during signal proc
 ### Exit criteria
 
 - [ ] **Two estimators** exist with unit tests, NOT one unified helper: `estimate_market_ioc_fill(levels, usd_to_spend)` (budget-driven) and `estimate_limit_ioc_fill(levels, target_token_qty, max_price)` (token-driven). Book level units documented as token-quantity in both.
-- [ ] EV gate uses estimated avg price from the **selected token's book** (YES for long, NO for short), not top-of-book.
+- [ ] Phase 5A: EV gate uses estimated avg price from the **selected token's book** (YES for long, NO for short), not top-of-book, for `MARKET_IOC`.
+- [ ] Phase 5B: after Phase 3, `LIMIT_IOC` uses `estimate_limit_ioc_fill(...)`; `ORDER_TYPE=limit_ioc` remains disabled for routine live trading until this is wired and tested.
 - [ ] Single YES book fetch and single NO book fetch per decision (no duplicate HTTP per side).
 - [ ] Test: synthetic book `[{"price": "0.62", "size": "10"}, {"price": "0.70", "size": "15"}]` (i.e., 10 tokens at $0.62 and 15 tokens at $0.70) with $10 budget. First level USD capacity = `0.62 × 10 = $6.20`, second level capacity needed = `$3.80 / 0.70 ≈ 5.43 tokens`. VWAP ≈ `$10 / (10 + 5.43) ≈ 0.6481`. Assert returned avg matches.
 - [ ] Test: empty book returns `fully_filled=False`.
@@ -1637,7 +2293,7 @@ Current state: `OrderBookImbalanceProcessor` fetches the book during signal proc
 
 ### Effort
 
-1 day.
+1 day total: 0.5 day for Phase 5A market-depth wiring and shared tests; 0.5 day for Phase 5B limit-depth integration after Phase 3.
 
 ---
 
@@ -1661,11 +2317,11 @@ If we adopt this:
 
 1. **Refuse plaintext `.env` in live mode — the check MUST run before `load_dotenv()`.**
 
-   **Implementation note (corrected from earlier draft):** the current code calls `load_dotenv()` at module import time ([bot.py:83](bot.py:83)), before `run_integrated_bot` runs. If the plaintext-refusal check is placed inside `run_integrated_bot`, the plaintext `.env` has already been read into `os.environ` by then — the refusal is too late to prevent the leak.
+   **Implementation note (corrected from earlier draft):** the current code calls `load_dotenv()` at module import time in `bot.py`, before `run_integrated_bot` runs. If the plaintext-refusal check is placed inside `run_integrated_bot`, the plaintext `.env` has already been read into `os.environ` by then — the refusal is too late to prevent the leak.
 
-   Two acceptable implementation patterns:
+   Operator must approve exactly one implementation before Phase 6 work starts. Do not implement both and do not add runtime fallback between them:
 
-   **Pattern A (preferred): move `load_dotenv` behind a conditional.**
+   **Pattern A: move `load_dotenv` behind a conditional.**
 
    ```python
    # At module-level import path in bot.py, BEFORE load_dotenv()
@@ -1685,7 +2341,7 @@ If we adopt this:
    # the parent process environment (typically `sops exec-env`).
    ```
 
-   **Pattern B (alternative): always skip `load_dotenv` in live mode regardless of .env presence.**
+   **Pattern B: always skip `load_dotenv` in live mode regardless of .env presence.**
 
    Same effect, no `.env`-file inspection. Operator is responsible for ensuring credentials are in the process environment via `sops exec-env` or systemd or shell `export`. This is the simpler invariant but breaks any operator who relied on plaintext `.env` for live mode (intentionally).
 
@@ -1759,17 +2415,26 @@ Phase 0 (lost-fill reconciliation + fill guards) ─────┐
                                        Phase 2 (operator config + balance pre-flight)
                                                       │
                                                       ▼
+                                       Phase 2.4 (structured decisions.jsonl writer)
+                                                      │
+                                                      ▼
                                        Phase 2.5 (dynamic sizing: fixed | percent) ── NEW, operator-requested
                                                       │
                                                       ▼
-                                       Phase 5 (depth estimator, per-side book) ── benefits both order types
+                                       Phase 5A (market-depth estimator + per-side book)
                                                       │
                                                       ▼
                                        Phase 4 (calibration analysis)
                                                       │
-                                                      ├── if calibration passes
+                                                      ▼
+                                       Phase 4.5 (strategy timing + price-band evaluation)
+                                                      │
+                                                      ├── if calibration + strategy-policy gates pass
                                                       ▼
                                        Phase 3 (ORDER_TYPE configurable: LIMIT_IOC)
+                                                      │
+                                                      ▼
+                                       Phase 5B (LIMIT_IOC depth integration)
                                                       │
                                                       ▼
                                        Phase 7.5 (multi-asset evaluation: ETH/SOL/XRP/...) ── NEW, operator-driven
@@ -1782,14 +2447,14 @@ Phase 0 (lost-fill reconciliation + fill guards) ─────┐
                                        Phase 7 (live reload — recommend: don't implement)
 ```
 
-Phase 2.5 is independent of code-correctness concerns but is the right place in the sequence: after Phase 2 confirms the operator's fixed-mode sizing target, Phase 2.5 adds the percent-mode option. Phase 7.5 is operator-driven evaluation only (no code in this phase) and gates whether Phase 8 deploys for BTC alone or for a wider asset set. Phase 8 follows Phase 7.5 so the deployment is built around the operator's final asset selection.
+Phase 2.4 must ship before Phase 2.5 because the dynamic sizing rejection gates are recorded through `decisions.jsonl`. Phase 2.5 then adds the percent-mode option after Phase 2 confirms the operator's fixed-mode sizing target. Phase 4.5 runs after baseline calibration because timing/price-band changes must be measured against the existing `13_14` and `0.60/0.40` policy without loosening the EV gate. Phase 7.5 is operator-driven evaluation only (no code in this phase) and gates whether Phase 8 deploys for BTC alone or for a wider asset set. Phase 8 follows Phase 7.5 so the deployment is built around the operator's final asset selection.
 
 ### Critical path
 
 - **Must ship before next live run:** Phase 0 (lost trade reconciled, fill guards in place).
 - **Phase 1 status:** Phase 1.1 (wire `SPIKE_THRESHOLD` / `DIVERGENCE_THRESHOLD` to env) is **runtime-behavior** code and DOES block live if the operator intends to tune via env. Phase 1.2 / 1.3 (README + `.env.example`) are documentation-only and do NOT block live. Effort table updated accordingly: Phase 1.1 blocks, 1.2/1.3 do not.
-- **Should ship before scaling trade size:** Phase 5 (depth estimator).
-- **Strategic decision gate:** Phase 4 must satisfy **all three** of the gates in 4.3 (point estimate, Wilson 95% CI lower bound, out-of-sample persistence) in at least one bucket with **n ≥ 100** Path A trades AND ≥200 Path B observations. A single positive bucket at small n is noise. The earlier "n ≥ 50" wording was inconsistent and is replaced everywhere with n ≥ 100. If calibration fails, the fix is to improve signal processors, not to change order type.
+- **Should ship before scaling trade size:** Phase 5A (market-depth estimator).
+- **Strategic decision gate:** Phase 4 must satisfy **all three** of the gates in 4.3 (dollar-weighted realized return, probability-edge CI cross-check, out-of-sample persistence) in at least one bucket with **n ≥ 100** Path A trades AND ≥200 Path B observations, and Phase 4.5 must show that the selected timing/price-band policy is at least as good as the current late-window baseline. A single positive bucket at small n is noise. The earlier "n ≥ 50" wording was inconsistent and is replaced everywhere with n ≥ 100. If calibration or Phase 4.5 fails, the fix is to improve signal processors or policy selection, not to change order type or loosen the EV gate.
 
 ### Important caveat
 
@@ -1850,10 +2515,13 @@ Operator-driven evaluation. No bot-code effort estimated until the operator retu
 │   ├── decisions.jsonl            # Phase 4 decision log
 │   └── archive/                   # rotated decisions.jsonl files
 └── logs/
-    └── bot.log                    # rotated by logrotate
+    ├── bot.log                    # rotated by logrotate
+    └── nautilus/                  # Nautilus TradingNode logs
 ```
 
-The ledger directory MUST be on the same filesystem as the temp-file write target so `os.replace` is atomic. Do not put `live_trades.json` on NFS or a separate mount from the bot's working directory.
+The ledger directory MUST be on the same filesystem as the temp-file write target so `os.replace` is atomic. Do not put `live_trades.json` on NFS or a separate mount from `/opt/polybot/ledger`.
+
+**Current-code path mismatch to fix before enabling this unit:** `bot.py` currently defaults the live ledger to repo-root `live_trades.json` and Nautilus logs to `./logs/nautilus` under the working directory. With `ProtectSystem=strict`, those defaults conflict with the service sandbox below. Phase 8 must set `LIVE_TRADE_LEDGER_PATH=/opt/polybot/ledger/live_trades.json` and must change the Nautilus `LoggingConfig.log_directory` wiring to use a required live-mode env var such as `NAUTILUS_LOG_DIR=/opt/polybot/logs/nautilus`. Do not rely on repo-root write access.
 
 ### systemd service file
 
@@ -1879,14 +2547,11 @@ WorkingDirectory=/opt/polybot/Polymarket-BTC-15-Minute-Trading-Bot
 
 # Pre-SOPS form:
 EnvironmentFile=/opt/polybot/Polymarket-BTC-15-Minute-Trading-Bot/.env
+Environment=LIVE_TRADE_LEDGER_PATH=/opt/polybot/ledger/live_trades.json
+Environment=NAUTILUS_LOG_DIR=/opt/polybot/logs/nautilus
 ExecStart=/opt/polybot/venv/bin/python bot.py --live
 
-Restart=on-failure
-RestartSec=30
-# Avoid restart storms if the bot fail-stops (e.g., durable-write failure).
-# Operator must investigate before restart — limit auto-restarts to 3 per hour.
-StartLimitInterval=3600
-StartLimitBurst=3
+Restart=no
 
 # Resource limits — modest, the bot is mostly I/O bound
 MemoryMax=1G
@@ -1913,10 +2578,10 @@ WantedBy=multi-user.target
 
 Critical notes:
 
-- **`Restart=on-failure` with `StartLimitBurst=3`.** The bot's Phase 0 design fail-stops on durable-write failure. systemd should NOT silently restart it more than 3 times in an hour — if the bot fail-stops repeatedly, the operator must investigate, not let systemd paper over the problem.
-- **No `Restart=always`.** That would clear the fail-stop guarantee.
+- **`Restart=no`.** The bot's Phase 0 design fail-stops on durable-write failure. systemd must not automatically restart after fail-stop because restart would weaken the manual-reconciliation guarantee. If the operator later wants automatic restart for non-ledger crashes, add exact exit-code separation and get explicit approval before changing this unit.
+- **No `Restart=always` or `Restart=on-failure`.** Those would clear or weaken the fail-stop guarantee.
 - **`User=polybot`, not root.** Containment in case of a compromise.
-- **`ProtectSystem=strict` + `ReadWritePaths`.** The bot can only write to ledger and logs directories.
+- **`ProtectSystem=strict` + `ReadWritePaths`.** The bot can only write to ledger and logs directories. This requires the `LIVE_TRADE_LEDGER_PATH` and `NAUTILUS_LOG_DIR` wiring above; otherwise current repo-root defaults will fail under the sandbox.
 - **`MemoryMax=1G`.** The bot's working set is small; a runaway memory leak would be killed before exhausting the host.
 
 ### Redis dependency
@@ -1961,7 +2626,7 @@ The bot does not natively rotate `decisions.jsonl`; the Phase 4 implementation s
 Minimum:
 
 - **Process up.** systemd handles restart; alert if `polybot.service` enters a `failed` state for >5 minutes (Prometheus node_exporter + alertmanager, or Datadog, or simple cron + email).
-- **Live-trading paused.** Alert if `live_trades.json` contains any record with `settlement_source == "SETTLEMENT_UNKNOWN"` or `needs_reconciliation == true` (see Phase 0 OR-vs-AND rule). A cron that `jq` queries the ledger every 5 minutes and sends an alert if non-empty.
+- **Live-trading paused.** Alert if `live_trades.json` contains any unresolved ledger state: a settled record with `settlement_source == "SETTLEMENT_UNKNOWN"` or `needs_reconciliation == true`, any `pending_actual_fills` entry, any unresolved `submitted_order_intents` entry, or a `LEDGER_BLOCKED` state reported by the bot. A cron that `jq` queries the durable ledger every 5 minutes can cover the file-backed cases; the process log/metrics must cover the in-memory ledger-blocked marker.
 - **Daily P&L.** A separate cron job tails recent settled trades and reports the day's realized P&L.
 - **Disk space on the ledger filesystem.** Standard `node_exporter` filesystem alert.
 
@@ -1975,12 +2640,12 @@ operator → ssh server
        → git pull
        → /opt/polybot/venv/bin/pip install -r requirements.txt  (if changed)
        → systemctl stop polybot
-       → cp /opt/polybot/ledger/live_trades.json /opt/polybot/ledger/backup/...  (manual ledger backup before any code change touching the ledger schema)
+       → verify /opt/polybot/ledger/live_trades.json is already current schema v3, or start with no existing ledger for a fresh deployment
        → systemctl start polybot
        → journalctl -u polybot -f  (watch startup; verify no SettlementLedgerError)
 ```
 
-**Critical:** before any code change that touches the ledger schema (e.g., Phase 0.3a's `pending_actual_fills` migration), back up `live_trades.json` outside the working directory. The bot's atomic-write pattern protects against partial writes during normal operation, but a botched deploy that runs a new version against an old ledger file can still corrupt state.
+**Critical:** this plan does not include any ledger migration. For a fresh deployment, either start with no existing ledger or provide a ledger that is already exact current schema v3. If an old or malformed ledger is present, startup/admin tooling must fail closed; the operator must replace it outside the application rather than relying on application code to transform it.
 
 ### Security checklist
 
@@ -1999,15 +2664,16 @@ operator → ssh server
 
 ### Effort
 
-1 day for the operator to set up the server, systemd unit, logrotate, backups, and basic monitoring. The bot code itself does not need changes for Phase 8 — only the operator's deployment scaffolding.
+1 day for the operator to set up the server, systemd unit, logrotate, backups, and basic monitoring, plus a small bot config patch for `NAUTILUS_LOG_DIR` if it has not already landed. Do not deploy the systemd sandbox until the path wiring is verified.
 
 ### Exit criteria
 
 - [ ] `systemctl status polybot` shows `active (running)` after a normal start.
+- [ ] Startup logs show `LIVE_TRADE_LEDGER_PATH=/opt/polybot/ledger/live_trades.json` and Nautilus log directory `/opt/polybot/logs/nautilus`.
 - [ ] `systemctl stop polybot` cleanly stops the bot; the fcntl lock is released; journalctl shows the `on_stop` cleanup running.
-- [ ] After a deliberate fail-stop (e.g., write-protect the ledger filesystem to trigger a SettlementLedgerError), systemd does NOT restart-loop more than 3 times.
+- [ ] After a deliberate fail-stop (e.g., write-protect the ledger filesystem to trigger a SettlementLedgerError), systemd does not restart the service at all; `Restart=no` leaves it stopped until explicit operator action.
 - [ ] Hourly ledger backup script runs and produces dated artifacts.
-- [ ] Alerting rule for unresolved SETTLEMENT_UNKNOWN fires in a test scenario.
+- [ ] Alerting rule for every live-blocking unresolved class fires in test scenarios: settled `SETTLEMENT_UNKNOWN` / `needs_reconciliation`, `pending_actual_fills`, unresolved `submitted_order_intents`, and `LEDGER_BLOCKED`.
 
 ---
 
@@ -2015,34 +2681,39 @@ operator → ssh server
 
 | Phase | Effort | Type | Blocks live? |
 |---|---|---|---|
-| 0. P0 fill bug | 2 days | Code + manual recovery | **Yes** |
+| 0. P0 fill bug (incl. 0.5 units-mismatch patch + 0.5a Nautilus 1.227.0 audit) | 3 days + 0.5a audit TBD | Code + dependency audit + manual recovery | **Yes** |
 | 1.1. Env wiring (`SPIKE_THRESHOLD`/`DIVERGENCE_THRESHOLD`) | 0.25 day | Runtime code | **Yes** (only if operator wants env-tunable values; otherwise document constants as code-owned) |
 | 1.2-1.3. Env audit docs + `.env.example` | 0.25 day | Documentation | No (cleanup) |
 | 2. Sizing config + balance pre-flight | 10 min | Operator action | No (operator decision) |
-| **2.5. Dynamic trade sizing (NEW)** | **1.5 days** | **Code (AccountState hook + sizing modes)** | **No (feature, operator-requested)** |
-| 5. Depth estimator | 1 day | Code | No (improvement) |
-| 4. Calibration (incl. `decisions.jsonl` writer) | 4h + elapsed time for data | Code + analysis | No (decision gate for Phase 3) |
-| 3. ORDER_TYPE | 3 days | Code | No (feature, blocked by Phase 4) |
+| 2.4. Structured `decisions.jsonl` writer | 0.5 day | Code | No (prerequisite for 2.5 + Phase 4 data) |
+| **2.5. Dynamic trade sizing + balance freshness (NEW)** | **2 days** | **Code (AccountState hook + sizing modes + stale-balance invalidation)** | **No (feature, operator-requested)** |
+| 5A. Market-depth estimator + selected-token book cache | 0.5 day | Code | No (improvement; prerequisite for Phase 3) |
+| 4. Calibration | 4h + elapsed time for data | Analysis | No (decision gate before Phase 4.5 + 3) |
+| 4.5. Strategy timing + price-band evaluation | 0.5-1 day + elapsed observations | Code + analysis | No (decision gate; no live-policy change without approval) |
+| 3. ORDER_TYPE | 3 days | Code | No (feature, blocked by Phase 4 + 4.5) |
+| 5B. LIMIT_IOC depth integration | 0.5 day | Code | No (required before enabling `limit_ioc`) |
 | **7.5. Multi-asset evaluation (NEW)** | **Operator-driven, no code** | **Decision** | **No (gates deployment scope)** |
 | 6. SOPS | 0.5 day | Code + ops | No (future) |
 | **8. Linux deployment (NEW)** | **1 day operator** | **Ops scaffolding** | **No (production deploy)** |
 | 7. Live reload | 0 days (Option C) | Docs only | No |
 
-**Minimum to resume live trading safely:** 2.5 days (Phases 0 + 1).
+**Minimum to resume live trading safely:** 3.25 days + Phase 0.5a audit time (Phase 0 + Phase 1.1).
 
-**Recommended before scaling:** 4–5 days (add Phases 4 + 5).
+**Recommended before scaling:** 6.5–8 days (add Phases 2.4 + 4 + 4.5 + 5A).
 
-**Full enhancement (limit orders + everything):** ~7 days plus calibration window.
+**Full enhancement (limit orders + everything):** ~9.5–10 days plus calibration/observation windows.
 
 ---
 
 ## Open Decisions Required From Operator
 
-1. **Trade size for live operation.** Phase 2 recommendation is $5 per trade with $20 cap. Confirm or adjust.
+1. **Trade size for live operation.** The intended normal config is `$55 / $385 / 7 positions / $110 daily loss`. The `$5.51 / $22.04` config is smoke-test-only after Phase 0, not the normal target.
 2. **Wire or remove `STOP_LOSS_PCT` / `TAKE_PROFIT_PCT` / `SPIKE_THRESHOLD` / `DIVERGENCE_THRESHOLD`.** Recommendation: remove the first two, wire the latter two.
 3. **Calibration data source.** Are there ≥100 settled live trades available? If not, what's the data collection plan?
 4. **`ORDER_TYPE` for live mode.** Live mode requires an explicit value. No implicit default in code. `.env.example` should leave it blank or commented with both allowed values shown, so the operator must consciously choose `market_ioc` or `limit_ioc`. This matches the `AGENTS.md` no-silent-fallback rule.
-5. **SOPS adoption timeline.** Phase 6 is ready when the team's key management approach is decided.
+5. **`LIMIT_IOC` partial-fill policy.** Phase 3 is blocked until operator explicitly chooses `partial_ok` or `all_or_nothing`; there is no plan default.
+6. **Strategy timing/price-band policy.** After Phase 4.5 reports the baseline vs candidate windows/bands, operator must explicitly approve either "keep current `13_14` + `0.60/0.40`" or one exact replacement policy. No automatic switch based on analysis output.
+7. **SOPS adoption timeline.** Phase 6 is ready when the team's key management approach is decided.
 
 ---
 
@@ -2051,17 +2722,19 @@ operator → ssh server
 The trade `BTC-15MIN-$11-1779093783343` is real on Polymarket but missing from the bot's ledger. Earlier drafts contained contradictory ordering — some sections said recover first, others said recover last. **This is the single canonical sequence:**
 
 1. **Stop live trading now.** Kill the bot process and the wrapper. Do not place any new live orders.
-2. **Ship Phase 0.4 (zero-price guard).** ~10-line commit, lands first, prevents further bad fills from corrupting the ledger during the rest of Phase 0.
-3. **Ship Phase 0.3a + 0.2 + 0.3b + 0.5 (adapter scaffold + VWAP injection + dust normalization + tests).** Single adapter-patch series with full test coverage.
-4. **Verify externally.** Open the Polymarket UI (or query on-chain) to obtain the actual payout for the lost order `BTC-15MIN-$11-1779093783343` and the exact submitted/filled/market-end timestamps from logs or Polymarket records.
-5. **Reconstruct the unknown record.** Run `venv/bin/python mark_settlement_resolved.py --create-unknown-from-external-order ...` per the Phase 0.1 command, using actual values (no placeholders).
-6. **Immediately resolve with verified payout.** Run `venv/bin/python mark_settlement_resolved.py --order-id ... --payout <verified> ...` **without waiting** for `auto_redeem` or the grace timeout. Polymarket does not replay missed websocket events; the market has already resolved; the bot will not receive any future `auto_redeem` for this trade.
-7. **Confirm no remaining unresolved entries.** The live-trading pause gate keys off unresolved unknowns. The actual code at [bot.py:784](bot.py:784) uses **OR**, not AND: any settled record with `needs_reconciliation is True` **OR** `settlement_source == "SETTLEMENT_UNKNOWN"` triggers the pause. Inspect `live_trades.json` and confirm zero entries match **either** condition. A reconstructed-but-unresolved entry (which has both flags set) will still pause live; a partially-resolved entry that updated only one flag will also still pause live. Resolution must set `settlement_source` to a real value (e.g., `"manual_reconciliation"`) AND set `needs_reconciliation` to `false`.
-8. **Smoke-test before resuming.** Start the bot in `--test-mode` (no live orders) and verify the new adapter callback path fires correctly on a synthetic fill. Then run one deliberately tiny `$5` live trade and confirm the actual-fill side channel + ledger record + `auto_redeem` settlement all complete cleanly.
-9. **Then, and only then, resume normal live trading.**
+2. **Ship Phase 0.1 (callback scaffold + durable unknown helper + pre-submit intent audit + admin selectors).** This must land before the zero-price guard because the guard calls `_create_durable_settlement_unknown_from_actual_fill`. It must include first-class `--venue-order-id` admin-tool support and `submitted_order_intents` admin resolution, not a synthetic `venue:<hash>` order-id fallback.
+3. **Verify fresh v3 ledger shape.** Do not run any schema migration. Start with no existing ledger, or provide a `live_trades.json` that is already exact current schema v3 with `pending_actual_fills` and `submitted_order_intents`. If an old/interim/malformed ledger exists, startup/admin tooling must fail closed and the operator must replace it outside the application.
+4. **Ship Phase 0.2 (zero-price guard).** It must create durable unknowns, not only process-local blocks.
+5. **Ship Phase 0.3 + 0.4 + 0.5 + 0.5a + 0.6 (VWAP injection + dust normalization + quote-quantity units fix + Nautilus 1.227.0 audit + tests).** Single adapter/dependency series with full test coverage. Do not resume live trading until 0.5a answers whether current-instrument one-sided quote drops are reducing trade decisions.
+6. **Verify externally.** Open the Polymarket UI (or query on-chain) to obtain the actual payout for the lost order `BTC-15MIN-$11-1779093783343` and the exact submitted/filled/market-end timestamps from logs or Polymarket records.
+7. **Reconstruct the unknown record.** Run `venv/bin/python mark_settlement_resolved.py --create-unknown-from-external-order ...` per the Phase 0.7 command, using actual values (no placeholders).
+8. **Immediately resolve with verified payout.** Run `venv/bin/python mark_settlement_resolved.py --order-id ... --payout <verified> ...` **without waiting** for `auto_redeem` or the grace timeout. Polymarket does not replay missed websocket events; the market has already resolved; the bot will not receive any future `auto_redeem` for this trade.
+9. **Confirm no remaining unresolved entries.** The live-trading pause gate in `bot.py` uses **OR**, not AND, across all unresolved classes: any settled record with `needs_reconciliation is True` **OR** `settlement_source == "SETTLEMENT_UNKNOWN"`, any `pending_actual_fills` entry, any unresolved `submitted_order_intents` entry, or the in-memory `LEDGER_BLOCKED` marker. Inspect `live_trades.json` and process logs/metrics and confirm zero live-blocking unresolved states remain. A reconstructed-but-unresolved entry (which has both settled flags set) will still pause live; a partially-resolved entry that updated only one flag will also still pause live. Resolution must set `settlement_source` to a real value (e.g., `"manual_reconciliation"`) AND set `needs_reconciliation` to `false`, and all pending actual fills/submitted intents must be explicitly converted or resolved.
+10. **Smoke-test before resuming.** Start the bot in `--test-mode` to verify decision/test startup is not blocked by the live-only adapter guard. Verify the new adapter callback path with the Phase 0 unit/integration harness, then run one deliberately tiny allowed `$5.51` live trade and confirm the actual-fill side channel + ledger record + `auto_redeem` settlement all complete cleanly.
+11. **Then, and only then, resume normal live trading with the `$55 / $385 / 7 positions / $110 daily loss` config.**
 
 **Earlier contradictions resolved:**
-- The "recover before any other work" wording is dropped. The zero-price guard is the only thing that must ship before recovery. The full adapter normalization must also ship before recovery to prevent the next bad fill from re‑creating the same problem during reconciliation.
+- The "recover before any other work" wording is dropped. The scaffold must ship before the zero-price guard, and the full adapter normalization must ship before recovery to prevent the next bad fill from re-creating the same problem during reconciliation.
 - The "wait for `auto_redeem` or grace timeout" wording is dropped everywhere. The lost market has already resolved; waiting accomplishes nothing and risks a $0 grace-timeout booking before the operator's manual resolution.
 
-This sequence must complete before resuming live trading. The risk engine has a phantom ~$11 exposure missing from its tracking until step 6 finishes.
+This sequence must complete before resuming live trading. The risk engine has a phantom ~$11 exposure missing from its tracking until step 8 finishes.

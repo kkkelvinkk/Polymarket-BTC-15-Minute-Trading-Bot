@@ -96,7 +96,7 @@ python -m venv venv
 venv\Scripts\activate
 
 # macOS / Linux
-python -m venv venv
+python3 -m venv venv
 source venv/bin/activate
 ```
 ## 3. Install Dependencies
@@ -123,13 +123,18 @@ REDIS_HOST=localhost
 REDIS_PORT=6379
 REDIS_DB=2
 
-# Trading Parameters
-MARKET_BUY_USD=1.00
-MAX_POSITION_SIZE=1.0
-MAX_TOTAL_EXPOSURE=10.0
-MAX_POSITIONS=5
+# Trading Parameters (SMOKE-TEST CONFIG shown — change to production after smoke trade settles)
+# MARKET_BUY_USD must be STRICTLY > 5.50 for live mode (smoke-test minimum: 5.51).
+# Production sizing per the plan: MARKET_BUY_USD=55.00, MAX_POSITION_SIZE=55.00,
+# MAX_TOTAL_EXPOSURE=385.00, MAX_POSITIONS=7, MAX_LOSS_PER_DAY=110.00.
+# Sizing invariants: MAX_POSITION_SIZE >= MARKET_BUY_USD;
+# MAX_TOTAL_EXPOSURE >= MAX_POSITION_SIZE * MAX_POSITIONS.
+MARKET_BUY_USD=5.51
+MAX_POSITION_SIZE=5.51
+MAX_TOTAL_EXPOSURE=22.04
+MAX_POSITIONS=4
 MAX_DRAWDOWN_PCT=0.15
-MAX_LOSS_PER_DAY=5.0
+MAX_LOSS_PER_DAY=11.02
 REQUIRE_SIGNAL_CONFIRMATION=true
 MIN_SIGNAL_CONFIDENCE=0.70
 EV_FEE_BUFFER=0.005
@@ -138,14 +143,49 @@ LIVE_SETTLEMENT_GRACE_SECONDS=3600
 REQUIRE_AUTO_REDEEM_TOKEN_HINT=true
 LIVE_TRADE_LEDGER_PATH=live_trades.json
 POLYGON_RPC_URL=https://your-polygon-rpc.example
-STOP_LOSS_PCT=0.30
-TAKE_PROFIT_PCT=0.20
-SPIKE_THRESHOLD=0.15
-DIVERGENCE_THRESHOLD=0.05
 ```
 
 Boolean flags accept only explicit values: `true`, `false`, `1`, `0`, `yes`,
 `no`, `on`, or `off`. Invalid values abort instead of being silently coerced.
+
+### Env vars that are NOT wired
+
+The following were previously listed but are not read by the bot. Setting them in
+`.env` has zero effect on runtime behavior:
+
+- `STOP_LOSS_PCT`, `TAKE_PROFIT_PCT` — the bot has no per-position exit loop and
+  Polymarket does not support stop orders. Strike from `.env`.
+- `SPIKE_THRESHOLD`, `DIVERGENCE_THRESHOLD` — these are **code-owned constants**
+  in `bot.py` (both `0.05`). Setting them in `.env` does not change behavior.
+  To adjust, edit `bot.py` and restart.
+
+### Live startup gates
+
+`--live` enforces two startup gates before any Nautilus node is built:
+
+1. **Strict minimum trade size.** `MARKET_BUY_USD > 5.50` is required (the
+   comparison is strict — `5.50` is blocked, `5.51` is the smoke-test minimum).
+   The value is quantized down to two decimal places BEFORE comparing, so
+   `5.5000001` (which would otherwise round-trip to `5.50` in arithmetic) is
+   also blocked. Missing, malformed, non-finite, zero, negative, or `<= 5.50`
+   values abort startup before the Nautilus node starts.
+
+   The same check runs again before any live order is submitted. This protects
+   against Redis-driven sim→live transitions: a process started in simulation
+   that later flips to live via Redis would otherwise bypass the startup gate.
+   At the runtime call site the gate **rejects the individual trade
+   (fail-closed)** rather than aborting the process, so the trading loop
+   continues evaluating decisions but no live order is submitted. If you see
+   repeated "LIVE ORDER BLOCKED: MARKET_BUY_USD must be greater than 5.50"
+   log lines, fix `MARKET_BUY_USD` and restart.
+
+2. **Explicit live confirmation.** `--live` alone prompts the operator to type
+   exactly the literal `LIVE` (case sensitive, no whitespace tolerance). Pass
+   `--live --confirm-live` to skip the prompt for unattended startup (systemd,
+   cron, Docker without `-it`, etc.). `--confirm-live` without `--live` is
+   rejected at argument parsing. On non-interactive stdin (no TTY), the prompt
+   treats `EOFError` as "operator did not confirm" and aborts cleanly with a
+   `SystemExit` instead of a Python traceback.
 
 `live_trades.json` stores filled live trades until Polymarket sends `auto_redeem`.
 If no payout event arrives after `LIVE_SETTLEMENT_GRACE_SECONDS`, the bot marks
@@ -153,53 +193,48 @@ the trade as `SETTLEMENT_UNKNOWN` instead of fabricating a $0 loss. A delayed
 `auto_redeem` can still correct the record and update realized P&L. Live submit
 requires valid market settlement metadata; missing `market_end_time` is rejected
 instead of using a secondary timeout. Live trading pauses while any
-`SETTLEMENT_UNKNOWN` record still has `needs_reconciliation=true`.
+unresolved ledger state exists: unresolved `SETTLEMENT_UNKNOWN` records
+(`needs_reconciliation=true` or `settlement_source="SETTLEMENT_UNKNOWN"`),
+pending actual fills, unresolved submitted order intents, or a ledger-blocked
+marker.
 
 Manual reconciliation is explicit and auditable. Stop the bot first, verify the
 actual settlement externally, resolve exactly one unknown order, then restart the
 bot so it reloads the ledger:
 
 ```bash
-python mark_settlement_resolved.py \
+venv/bin/python mark_settlement_resolved.py \
+  --ledger /path/to/live_trades.json \
   --order-id ORDER_ID \
   --payout 0 \
   --reason "Verified no redeemable payout in Polymarket UI on 2026-05-18"
 ```
 
 The tool takes the same `live_trades.json.lock` used by the bot and refuses to
-run while the bot is running. It resolves the ledger path from
-`LIVE_TRADE_LEDGER_PATH` by default and prints the exact resolved ledger and lock
-paths before writing. It changes `settlement_source` to `manual_reconciliation`,
+run while the bot is running. It requires an explicit `--ledger` path and prints
+the exact resolved ledger and lock paths before writing. It changes
+`settlement_source` to `manual_reconciliation`,
 records the previous unknown state, computes P&L from the verified payout, and
 clears `needs_reconciliation`. It does not add an automatic override or hidden
 resume path.
-
-If an old open trade is stuck and cannot be timed out because its metadata is
-incomplete, stop the bot and move exactly one open order into
-`SETTLEMENT_UNKNOWN` before reconciling it:
-
-```bash
-python mark_settlement_resolved.py \
-  --migrate-open-to-unknown ORDER_ID \
-  --confirm-open-migration \
-  --reason "Open trade missing market_end_time after schema migration"
-```
 
 If `live_trades.json` is corrupt or unreadable, startup fails closed. Repair the
 JSON manually from a known-good copy before starting live mode. Keep external
 snapshots of this file, for example with a cron job that copies it to a dated
 backup path outside the repo.
 
-If the live ledger blocks during a fill callback, later fill callbacks are
-ignored until the process is repaired and restarted. This prevents the bot from
-committing a partial local view as if it were complete. During recovery, verify
-the order state from Polymarket exchange/order records; do not rely only on
-`live_trades.json`. If a filled order is missing from the ledger entirely,
-create a `SETTLEMENT_UNKNOWN` record from the external order details, then
-resolve it with the verified payout:
+If the live ledger blocks during a fill callback, later fill callbacks fail
+closed until the process is repaired and restarted. Some blocked direct-fill
+paths may create a durable external-repair `SETTLEMENT_UNKNOWN` without usable
+accounting fields; they must not be resolved until the operator supplies
+verified external fill values. During recovery, verify the order state from
+Polymarket exchange/order records; do not rely only on `live_trades.json`. If a
+filled order is missing from the ledger entirely, create a `SETTLEMENT_UNKNOWN`
+record from the external order details, then resolve it with the verified payout:
 
 ```bash
-python mark_settlement_resolved.py \
+venv/bin/python mark_settlement_resolved.py \
+  --ledger /path/to/live_trades.json \
   --create-unknown-from-external-order ORDER_ID \
   --confirm-external-order \
   --external-size 2.00 \
@@ -219,16 +254,16 @@ python mark_settlement_resolved.py \
 
 The reconstruction command rejects inconsistent fill math unless
 `--external-size` matches `--external-entry-price * --external-filled-qty`
-within the smaller of $0.01 or 0.5%, rejects entry prices outside
+within exact `1E-18` accounting tolerance, rejects entry prices outside
 `0 < price <= 1`, and rejects impossible ordering unless
 `submitted_at <= filled_at <= market_end_time`. After creating the unknown
 record, resolve it with the verified payout using `--order-id ORDER_ID --payout
-PAYOUT --reason "..."`.
+PAYOUT --reason "..."` plus the same explicit `--ledger /path/to/live_trades.json`.
 
 `REQUIRE_AUTO_REDEEM_TOKEN_HINT=true` avoids assigning wallet-level redeem
 payouts to bot trades when the event does not identify the token or outcome.
 Those events are kept in the ledger as pending retry/reconciliation items, with
-a 7-day retention limit and 500-event cap. Before relying on live settlement,
+no age-based pruning or 500-event cap. Before relying on live settlement,
 capture and inspect at least one real Polymarket `auto_redeem` log line and
 confirm the payload includes one of the supported token/outcome fields:
 `asset_id`, `assetId`, `token_id`, `tokenId`, `clobTokenId`, `clob_token_id`,

@@ -1,0 +1,68 @@
+# Phase 8 — systemd unit template for the Polymarket BTC 15-min bot.
+#
+# Copy to /etc/systemd/system/polybot.service, edit the paths if your install
+# isn't at /opt/polybot, then:
+#
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable polybot
+#   sudo systemctl start polybot
+#   journalctl -u polybot -f          # watch startup
+#
+# IMPORTANT — Restart policy: this unit uses ``Restart=no`` so the bot does NOT
+# auto-restart after a fail-stop. The Phase 0 design fail-stops on durable-
+# write failure; restarting silently would weaken the manual-reconciliation
+# guarantee. After a failure, the operator must inspect the journal, reconcile
+# any unresolved ledger state, and then ``systemctl start polybot`` explicitly.
+#
+# If switching to SOPS (Phase 6), comment out the EnvironmentFile and
+# ExecStart lines below and uncomment the sops exec-env variants.
+
+[Unit]
+Description=Polymarket BTC 15-Min Trading Bot
+After=network-online.target redis.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polybot
+Group=polybot
+WorkingDirectory=/opt/polybot/Polymarket-BTC-15-Minute-Trading-Bot
+
+# --- Env loading: pick ONE of the two stanzas below ---
+
+# Pre-SOPS (plaintext .env, NOT recommended for production secrets):
+EnvironmentFile=/opt/polybot/Polymarket-BTC-15-Minute-Trading-Bot/.env
+
+# Post-SOPS (preferred for production after Phase 6 is adopted):
+#ExecStart=/usr/local/bin/sops exec-env /opt/polybot/secrets/.env.sops.yaml \
+#  '/opt/polybot/venv/bin/python bot.py --live --confirm-live'
+
+Environment=LIVE_TRADE_LEDGER_PATH=/opt/polybot/ledger/live_trades.json
+Environment=NAUTILUS_LOG_DIR=/opt/polybot/logs/nautilus
+Environment=DECISION_LOG_PATH=/opt/polybot/ledger/decisions.jsonl
+
+ExecStart=/opt/polybot/venv/bin/python bot.py --live --confirm-live
+
+Restart=no
+
+# Resource limits — modest; the bot is I/O bound.
+MemoryMax=1G
+TasksMax=200
+
+# Logging to journald (paired with logrotate)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polybot
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/polybot/ledger /opt/polybot/logs
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

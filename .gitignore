@@ -9,6 +9,8 @@
 .env.production
 .env.development
 *.env
+# Phase 1.3: explicit exception so the documented example can be committed
+!.env.example
 
 # Any file with "secret", "private", "key", "credential" in the name
 *secret*
@@ -72,6 +74,9 @@ htmlcov/
 paper_trades.json
 live_trades.json
 live_trades.json.lock
+# Phase 2.4 decision-observation log
+decisions.jsonl
+decisions.jsonl.*
 trades.json
 trade_history.json
 *.trade

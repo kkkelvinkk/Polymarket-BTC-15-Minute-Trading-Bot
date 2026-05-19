@@ -26,4 +26,4 @@ if [ "$confirm" != "LIVE" ]; then
   exit 1
 fi
 
-exec "$VENV_DIR/bin/python" 15m_bot_runner.py --live "$@"
+exec "$VENV_DIR/bin/python" 15m_bot_runner.py --live --confirm-live "$@"

@@ -1,0 +1,15 @@
+# Phase 8 — hourly ledger backup template.
+# Copy to /etc/cron.d/polybot-ledger-backup (root:root, mode 0644).
+#
+# Mailto blank suppresses email on success; cron writes errors to syslog.
+# Adjust the S3 bucket / destination to your infrastructure. For a local-disk
+# backup destination, replace the aws s3 cp line with rsync to a sibling
+# filesystem mount.
+
+MAILTO=""
+
+# Every hour at :00, ship a timestamped snapshot of live_trades.json to S3.
+0 * * * * polybot /usr/local/bin/aws s3 cp /opt/polybot/ledger/live_trades.json s3://polybot-backups/live_trades-$(date -u +\%Y\%m\%dT\%H\%M).json --quiet
+
+# Once a day at 03:17 UTC, also back up decisions.jsonl (Phase 2.4 audit log).
+17 3 * * * polybot /usr/local/bin/aws s3 cp /opt/polybot/ledger/decisions.jsonl s3://polybot-backups/decisions-$(date -u +\%Y\%m\%d).jsonl --quiet
