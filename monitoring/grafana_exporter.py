@@ -175,16 +175,19 @@ class GrafanaMetricsExporter:
     
     def __init__(
         self,
+        host: str = "0.0.0.0",
         port: int = 8000,
         update_interval: int = 5,  # seconds
     ):
         """
         Initialize metrics exporter.
-        
+
         Args:
+            host: Bind address for the metrics HTTP server
             port: HTTP port for metrics endpoint
             update_interval: How often to update metrics (seconds)
         """
+        self.host = host
         self.port = port
         self.update_interval = update_interval
         
@@ -203,7 +206,7 @@ class GrafanaMetricsExporter:
         self._update_thread = None
         self._stop_event = threading.Event()
         
-        logger.info(f"Initialized Grafana Metrics Exporter (port {port})")
+        logger.info(f"Initialized Grafana Metrics Exporter (host {host}, port {port})")
     
     def _setup_metrics(self) -> None:
         """Setup Prometheus metrics."""
@@ -360,7 +363,7 @@ class GrafanaMetricsExporter:
             MetricsHandler.exporter = self
             
             # Create and start custom HTTP server
-            self._server = HTTPServer(('0.0.0.0', self.port), MetricsHandler)
+            self._server = HTTPServer((self.host, self.port), MetricsHandler)
             self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
             self._thread.start()
             
@@ -457,8 +460,15 @@ class GrafanaMetricsExporter:
 _grafana_exporter_instance = None
 
 def get_grafana_exporter() -> GrafanaMetricsExporter:
-    """Get singleton Grafana exporter."""
+    """Get singleton Grafana exporter.
+
+    Reads GRAFANA_HOST and GRAFANA_PORT from the process environment (loaded
+    from .env at startup). If unset, the constructor defaults apply
+    (host=0.0.0.0, port=8000) — these preserve the prior hardcoded values.
+    """
     global _grafana_exporter_instance
     if _grafana_exporter_instance is None:
-        _grafana_exporter_instance = GrafanaMetricsExporter()
+        host = os.getenv("GRAFANA_HOST", "0.0.0.0")
+        port = int(os.getenv("GRAFANA_PORT", "8000"))
+        _grafana_exporter_instance = GrafanaMetricsExporter(host=host, port=port)
     return _grafana_exporter_instance
