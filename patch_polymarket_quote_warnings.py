@@ -17,14 +17,38 @@ from __future__ import annotations
 
 
 _PATCH_APPLIED = False
+_PINNED_NAUTILUS_VERSION = "1.227.0"
 
 
 def apply_polymarket_quote_warning_patch() -> bool:
-    """Replace PolymarketDataClient._handle_book_snapshot/_handle_quote with no-warn variants."""
+    """Replace PolymarketDataClient._handle_book_snapshot/_handle_quote with no-warn variants.
+
+    Installed-version guard: this patch is tied to nautilus_trader
+    ``_PINNED_NAUTILUS_VERSION``. The replacement method bodies are verbatim
+    copies of upstream source minus the noisy `self._log.warning` call; on a
+    version bump those bodies may have drifted, so the patch refuses to apply
+    rather than silently overwriting current upstream with stale method bodies.
+    Re-diff upstream `data.py` against the bodies here and bump the pin.
+    """
     global _PATCH_APPLIED
 
     if _PATCH_APPLIED:
         return True
+
+    try:
+        import nautilus_trader
+    except ImportError as exc:
+        raise RuntimeError(
+            "apply_polymarket_quote_warning_patch requires nautilus_trader to be installed"
+        ) from exc
+    installed_version = getattr(nautilus_trader, "__version__", "<unknown>")
+    if installed_version != _PINNED_NAUTILUS_VERSION:
+        raise RuntimeError(
+            "Polymarket quote-warning filter patch is pinned to nautilus_trader "
+            f"{_PINNED_NAUTILUS_VERSION}, but installed version is "
+            f"{installed_version}. Re-diff upstream `adapters/polymarket/data.py` "
+            "against the method bodies in this patch and bump the pin before use."
+        )
 
     try:
         from nautilus_trader.adapters.polymarket.common.constants import (

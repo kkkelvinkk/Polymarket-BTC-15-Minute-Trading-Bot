@@ -332,6 +332,13 @@ def apply_uuid_fallback_guard_patch():
             known_venue_order_ids = {o.venue_order_id for o in self._cache.orders()}
             known_venue_order_ids.update({r.venue_order_id for r in reports})
 
+            # Operational caveat (verbatim upstream behavior, preserved):
+            # `command` here is the LAST loop-shadowed GenerateOrderStatusReport
+            # built from `order.instrument_id`, NOT the original aggregate command
+            # passed into generate_order_status_reports. Under multi-market queries
+            # (orders spanning more than one instrument), this fill request will
+            # filter on the instrument of whichever open order was processed last.
+            # Single-instrument deployments (current 15-min BTC bot) are unaffected.
             fill_command = GenerateFillReports(
                 instrument_id=command.instrument_id,
                 venue_order_id=None,

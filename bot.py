@@ -104,10 +104,16 @@ else:
     logger.error("Polymarket CLOB v2 compatibility patch failed")
 
 from patch_polymarket_quote_warnings import apply_polymarket_quote_warning_patch
-if apply_polymarket_quote_warning_patch():
-    logger.info("Polymarket 'Dropping QuoteTick' warning filter applied")
+try:
+    quote_warning_patch_applied = apply_polymarket_quote_warning_patch()
+except Exception as exc:
+    quote_warning_patch_applied = False
+    logger.error(f"Polymarket 'Dropping QuoteTick' warning filter failed: {exc}")
 else:
-    logger.warning("Polymarket 'Dropping QuoteTick' warning filter could not be applied")
+    if quote_warning_patch_applied:
+        logger.info("Polymarket 'Dropping QuoteTick' warning filter applied")
+    else:
+        logger.error("Polymarket 'Dropping QuoteTick' warning filter could not be applied")
 
 
 # =============================================================================
@@ -4257,6 +4263,7 @@ class IntegratedBTCStrategy(Strategy):
             position_size_usd=POSITION_SIZE_USD,
             top_of_book_entry=top_of_book_entry,
             rec=rec,
+            market_meta=market_meta,
         )
         if executable_entry is None:
             return False
@@ -4358,6 +4365,7 @@ class IntegratedBTCStrategy(Strategy):
         position_size_usd: Decimal,
         top_of_book_entry: Decimal,
         rec: DecisionRecord,
+        market_meta: Optional[Dict[str, Any]] = None,
     ) -> Optional[Decimal]:
         """Phase 5A — return the VWAP executable entry for the selected
         token's asks, or None when the book cannot be evaluated.
@@ -4367,6 +4375,11 @@ class IntegratedBTCStrategy(Strategy):
         if the book is too thin to fill the full position size, this
         method logs the reason via ``rec.reject`` and returns None. Callers
         treat None as "skip the trade."
+
+        When ``market_meta`` is supplied, the helper additionally enforces
+        that ``side_token_id`` actually belongs to the side named in
+        ``entry_source`` (YES vs NO). This guards against future refactors
+        that would silently compute the VWAP off the wrong side's book.
 
         No fallback to top-of-book ask under any error condition; per the
         plan's No-Fallback policy, a corrupt/missing book is an actionable
@@ -4379,6 +4392,28 @@ class IntegratedBTCStrategy(Strategy):
                 f"{entry_source} side has no token_id in market metadata",
             )
             return None
+        if market_meta is not None:
+            label = (entry_source or "").upper()
+            if "YES" in label:
+                expected_token = market_meta.get("yes_token_id")
+                expected_side = "YES"
+            elif "NO" in label:
+                expected_token = market_meta.get("no_token_id")
+                expected_side = "NO"
+            else:
+                expected_token = None
+                expected_side = None
+            if expected_side is not None and expected_token is not None and side_token_id != expected_token:
+                logger.error(
+                    f"SKIP: side_token_id {side_token_id[:16]}… does not match "
+                    f"market_meta {expected_side.lower()}_token_id"
+                )
+                rec.reject(
+                    "depth_aware_token_side_mismatch",
+                    f"side_token_id does not match market_meta {expected_side.lower()}_token_id "
+                    f"for entry_source={entry_source!r}",
+                )
+                return None
         try:
             book = await asyncio.to_thread(
                 self.orderbook_processor.fetch_order_book, side_token_id
@@ -5599,6 +5634,8 @@ def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, tes
         ensure_live_market_order_patch()
         if not v2_patch_applied:
             raise RuntimeError("Live mode requires Polymarket CLOB v2 compatibility patch")
+        if not quote_warning_patch_applied:
+            raise RuntimeError("Live mode requires Polymarket quote-warning filter patch")
 
     redis_client = init_redis()
 
