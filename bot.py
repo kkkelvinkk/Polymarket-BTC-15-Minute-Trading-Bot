@@ -105,16 +105,10 @@ else:
     logger.error("Polymarket CLOB v2 compatibility patch failed")
 
 from patch_polymarket_quote_warnings import apply_polymarket_quote_warning_patch
-try:
-    quote_warning_patch_applied = apply_polymarket_quote_warning_patch()
-except Exception as exc:
-    quote_warning_patch_applied = False
-    logger.error(f"Polymarket 'Dropping QuoteTick' warning filter failed: {exc}")
-else:
-    if quote_warning_patch_applied:
-        logger.info("Polymarket 'Dropping QuoteTick' warning filter applied")
-    else:
-        logger.error("Polymarket 'Dropping QuoteTick' warning filter could not be applied")
+quote_warning_patch_applied = apply_polymarket_quote_warning_patch()
+if not quote_warning_patch_applied:
+    raise RuntimeError("Polymarket 'Dropping QuoteTick' warning filter could not be applied")
+logger.info("Polymarket 'Dropping QuoteTick' warning filter applied")
 
 
 # =============================================================================
@@ -358,6 +352,7 @@ def get_market_buy_usd() -> Decimal:
 
 
 LIVE_MIN_MARKET_BUY_USD = Decimal("5.50")
+NAUTILUS_SHUTDOWN_TIMEOUT_SECONDS = 2.0
 
 
 # --- Phase 2.5 sizing mode validation -------------------------------------
@@ -7590,12 +7585,13 @@ def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, tes
 
     order_config = validate_live_order_config()
 
+    if not quote_warning_patch_applied:
+        raise RuntimeError("Polymarket quote-warning filter patch is required")
+
     if not simulation:
         ensure_live_market_order_patch()
         if not v2_patch_applied:
             raise RuntimeError("Live mode requires Polymarket CLOB v2 compatibility patch")
-        if not quote_warning_patch_applied:
-            raise RuntimeError("Live mode requires Polymarket quote-warning filter patch")
 
     redis_client = init_redis()
 
@@ -7718,6 +7714,9 @@ def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, tes
         risk_engine=LiveRiskEngineConfig(bypass=simulation),
         data_clients={POLYMARKET: poly_data_cfg},
         exec_clients={POLYMARKET: poly_exec_cfg} if poly_exec_cfg else {},
+        timeout_post_stop=NAUTILUS_SHUTDOWN_TIMEOUT_SECONDS,
+        timeout_disconnection=NAUTILUS_SHUTDOWN_TIMEOUT_SECONDS,
+        timeout_shutdown=NAUTILUS_SHUTDOWN_TIMEOUT_SECONDS,
     )
 
     strategy = IntegratedBTCStrategy(
@@ -7746,8 +7745,18 @@ def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, tes
     except KeyboardInterrupt:
         print("\nShutting down...")
     finally:
-        node.dispose()
+        _dispose_node_without_blocking_executor_wait(node)
         logger.info("Bot stopped")
+
+
+def _dispose_node_without_blocking_executor_wait(node):
+    executor_shutdown = node.kernel.executor.shutdown
+
+    def _shutdown_without_wait(wait=True, cancel_futures=True):
+        return executor_shutdown(wait=False, cancel_futures=True)
+
+    node.kernel.executor.shutdown = _shutdown_without_wait
+    node.dispose()
 
 def parse_runtime_args(argv=None):
     import argparse
@@ -7832,6 +7841,9 @@ def main():
         logger.info("=" * 80)
 
     run_integrated_bot(simulation=simulation, enable_grafana=enable_grafana, test_mode=test_mode)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":

@@ -352,6 +352,14 @@ class SimulationModeSafetyTests(unittest.TestCase):
             def __init__(self, config):
                 captured["config"] = config
                 self.trader = _RecordingTrader()
+                self.kernel = types.SimpleNamespace(
+                    executor=types.SimpleNamespace(
+                        shutdown=lambda wait=True, cancel_futures=True: captured.setdefault(
+                            "executor_shutdown",
+                            {"wait": wait, "cancel_futures": cancel_futures},
+                        )
+                    )
+                )
 
             def add_data_client_factory(self, *args, **kwargs):
                 pass
@@ -366,6 +374,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
                 raise KeyboardInterrupt
 
             def dispose(self):
+                self.kernel.executor.shutdown(wait=True, cancel_futures=True)
                 captured["disposed"] = True
 
         try:
@@ -433,6 +442,39 @@ class SimulationModeSafetyTests(unittest.TestCase):
         args = self.bot.parse_runtime_args(["--live", "--confirm-live"])
         self.assertTrue(args.live)
         self.assertTrue(args.confirm_live)
+
+    def test_main_forces_cli_process_exit_after_run_returns(self):
+        class _ExitCalled(Exception):
+            pass
+
+        captured = {}
+        original_argv = sys.argv
+        original_run = self.bot.run_integrated_bot
+        original_exit = self.bot.os._exit
+
+        def _run_integrated_bot(**kwargs):
+            captured["run_kwargs"] = kwargs
+
+        def _exit(code):
+            captured["exit_code"] = code
+            raise _ExitCalled
+
+        try:
+            sys.argv = ["bot.py", "--test-mode", "--no-grafana"]
+            self.bot.run_integrated_bot = _run_integrated_bot
+            self.bot.os._exit = _exit
+            with self.assertRaises(_ExitCalled):
+                self.bot.main()
+        finally:
+            sys.argv = original_argv
+            self.bot.run_integrated_bot = original_run
+            self.bot.os._exit = original_exit
+
+        self.assertEqual(
+            captured["run_kwargs"],
+            {"simulation": True, "enable_grafana": False, "test_mode": True},
+        )
+        self.assertEqual(captured["exit_code"], 0)
 
     def test_live_market_buy_usd_gate_blocks_5_50_exactly(self):
         # Phase 0.3: strict comparison; 5.50 must be blocked, 5.51 allowed.
@@ -2247,6 +2289,15 @@ class SimulationModeSafetyTests(unittest.TestCase):
 
         self.assertTrue(captured["strategy"].current_simulation_mode)
 
+    def test_quote_warning_patch_failure_aborts_startup(self):
+        original_quote_warning_patch_applied = self.bot.quote_warning_patch_applied
+        self.bot.quote_warning_patch_applied = False
+        try:
+            with self.assertRaisesRegex(RuntimeError, "quote-warning filter patch is required"):
+                self._run_bot_with_fake_node(simulation=True, redis_client=None)
+        finally:
+            self.bot.quote_warning_patch_applied = original_quote_warning_patch_applied
+
     def test_live_mode_requires_v2_patch(self):
         class _SeededRedis:
             def set(self, _key, _value):
@@ -2282,6 +2333,31 @@ class SimulationModeSafetyTests(unittest.TestCase):
 
         self.assertEqual(redis_client.values["btc_trading:simulation_mode"], "0")
         self.assertFalse(captured["strategy"].current_simulation_mode)
+
+    def test_trading_node_uses_short_shutdown_timeouts(self):
+        captured = self._run_bot_with_fake_node(simulation=True, redis_client=None)
+        config_kwargs = captured["config"].kwargs
+
+        self.assertEqual(
+            config_kwargs["timeout_post_stop"],
+            self.bot.NAUTILUS_SHUTDOWN_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            config_kwargs["timeout_disconnection"],
+            self.bot.NAUTILUS_SHUTDOWN_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            config_kwargs["timeout_shutdown"],
+            self.bot.NAUTILUS_SHUTDOWN_TIMEOUT_SECONDS,
+        )
+
+    def test_trading_node_dispose_does_not_wait_on_executor_shutdown(self):
+        captured = self._run_bot_with_fake_node(simulation=True, redis_client=None)
+
+        self.assertEqual(
+            captured["executor_shutdown"],
+            {"wait": False, "cancel_futures": True},
+        )
 
     def test_failed_live_redis_seed_aborts_startup(self):
         class _FailingRedis:

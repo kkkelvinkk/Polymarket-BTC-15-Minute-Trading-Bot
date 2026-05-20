@@ -50,32 +50,29 @@ def apply_polymarket_quote_warning_patch() -> bool:
             "against the method bodies in this patch and bump the pin before use."
         )
 
-    try:
-        from nautilus_trader.adapters.polymarket.common.constants import (
-            POLYMARKET_MAX_PRICE,
-            POLYMARKET_MIN_PRICE,
-        )
-        from nautilus_trader.adapters.polymarket.common.enums import PolymarketOrderSide
-        from nautilus_trader.adapters.polymarket.data import PolymarketDataClient
-        from nautilus_trader.adapters.polymarket.schemas.book import (
-            PolymarketQuote,
-            PolymarketQuotes,
-        )
-        from nautilus_trader.adapters.polymarket.schemas.book import PolymarketBookSnapshot
-        from nautilus_trader.common.enums import LogColor
-        from nautilus_trader.core.datetime import millis_to_nanos
-        from nautilus_trader.model.data import (
-            BookOrder,
-            OrderBookDelta,
-            OrderBookDeltas,
-            QuoteTick,
-        )
-        from nautilus_trader.model.enums import BookAction, OrderSide, RecordFlag
-        from nautilus_trader.model.instruments import BinaryOption
-    except ImportError:
-        return False
+    from nautilus_trader.adapters.polymarket.common.constants import (
+        POLYMARKET_MAX_PRICE,
+        POLYMARKET_MIN_PRICE,
+    )
+    from nautilus_trader.adapters.polymarket.common.enums import PolymarketOrderSide
+    from nautilus_trader.adapters.polymarket.data import PolymarketDataClient
+    from nautilus_trader.adapters.polymarket.schemas.book import (
+        PolymarketQuote,
+        PolymarketQuotes,
+    )
+    from nautilus_trader.adapters.polymarket.schemas.book import PolymarketBookSnapshot
+    from nautilus_trader.common.enums import LogColor
+    from nautilus_trader.core.datetime import millis_to_nanos
+    from nautilus_trader.model.data import (
+        BookOrder,
+        OrderBookDelta,
+        OrderBookDeltas,
+        QuoteTick,
+    )
+    from nautilus_trader.model.enums import BookAction, OrderSide, RecordFlag
+    from nautilus_trader.model.instruments import BinaryOption
 
-    async def _handle_book_snapshot(
+    def _handle_book_snapshot(
         self,
         instrument: BinaryOption,
         ws_message: PolymarketBookSnapshot,
