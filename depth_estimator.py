@@ -1,10 +1,10 @@
 """
-Phase 5A / 5B — depth-aware fill estimators for the EV gate.
+Depth-aware fill estimators for the EV gate.
 
 The current EV gate uses top-of-book ask. Real market IOC fills sweep multiple
 book levels; without depth-aware estimation, the gate filters on a price the
-trade never actually pays. Two separate estimators per EXECUTION_PLAN.md
-Phase 5 — they have different inputs and different "fully filled" semantics:
+trade never actually pays. Two separate estimators are needed because they
+have different inputs and different "fully filled" semantics:
 
 - ``estimate_market_ioc_fill(levels, usd_to_spend)``: budget-driven. Spend up
   to a USD amount across asks. Used for ``ORDER_TYPE=market_ioc``.
@@ -103,7 +103,7 @@ def estimate_fill_for_order_type(
     target_token_qty: Optional[Decimal] = None,
     max_price: Optional[Decimal] = None,
 ) -> tuple[Optional[Decimal], Decimal, Optional[Decimal], bool]:
-    """Phase 5B unified entrypoint — dispatch to the correct estimator based
+    """Unified entrypoint — dispatch to the correct estimator based
     on the validated ``ORDER_TYPE`` env value.
 
     Returns ``(vwap, tokens_filled, actual_cost_or_None, fully_filled)``.
@@ -119,8 +119,8 @@ def estimate_fill_for_order_type(
 
     The strict argument-shape check is intentional: silently accepting the
     "wrong" arguments would let a caller pass a USD budget to a limit
-    estimator and get a misleading partial-fill answer (see EXECUTION_PLAN.md
-    Phase 5.1 reviewer-flagged P0 scenario).
+    estimator and get a misleading partial-fill answer (see the reviewer-flagged
+    P0 scenario in EXECUTION_PLAN.md).
     """
     if order_type == "market_ioc":
         if usd_to_spend is None:

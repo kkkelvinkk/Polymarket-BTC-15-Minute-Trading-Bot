@@ -1,5 +1,5 @@
 """
-Phase 2.4 — structured decision-observation writer.
+Structured decision-observation writer.
 
 Every _make_trading_decision invocation MUST emit exactly one JSON line to
 decisions.jsonl, including early-return rejected branches. A finalizer-style
@@ -18,7 +18,7 @@ The writer is intentionally minimal:
     `with` block. The caller's exception handler decides whether to fail-stop
     the trading loop or surface the error to the operator.
 
-Schema fields documented at EXECUTION_PLAN.md Phase 2.4. New fields can be
+Schema fields documented at EXECUTION_PLAN.md. New fields can be
 added without coordination; older lines simply lack them.
 """
 

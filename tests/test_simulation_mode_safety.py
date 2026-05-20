@@ -433,7 +433,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 2)
 
     def test_confirm_live_without_live_fails_argument_parsing(self):
-        # Phase 0.3 gate: --confirm-live is only valid with --live.
+        # Live startup gate: --confirm-live is only valid with --live.
         with self.assertRaises(SystemExit) as raised:
             self.bot.parse_runtime_args(["--confirm-live"])
         self.assertEqual(raised.exception.code, 2)
@@ -477,7 +477,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
         self.assertEqual(captured["exit_code"], 0)
 
     def test_live_market_buy_usd_gate_blocks_5_50_exactly(self):
-        # Phase 0.3: strict comparison; 5.50 must be blocked, 5.51 allowed.
+        # Strict comparison: 5.50 must be blocked, 5.51 allowed.
         original = os.environ.get("MARKET_BUY_USD")
         try:
             os.environ["MARKET_BUY_USD"] = "5.50"
@@ -558,7 +558,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
                 os.environ["MARKET_BUY_USD"] = original
 
     def test_live_market_buy_usd_gate_blocks_boundary_just_above_5_50(self):
-        # Phase 0.3 quantize-before-compare: 5.500001 must be quantized down to
+        # Quantize-before-compare: 5.500001 must be quantized down to
         # 5.50 (ROUND_DOWN) BEFORE the comparison, so it remains blocked.
         # Reviewer #2 finding #8: previous draft compared raw Decimal then
         # quantized, which allowed 5.500001 through but recorded 5.50 as the
@@ -592,7 +592,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
                 os.environ["MARKET_BUY_USD"] = original
 
     def test_validate_live_market_buy_usd_returns_tuple(self):
-        # Phase 0.3 non-raising validator that both startup and runtime call sites
+        # Non-raising validator that both startup and runtime call sites
         # can share. Avoids try/except in the order submission path (CLAUDE.md
         # rule #1 fallback compliance).
         original = os.environ.get("MARKET_BUY_USD")
@@ -699,7 +699,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
             else:
                 os.environ["MARKET_BUY_USD"] = original
 
-    # --- Phase 5A EV-gate VWAP wiring ---------------------------------------
+    # --- EV-gate VWAP wiring ------------------------------------------------
 
     def test_compute_depth_aware_entry_returns_vwap_when_book_is_healthy(self):
         strategy = self._track_strategy(
@@ -989,7 +989,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
                 )
             )
 
-    # --- Phase 3 LIMIT_IOC helpers ------------------------------------------
+    # --- LIMIT_IOC helpers ---------------------------------------------------
 
     def test_compute_limit_price_returns_none_for_low_confidence(self):
         # fused 0.04 - edge 0.05 = -0.01 → out of (0, 1)
@@ -1057,7 +1057,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "safe submitted limit price"):
             self.bot.derive_submitted_limit_price(Decimal("0.0001"), 2)
 
-    # --- Phase 4.5 timing/price-band helpers --------------------------------
+    # --- Timing/price-band helpers ------------------------------------------
 
     def test_trade_window_label_buckets_seconds_correctly(self):
         cases = [
@@ -1108,7 +1108,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
                 msg=f"price={price}",
             )
 
-    # --- Phase 2.5 SIZING_MODE validation -----------------------------------
+    # --- SIZING_MODE validation ---------------------------------------------
 
     def test_sizing_mode_missing_raises(self):
         original = os.environ.get("SIZING_MODE")
@@ -1193,7 +1193,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
             else:
                 os.environ["PCT_OF_FREE_COLLATERAL_PER_TRADE"] = original
 
-    # --- Phase 3 ORDER_TYPE validation --------------------------------------
+    # --- ORDER_TYPE validation ----------------------------------------------
 
     def test_order_type_missing_raises(self):
         original = os.environ.get("ORDER_TYPE")

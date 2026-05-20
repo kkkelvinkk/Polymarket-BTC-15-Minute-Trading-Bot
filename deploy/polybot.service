@@ -1,4 +1,4 @@
-# Phase 8 — systemd unit template for the Polymarket BTC 15-min bot.
+# systemd unit template for the Polymarket BTC 15-min bot.
 #
 # Copy to /etc/systemd/system/polybot.service, edit the paths if your install
 # isn't at /opt/polybot, then:
@@ -9,12 +9,12 @@
 #   journalctl -u polybot -f          # watch startup
 #
 # IMPORTANT — Restart policy: this unit uses ``Restart=no`` so the bot does NOT
-# auto-restart after a fail-stop. The Phase 0 design fail-stops on durable-
+# auto-restart after a fail-stop. The ledger design fail-stops on durable-
 # write failure; restarting silently would weaken the manual-reconciliation
 # guarantee. After a failure, the operator must inspect the journal, reconcile
 # any unresolved ledger state, and then ``systemctl start polybot`` explicitly.
 #
-# If switching to SOPS (Phase 6), comment out the EnvironmentFile and
+# If switching to SOPS, comment out the EnvironmentFile and
 # ExecStart lines below and uncomment the sops exec-env variants.
 
 [Unit]
@@ -33,7 +33,7 @@ WorkingDirectory=/opt/polybot/Polymarket-BTC-15-Minute-Trading-Bot
 # Pre-SOPS (plaintext .env, NOT recommended for production secrets):
 EnvironmentFile=/opt/polybot/Polymarket-BTC-15-Minute-Trading-Bot/.env
 
-# Post-SOPS (preferred for production after Phase 6 is adopted):
+# Post-SOPS (preferred for production after SOPS is adopted):
 #ExecStart=/usr/local/bin/sops exec-env /opt/polybot/secrets/.env.sops.yaml \
 #  '/opt/polybot/venv/bin/python bot.py --live --confirm-live'
 

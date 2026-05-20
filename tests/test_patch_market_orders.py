@@ -296,12 +296,12 @@ class PatchMarketOrdersTests(unittest.TestCase):
 
     def test_uuid_guard_blocks_unpatched_installed_nautilus(self):
         """Regression: installed nautilus_trader (1.222.0 or 1.227.0) still
-        contains the UUID4 client-id fallback at 3 sites until our Phase 0.4
+        contains the UUID4 client-id fallback at 3 sites until our
         guard patch is applied. The verify MUST block live startup on the
         unpatched class.
 
         If this fails, either (a) installed Nautilus was upgraded past the
-        fallback (good — verify Phase 0.5a audit before unblocking live), or
+        fallback (good — verify the clean-env Nautilus audit before unblocking live), or
         (b) the verification was weakened (bad).
         """
         module = load_patch_module()
@@ -419,7 +419,7 @@ class PatchMarketOrdersTests(unittest.TestCase):
             canonical.unregister_actual_fill_handler(handler)
 
     def test_zz_uuid_fallback_guard_patch_lets_verify_pass(self):
-        """Phase 0.4 — applying the UUID-fallback guard patch replaces the 3
+        """Applying the UUID-fallback guard patch replaces the 3
         ClientOrderId-via-UUID4 fallback sites with _dispatch_actual_fill +
         skip. After patching, verify_no_nautilus_client_order_id_uuid_fallback
         MUST stop tripping on the now-patched method source.

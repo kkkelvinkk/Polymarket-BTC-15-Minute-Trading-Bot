@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Phase 4 — calibration validation script.
+Calibration validation script.
 
 Reads ``live_trades.json`` (Path A: settled live trades) and reports per-
-confidence-bucket statistics needed for the Phase 4 three-gate decision rule:
+confidence-bucket statistics needed for the three-gate decision rule:
 
 1. **Dollar-weighted realized return** (``sum_pnl_usd / sum_size_usd``) positive
    in at least one bucket with ``n >= 100``.
@@ -12,7 +12,7 @@ confidence-bucket statistics needed for the Phase 4 three-gate decision rule:
 3. **Out-of-sample persistence**: realized return positive in BOTH halves
    (chronological split).
 
-Exclusion rules (per EXECUTION_PLAN.md Phase 4.2):
+Exclusion rules (per EXECUTION_PLAN.md):
 
 - Skip records where ``settlement_source`` is not one of
   ``auto_redeem``, ``late_auto_redeem``, ``manual_reconciliation``.
@@ -245,7 +245,7 @@ def gate_three_check(buckets: dict) -> tuple[bool, list[str]]:
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="Phase 4 calibration analysis")
+    parser = argparse.ArgumentParser(description="Calibration analysis")
     parser.add_argument("--ledger", required=True, help="Path to live_trades.json")
     parser.add_argument("--decisions", help="Optional path to decisions.jsonl (Path B)")
     parser.add_argument(
@@ -324,7 +324,7 @@ def main(argv=None) -> int:
         print(
             "\nPath B not provided. Pass --decisions /path/to/decisions.jsonl "
             "to inspect the unbiased decision-observation set (currently produced "
-            "only when the Phase 2.4 wiring lands on _make_trading_decision)."
+            "only when decision logging lands on _make_trading_decision)."
         )
     return 0
 

@@ -129,7 +129,7 @@ _UUID_GUARD_PINNED_NAUTILUS_VERSION = "1.227.0"
 
 
 def apply_uuid_fallback_guard_patch():
-    """Phase 0.4 — replace the 3 ClientOrderId-via-UUID4 fallback sites
+    """Replace the 3 ClientOrderId-via-UUID4 fallback sites
     in nautilus_trader 1.227.0 ``PolymarketExecutionClient`` with structured
     fail-closed dispatches.
 
@@ -185,9 +185,9 @@ def apply_uuid_fallback_guard_patch():
     installed_version = getattr(nautilus_trader, "__version__", "<unknown>")
     if installed_version != _UUID_GUARD_PINNED_NAUTILUS_VERSION:
         raise RuntimeError(
-            "Phase 0.4 UUID-fallback guard patch is pinned to nautilus_trader "
+            "UUID-fallback guard patch is pinned to nautilus_trader "
             f"{_UUID_GUARD_PINNED_NAUTILUS_VERSION}, but installed version is "
-            f"{installed_version}. Re-run the Phase 0.5a clean-env audit "
+            f"{installed_version}. Re-run the clean-env Nautilus audit "
             "before bumping the pin: the patched method bodies are verbatim "
             "copies of the 1.227.0 source and may have drifted upstream."
         )
@@ -268,7 +268,7 @@ def apply_uuid_fallback_guard_patch():
                     venue_order_id = polymarket_order.get_venue_order_id()
                     client_order_id = self._cache.client_order_id(venue_order_id)
                     if client_order_id is None:
-                        # Phase 0.4 UUID-fallback guard (site 1 of 3): no
+                        # UUID-fallback guard (site 1 of 3): no
                         # synthetic client_order_id. Dispatch failure callback
                         # and skip this report.
                         _dispatch_actual_fill(
@@ -352,7 +352,7 @@ def apply_uuid_fallback_guard_patch():
                 venue_order_id_fill_reports[fill.venue_order_id].append(fill)
 
             for venue_order_id, fr_list in venue_order_id_fill_reports.items():
-                # Phase 0.4 UUID-fallback guard (site 2 of 3): cache lookup is
+                # UUID-fallback guard (site 2 of 3): cache lookup is
                 # not in installed Nautilus's 1.227.0 source here — Nautilus
                 # bypasses the cache entirely and synthesizes a UUID for every
                 # venue_order_id reconstructed from fills. Our guard refuses
@@ -477,7 +477,7 @@ def apply_uuid_fallback_guard_patch():
 
             client_order_id = self._cache.client_order_id(venue_order_id)
             if client_order_id is None:
-                # Phase 0.4 UUID-fallback guard (site 3 of 3): no synthetic
+                # UUID-fallback guard (site 3 of 3): no synthetic
                 # client_order_id; dispatch failure callback and skip.
                 _dispatch_actual_fill(
                     None,
@@ -539,7 +539,7 @@ def apply_market_order_patch():
         from nautilus_trader.adapters.polymarket.execution import PolymarketExecutionClient
         from nautilus_trader.common.enums import LogColor
 
-        # Phase 0.4: apply UUID-fallback guard FIRST so the verify reads the
+        # Apply UUID-fallback guard FIRST so the verify reads the
         # patched method source.
         apply_uuid_fallback_guard_patch()
 

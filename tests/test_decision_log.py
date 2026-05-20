@@ -1,4 +1,4 @@
-"""Tests for Phase 2.4 decision_log.DecisionRecord."""
+"""Tests for decision_log.DecisionRecord."""
 
 import json
 import os

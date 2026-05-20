@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test Script for Phase 5: Execution Layer
+Test Script for the Execution Layer
 
 Tests:
 1. Risk Engine
@@ -9,7 +9,7 @@ Tests:
 4. Position Management
 5. Stop Loss / Take Profit
 
-Run this after Phase 4 tests pass.
+Run this after strategy brain tests pass.
 """
 import asyncio
 from decimal import Decimal
@@ -255,9 +255,9 @@ async def test_polymarket_client():
 
 
 async def run_all_tests():
-    """Run all Phase 5 tests."""
+    """Run all execution layer tests."""
     console.print(Panel.fit(
-        "[bold cyan]PHASE 5: EXECUTION LAYER - TEST SUITE[/bold cyan]\n\n"
+        "[bold cyan]EXECUTION LAYER - TEST SUITE[/bold cyan]\n\n"
         "Testing order execution and position management...",
         border_style="cyan"
     ))
@@ -277,7 +277,7 @@ async def run_all_tests():
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("Component", style="cyan", width=25)
     table.add_column("Status", width=15)
-    table.add_column("Ready for Phase 6", width=15)
+    table.add_column("Ready for Monitoring", width=20)
     
     for component, passed in results.items():
         status = "[green]✓ PASSED[/green]" if passed else "[red]✗ FAILED[/red]"
@@ -292,12 +292,12 @@ async def run_all_tests():
     console.print("\n" + "="*60)
     if all_passed:
         console.print("[bold green]✓ ALL TESTS PASSED![/bold green]")
-        console.print("\n[cyan]Phase 5 is complete and working![/cyan]")
-        console.print("[cyan]You can now proceed to Phase 6: Monitoring & Analytics[/cyan]")
+        console.print("\n[cyan]Execution layer is complete and working![/cyan]")
+        console.print("[cyan]You can now proceed to monitoring and analytics.[/cyan]")
         return 0
     else:
         console.print("[bold red]✗ SOME TESTS FAILED[/bold red]")
-        console.print("\n[yellow]Fix the failed components before proceeding to Phase 6.[/yellow]")
+        console.print("\n[yellow]Fix the failed components before proceeding to monitoring and analytics.[/yellow]")
         return 1
 
 

@@ -1,10 +1,10 @@
-"""Tests for Phase 6 SOPS plaintext-env guard."""
+"""Tests for SOPS plaintext-env guard."""
 
 import os
 import unittest
 from pathlib import Path
 
-from phase_6_sops_check import (
+from sops_plaintext_env_guard import (
     _is_live_invocation,
     refuse_plaintext_env_in_live_mode,
 )
@@ -53,7 +53,7 @@ class IsLiveInvocationTests(unittest.TestCase):
 
 class RefusePlaintextEnvTests(unittest.TestCase):
     def setUp(self):
-        self.tmp_root = Path(f"/tmp/test_phase6_{os.getpid()}_{id(self)}")
+        self.tmp_root = Path(f"/tmp/test_sops_guard_{os.getpid()}_{id(self)}")
         self.tmp_root.mkdir(parents=True, exist_ok=True)
 
     def tearDown(self):

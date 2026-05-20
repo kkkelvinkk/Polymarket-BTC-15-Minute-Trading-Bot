@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test Script for Phase 3: Nautilus Core
+Test Script for Nautilus Core
 
 Tests:
 1. Instrument Registry
@@ -9,7 +9,7 @@ Tests:
 4. Custom Data Provider
 5. End-to-End Data Flow
 
-Run this after Phase 2 tests pass.
+Run this after ingestion tests pass.
 """
 import asyncio
 from datetime import datetime
@@ -204,9 +204,9 @@ async def test_data_engine():
 
 
 async def run_all_tests():
-    """Run all Phase 3 tests."""
+    """Run all Nautilus core tests."""
     console.print(Panel.fit(
-        "[bold cyan]PHASE 3: NAUTILUS CORE - TEST SUITE[/bold cyan]\n\n"
+        "[bold cyan]NAUTILUS CORE - TEST SUITE[/bold cyan]\n\n"
         "Testing Nautilus integration...",
         border_style="cyan"
     ))
@@ -226,7 +226,7 @@ async def run_all_tests():
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("Component", style="cyan", width=25)
     table.add_column("Status", width=15)
-    table.add_column("Ready for Phase 4", width=15)
+    table.add_column("Ready for Strategy", width=18)
     
     for component, passed in results.items():
         status = "[green]✓ PASSED[/green]" if passed else "[red]✗ FAILED[/red]"
@@ -241,12 +241,12 @@ async def run_all_tests():
     console.print("\n" + "="*60)
     if all_passed:
         console.print("[bold green]✓ ALL TESTS PASSED![/bold green]")
-        console.print("\n[cyan]Phase 3 is complete and working![/cyan]")
-        console.print("[cyan]You can now proceed to Phase 4: Strategy Brain[/cyan]")
+        console.print("\n[cyan]Nautilus core is complete and working![/cyan]")
+        console.print("[cyan]You can now proceed to strategy brain.[/cyan]")
         return 0
     else:
         console.print("[bold red]✗ SOME TESTS FAILED[/bold red]")
-        console.print("\n[yellow]Fix the failed components before proceeding to Phase 4.[/yellow]")
+        console.print("\n[yellow]Fix the failed components before proceeding to strategy brain.[/yellow]")
         return 1
 
 

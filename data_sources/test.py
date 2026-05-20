@@ -223,8 +223,8 @@ async def test_solana():
 async def run_all_tests():
     """Run all data source tests."""
     console.print(Panel.fit(
-        "[bold cyan]PHASE 1: EXTERNAL DATA SOURCES - TEST SUITE[/bold cyan]\n\n"
-        "Testing all data sources before moving to Phase 2...",
+        "[bold cyan]EXTERNAL DATA SOURCES - TEST SUITE[/bold cyan]\n\n"
+        "Testing all data sources before moving to ingestion...",
         border_style="cyan"
     ))
     
@@ -244,7 +244,7 @@ async def run_all_tests():
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("Data Source", style="cyan", width=20)
     table.add_column("Status", width=15)
-    table.add_column("Ready for Phase 2", width=20)
+    table.add_column("Ready for Ingestion", width=20)
     
     for source, passed in results.items():
         status = "[green]✓ PASSED[/green]" if passed else "[red]✗ FAILED[/red]"
@@ -259,12 +259,12 @@ async def run_all_tests():
     console.print("\n" + "="*60)
     if all_passed:
         console.print("[bold green]✓ ALL TESTS PASSED![/bold green]")
-        console.print("\n[cyan]Phase 1 is complete and working!")
-        console.print("You can now proceed to Phase 2: Ingestion Layer[/cyan]")
+        console.print("\n[cyan]External data sources are complete and working!")
+        console.print("You can now proceed to the ingestion layer.[/cyan]")
         return 0
     else:
         console.print("[bold red]✗ SOME TESTS FAILED[/bold red]")
-        console.print("\n[yellow]Fix the failed data sources before proceeding to Phase 2.[/yellow]")
+        console.print("\n[yellow]Fix the failed data sources before proceeding to ingestion.[/yellow]")
         return 1
 
 

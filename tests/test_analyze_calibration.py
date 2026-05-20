@@ -1,4 +1,4 @@
-"""Phase 4 tests for analyze_calibration.py."""
+"""Tests for analyze_calibration.py."""
 
 import json
 import os

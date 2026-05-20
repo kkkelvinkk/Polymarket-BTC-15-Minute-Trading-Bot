@@ -1,4 +1,4 @@
-"""Phase 5A regression tests for depth_estimator helpers."""
+"""Regression tests for depth_estimator helpers."""
 
 import unittest
 from decimal import Decimal
@@ -52,7 +52,7 @@ class ParseBookLevelTests(unittest.TestCase):
 
 class EstimateMarketIocFillTests(unittest.TestCase):
     def test_per_plan_synthetic_example(self):
-        """Per EXECUTION_PLAN.md Phase 5 acceptance test:
+        """Per the EXECUTION_PLAN.md acceptance test:
         book ``[$0.62 x 10, $0.70 x 15]``, budget $10.
         Level 1 USD capacity = 0.62 * 10 = $6.20. Remaining = $3.80.
         Tokens at level 2 = 3.80 / 0.70 = 5.428571...
@@ -103,7 +103,7 @@ class EstimateMarketIocFillTests(unittest.TestCase):
 
 class EstimateLimitIocFillTests(unittest.TestCase):
     def test_reviewer_correctness_case(self):
-        """Per EXECUTION_PLAN.md Phase 5 reviewer-flagged correctness case:
+        """Per the EXECUTION_PLAN.md reviewer-flagged correctness case:
         operator wants up to 10 tokens at price <= $0.50 with budget $5.
         Book has 10 tokens @ $0.40. Token-driven walk accumulates 10 tokens,
         spends $4 (less than budget), reports fully_filled=True."""
@@ -182,7 +182,7 @@ class EstimateLimitIocFillTests(unittest.TestCase):
 
 
 class EstimateFillForOrderTypeTests(unittest.TestCase):
-    """Phase 5B unified entrypoint dispatching to the right estimator."""
+    """Unified entrypoint dispatching to the right estimator."""
 
     def test_market_ioc_dispatches_correctly(self):
         from depth_estimator import estimate_fill_for_order_type
@@ -249,7 +249,7 @@ class EstimateFillForOrderTypeTests(unittest.TestCase):
 class SelectedTokenSideTests(unittest.TestCase):
     """Verifies the EV-gate-side semantics: the estimator must walk the
     SELECTED token's asks (YES for long, NO for short), not the other side.
-    Per Phase 5.2 critical note."""
+    Per the critical selected-token-side note."""
 
     def test_no_book_empty_yes_only_returns_not_full_for_no_trade(self):
         yes_book = book((Decimal("0.62"), Decimal("100")))

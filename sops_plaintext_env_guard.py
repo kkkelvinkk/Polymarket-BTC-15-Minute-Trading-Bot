@@ -1,8 +1,8 @@
 """
-Phase 6 — SOPS credential management guard (Pattern A).
+SOPS credential management guard (Pattern A).
 
 This module ships the "refuse plaintext .env in live mode" check from
-EXECUTION_PLAN.md Phase 6 as a standalone callable. It is NOT wired into
+EXECUTION_PLAN.md as a standalone callable. It is NOT wired into
 ``bot.py`` import-time yet — the plan explicitly requires operator approval
 before changing live-mode env-loading behavior, since current operators run
 with plaintext ``.env`` files and switching them off without warning would
@@ -11,8 +11,8 @@ break their workflow.
 When the operator decides to adopt SOPS, the integration is a one-liner near
 the top of ``bot.py``, BEFORE ``load_dotenv()`` runs::
 
-    # === Phase 6 SOPS guard (operator-opted-in via repo edit) ===
-    from phase_6_sops_check import refuse_plaintext_env_in_live_mode
+    # === SOPS plaintext-env guard (operator-opted-in via repo edit) ===
+    from sops_plaintext_env_guard import refuse_plaintext_env_in_live_mode
     refuse_plaintext_env_in_live_mode(repo_root=Path(__file__).parent)
 
 The plan's "Pattern A" is implemented here: check ``--live`` argument
@@ -55,7 +55,7 @@ def refuse_plaintext_env_in_live_mode(
     repo_root: Path,
     argv: Iterable[str] | None = None,
 ) -> None:
-    """Phase 6 Pattern A — refuse to start in live mode if a plaintext
+    """Pattern A — refuse to start in live mode if a plaintext
     ``.env`` is present at the repo root.
 
     Call this BEFORE ``load_dotenv()`` runs. After the operator opts in to
@@ -79,6 +79,5 @@ def refuse_plaintext_env_in_live_mode(
             "Live mode refuses to start with plaintext .env present at "
             f"{env_path}. Use `sops exec-env /path/to/.env.sops.yaml` to "
             "inject credentials into the process environment, or move .env "
-            "outside the repo. See EXECUTION_PLAN.md Phase 6 and "
-            "deploy/README.md SOPS section."
+            "outside the repo. See the deploy/README.md SOPS section."
         )

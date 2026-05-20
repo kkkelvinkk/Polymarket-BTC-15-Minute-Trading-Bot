@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test Script for Phase 2: Ingestion Layer
+Test Script for the Ingestion Layer
 
 Tests:
 1. Unified Data Adapter
@@ -8,7 +8,7 @@ Tests:
 3. Data Validator
 4. Rate Limiter
 
-Run this after Phase 1 tests pass.
+Run this after external data source tests pass.
 """
 import asyncio
 from datetime import datetime
@@ -260,9 +260,9 @@ async def test_rate_limiter():
 
 
 async def run_all_tests():
-    """Run all Phase 2 tests."""
+    """Run all ingestion tests."""
     console.print(Panel.fit(
-        "[bold cyan]PHASE 2: INGESTION LAYER - TEST SUITE[/bold cyan]\n\n"
+        "[bold cyan]INGESTION LAYER - TEST SUITE[/bold cyan]\n\n"
         "Testing data ingestion components...",
         border_style="cyan"
     ))
@@ -283,7 +283,7 @@ async def run_all_tests():
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("Component", style="cyan", width=25)
     table.add_column("Status", width=15)
-    table.add_column("Ready for Phase 3", width=15)
+    table.add_column("Ready for Nautilus", width=18)
     
     for component, passed in results.items():
         status = "[green]✓ PASSED[/green]" if passed else "[red]✗ FAILED[/red]"
@@ -298,12 +298,12 @@ async def run_all_tests():
     console.print("\n" + "="*60)
     if all_passed:
         console.print("[bold green]✓ ALL TESTS PASSED![/bold green]")
-        console.print("\n[cyan]Phase 2 is complete and working![/cyan]")
-        console.print("[cyan]You can now proceed to Phase 3: Nautilus Core[/cyan]")
+        console.print("\n[cyan]Ingestion layer is complete and working![/cyan]")
+        console.print("[cyan]You can now proceed to Nautilus core.[/cyan]")
         return 0
     else:
         console.print("[bold red]✗ SOME TESTS FAILED[/bold red]")
-        console.print("\n[yellow]Fix the failed components before proceeding to Phase 3.[/yellow]")
+        console.print("\n[yellow]Fix the failed components before proceeding to Nautilus core.[/yellow]")
         return 1
 
 

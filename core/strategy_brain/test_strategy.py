@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test Script for Phase 4: Strategy Brain
+Test Script for Strategy Brain
 
 Tests:
 1. Signal Processors (Spike, Sentiment, Divergence)
@@ -8,7 +8,7 @@ Tests:
 3. 15-Minute BTC Strategy
 4. End-to-End Signal Flow
 
-Run this after Phase 3 tests pass.
+Run this after Nautilus core tests pass.
 """
 import asyncio
 from decimal import Decimal
@@ -230,9 +230,9 @@ async def test_btc_strategy():
 
 
 async def run_all_tests():
-    """Run all Phase 4 tests."""
+    """Run all strategy brain tests."""
     console.print(Panel.fit(
-        "[bold cyan]PHASE 4: STRATEGY BRAIN - TEST SUITE[/bold cyan]\n\n"
+        "[bold cyan]STRATEGY BRAIN - TEST SUITE[/bold cyan]\n\n"
         "Testing signal processing and strategy logic...",
         border_style="cyan"
     ))
@@ -252,7 +252,7 @@ async def run_all_tests():
     table = Table(show_header=True, header_style="bold magenta")
     table.add_column("Component", style="cyan", width=25)
     table.add_column("Status", width=15)
-    table.add_column("Ready for Phase 5", width=15)
+    table.add_column("Ready for Execution", width=20)
     
     for component, passed in results.items():
         status = "[green]✓ PASSED[/green]" if passed else "[red]✗ FAILED[/red]"
@@ -267,12 +267,12 @@ async def run_all_tests():
     console.print("\n" + "="*60)
     if all_passed:
         console.print("[bold green]✓ ALL TESTS PASSED![/bold green]")
-        console.print("\n[cyan]Phase 4 is complete and working![/cyan]")
-        console.print("[cyan]You can now proceed to Phase 5: Execution Layer[/cyan]")
+        console.print("\n[cyan]Strategy brain is complete and working![/cyan]")
+        console.print("[cyan]You can now proceed to the execution layer.[/cyan]")
         return 0
     else:
         console.print("[bold red]✗ SOME TESTS FAILED[/bold red]")
-        console.print("\n[yellow]Fix the failed components before proceeding to Phase 5.[/yellow]")
+        console.print("\n[yellow]Fix the failed components before proceeding to the execution layer.[/yellow]")
         return 1
 
 

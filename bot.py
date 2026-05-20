@@ -69,7 +69,7 @@ logger.add(
     format="{time:YYYY-MM-DDTHH:mm:ss.SSSSSS!UTC}Z | {level:<8} | {name}:{function}:{line} - {message}",
 )
 
-# Import our phases
+# Import strategy components
 from core.strategy_brain.signal_processors.spike_detector import SpikeDetectionProcessor
 from core.strategy_brain.signal_processors.sentiment_processor import SentimentProcessor
 from core.strategy_brain.signal_processors.divergence_processor import PriceDivergenceProcessor
@@ -355,7 +355,7 @@ LIVE_MIN_MARKET_BUY_USD = Decimal("5.50")
 NAUTILUS_SHUTDOWN_TIMEOUT_SECONDS = 2.0
 
 
-# --- Phase 2.5 sizing mode validation -------------------------------------
+# --- Sizing mode validation ------------------------------------------------
 
 SIZING_MODE_FIXED = "fixed"
 SIZING_MODE_PERCENT = "percent"
@@ -363,7 +363,7 @@ _ALLOWED_SIZING_MODES = frozenset({SIZING_MODE_FIXED, SIZING_MODE_PERCENT})
 
 
 def get_sizing_mode_for_live() -> str:
-    """Phase 2.5 — required env var when ``--live``. No implicit default.
+    """Required env var when ``--live``. No implicit default.
 
     Returns the validated sizing mode string. Raises ``RuntimeError`` if
     ``SIZING_MODE`` is missing or not one of ``fixed`` / ``percent``.
@@ -472,8 +472,7 @@ def validate_live_order_config() -> Dict[str, Any]:
 
 
 def trade_window_label_for_seconds_into_sub_interval(seconds: float) -> str:
-    """Phase 4.5 — classify the elapsed seconds into one of the candidate
-    trade windows defined in EXECUTION_PLAN.md Phase 4.5:
+    """Classify elapsed seconds into one of the candidate trade windows:
 
       - ``06_09``: 360-539 s  (6:00-8:59 into the 15-min market)
       - ``09_11``: 540-659 s
@@ -484,7 +483,7 @@ def trade_window_label_for_seconds_into_sub_interval(seconds: float) -> str:
 
     The bot's current live trade window is exactly ``13_14_current``
     (780-840 seconds). The other buckets are observation-only labels so
-    Phase 4.5 calibration can compare candidate windows against the live
+    calibration can compare candidate windows against the live
     baseline without changing the live gate.
     """
     if seconds < 360:
@@ -503,8 +502,8 @@ def trade_window_label_for_seconds_into_sub_interval(seconds: float) -> str:
 
 
 def trend_price_band_for(yes_price: float) -> str:
-    """Phase 4.5 — classify the YES price into one of the six bands defined in
-    EXECUTION_PLAN.md Phase 4.5 (moderate / strong / extreme on each side).
+    """Classify the YES price into one of the six trend-policy bands.
+
     The neutral middle band uses the strict ``(0.40, 0.60)`` open interval
     consistent with the trend filter's own thresholds.
     """
@@ -529,7 +528,7 @@ POLYMARKET_LIMIT_MIN_TOKENS = Decimal("5")
 def compute_limit_price(
     fused_confidence: float, limit_required_edge: Decimal
 ) -> Optional[Decimal]:
-    """Phase 3 — compute the limit-price cap from fused confidence.
+    """Compute the limit-price cap from fused confidence.
 
     ``fused.confidence`` is confidence in the selected direction (BULLISH or
     BEARISH); it is NOT a raw YES-probability. The cap is the same formula
@@ -552,7 +551,7 @@ def compute_limit_order_token_qty(
     limit_price: Decimal,
     size_precision: int,
 ) -> Optional[Decimal]:
-    """Phase 3 — compute the token quantity for a LIMIT_IOC order.
+    """Compute the token quantity for a LIMIT_IOC order.
 
     Conservative sizing: ``token_qty = budget / limit_price`` rounded DOWN
     to ``size_precision`` decimal places so the worst-case spend (at the
@@ -605,7 +604,7 @@ def derive_submitted_limit_price(
 
 
 def get_validated_limit_required_edge() -> Decimal:
-    """Phase 3 — required env var when ``ORDER_TYPE=limit_ioc``.
+    """Required env var when ``ORDER_TYPE=limit_ioc``.
 
     Strict range (0, 1). No clamping. Raises ``RuntimeError`` on any invalid
     input so impossible values fail fast at startup, not silently inside the
@@ -665,7 +664,7 @@ def get_validated_ev_buffers() -> tuple[Decimal, Decimal]:
 
 
 def get_pct_of_free_collateral_per_trade() -> Decimal:
-    """Phase 2.5 — required env var when ``SIZING_MODE=percent``.
+    """Required env var when ``SIZING_MODE=percent``.
 
     Returns the validated ``Decimal`` in (0, 1). Raises ``RuntimeError`` on
     missing, malformed, non-finite, or out-of-range values.
@@ -702,7 +701,7 @@ def _live_market_buy_usd_blocked_message(raw_value) -> str:
 
 
 def validate_live_market_buy_usd():
-    """Phase 0.3 strict validator. Returns (ok, error_msg, validated_amount).
+    """Strict live-size validator. Returns (ok, error_msg, validated_amount).
 
     Reads ``MARKET_BUY_USD`` once and validates it against the live gate.
     Quantizes BEFORE comparing so that ``5.5000001`` cannot slip past the
@@ -729,7 +728,7 @@ def validate_live_market_buy_usd():
 
 
 def enforce_live_market_buy_usd_gate() -> Decimal:
-    """Phase 0.3 live startup gate: MARKET_BUY_USD must be strictly > 5.50.
+    """Live startup gate: MARKET_BUY_USD must be strictly > 5.50.
 
     Used at process startup when --live is passed. Raises ``RuntimeError`` on
     any invalid value so startup fails closed. Runtime checks should use
@@ -843,7 +842,7 @@ class IntegratedBTCStrategy(Strategy):
         # YES token id for the current market (set in _load_all_btc_instruments)
         self._yes_token_id: Optional[str] = None
 
-        # Phase 4: Signal Processors
+        # Signal processors
         self.spike_detector = SpikeDetectionProcessor(
             spike_threshold=0.05,       # FIXED: was 0.15 (too high for probabilities)
             lookback_periods=20,
@@ -870,7 +869,7 @@ class IntegratedBTCStrategy(Strategy):
             cache_seconds=300,          # refresh every 5 min
         )
 
-        # Phase 4: Signal Fusion — update weights for 6 processors
+        # Signal fusion — update weights for 6 processors
         self.fusion_engine = get_fusion_engine()
         # Rebalanced weights (must sum ≤ 1.0; higher = more influence)
         self.fusion_engine.set_weight("OrderBookImbalance", 0.30)  # best real-time signal
@@ -880,7 +879,7 @@ class IntegratedBTCStrategy(Strategy):
         self.fusion_engine.set_weight("DeribitPCR",         0.10)  # institutional sentiment
         self.fusion_engine.set_weight("SentimentAnalysis",  0.05)  # daily F&G (weak)
 
-        # Phase 5: Risk Management
+        # Risk management
         self.risk_engine = get_risk_engine()
         try:
             self._rehydrate_settled_daily_risk()
@@ -889,13 +888,13 @@ class IntegratedBTCStrategy(Strategy):
             self._release_live_trade_ledger_lock()
             raise
 
-        # Phase 6: Performance Tracking
+        # Performance tracking
         self.performance_tracker = get_performance_tracker()
 
-        # Phase 7: Learning Engine
+        # Learning engine
         self.learning_engine = get_learning_engine()
 
-        # Phase 6: Grafana (optional)
+        # Grafana (optional)
         if enable_grafana:
             self.grafana_exporter = get_grafana_exporter()
         else:
@@ -917,10 +916,10 @@ class IntegratedBTCStrategy(Strategy):
 
         logger.info("=" * 80)
         logger.info("INTEGRATED BTC STRATEGY INITIALIZED - FIXED VERSION")
-        logger.info("  Phase 4: Signal processors ready")
-        logger.info("  Phase 5: Risk engine ready")
-        logger.info("  Phase 6: Performance tracking ready")
-        logger.info("  Phase 7: Learning engine ready")
+        logger.info("  Signal processors ready")
+        logger.info("  Risk engine ready")
+        logger.info("  Performance tracking ready")
+        logger.info("  Learning engine ready")
         logger.info(f"  ${float(get_market_buy_usd()):.2f} per trade maximum")
         logger.info(
             "  Signal confirmation: "
@@ -4410,12 +4409,12 @@ class IntegratedBTCStrategy(Strategy):
 
     async def _make_trading_decision(self, current_price: Decimal, trade_key=None) -> bool:
         """
-        Make trading decision using our 7-phase system.
+        Make a trading decision using the integrated strategy workflow.
 
         Position size is a fixed USD amount. The market price is used only as a
         late-window trend filter; fused signals must still confirm the side.
 
-        Phase 2.4 wiring: every early-return path records exactly one
+        Decision-log wiring: every early-return path records exactly one
         decisions.jsonl line via the `rec` DecisionRecord context manager.
         Reject branches call ``rec.reject(gate, reason)`` immediately before
         ``return False``; the positive path calls ``rec.decided(...)`` before
@@ -4480,7 +4479,7 @@ class IntegratedBTCStrategy(Strategy):
 
         logger.info(f"Current price: ${float(current_price):,.4f}")
 
-        # --- Phase 4a: Build real metadata for processors ---
+        # --- Build real metadata for processors ---
         metadata = await self._fetch_market_context(current_price)
         market_meta = self._require_current_market_metadata("trading decision")
         rec.update(
@@ -4491,7 +4490,7 @@ class IntegratedBTCStrategy(Strategy):
             market_end_time=market_meta.get("end_time"),
         )
 
-        # --- Phase 4.5 timing/price-band observability ---
+        # --- Timing/price-band observability ---
         market_end_iso = market_meta.get("end_time")
         end_dt = self._parse_utc_datetime(market_end_iso) if market_end_iso else None
         if end_dt is not None:
@@ -4512,7 +4511,7 @@ class IntegratedBTCStrategy(Strategy):
             # downstream trend filter will already short-circuit.
             pass
 
-        # --- Phase 4b: Run all three signal processors ---
+        # --- Run all three signal processors ---
         signals = self._process_signals(current_price, metadata)
 
         if not signals:
@@ -4538,7 +4537,7 @@ class IntegratedBTCStrategy(Strategy):
             ]
         )
 
-        # --- Phase 4c: Fuse signals into one consensus ---
+        # --- Fuse signals into one consensus ---
         fused = self.fusion_engine.fuse_signals(signals, min_signals=2, min_score=55.0)
         if not fused:
             logger.info("Fusion produced no actionable signal — no trade this interval")
@@ -4554,7 +4553,7 @@ class IntegratedBTCStrategy(Strategy):
             fused_direction=str(fused.direction.value),
         )
 
-        # --- Phase 5: Position size is a fixed USD amount ---
+        # --- Position size is a fixed USD amount ---
         POSITION_SIZE_USD = get_market_buy_usd()
 
         # =========================================================================
@@ -4595,7 +4594,7 @@ class IntegratedBTCStrategy(Strategy):
             )
             return False
         # ``trend_price_band`` was already populated with the granular
-        # Phase 4.5 band above; the coarse trend-filter band is implicit in
+        # granular band above; the coarse trend-filter band is implicit in
         # the rejection gate name for neutral trades.
 
         if get_env_bool("REQUIRE_SIGNAL_CONFIRMATION", True):
@@ -4819,7 +4818,7 @@ class IntegratedBTCStrategy(Strategy):
         # Positive decision — record before delegating to executor.
         rec.decided(direction=direction)
 
-        # --- Phase 5 / 6: Execute ---
+        # --- Execute ---
         if is_simulation:
             placed = await self._record_paper_trade(fused, POSITION_SIZE_USD, current_price, direction)
         else:
@@ -4879,7 +4878,7 @@ class IntegratedBTCStrategy(Strategy):
         limit_ioc_fill_policy: Optional[str] = None,
         order_book: Any = _ORDER_BOOK_NOT_PROVIDED,
     ) -> Optional[DepthAwareEntry]:
-        """Phase 5A — return the VWAP executable entry for the selected
+        """Return the VWAP executable entry for the selected
         token's asks, or None when the book cannot be evaluated.
 
         Fail-closed semantics: if the caller omits the decision-cycle snapshot,
@@ -7580,7 +7579,7 @@ def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, tes
     
     print("=" * 80)
     print("INTEGRATED POLYMARKET BTC 15-MIN TRADING BOT")
-    print("Nautilus + 7-Phase System + Redis Control")
+    print("Nautilus + Redis Control")
     print("=" * 80)
 
     order_config = validate_live_order_config()
@@ -7616,11 +7615,11 @@ def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, tes
     print(f"  Initial Mode: {'SIMULATION' if simulation else 'LIVE TRADING'}")
     print(f"  Redis Control: {'Enabled' if redis_client else 'Disabled'}")
     print(f"  Grafana: {'Enabled' if enable_grafana else 'Disabled'}")
-    # Print the validated MARKET_BUY_USD. In live mode the Phase 0.3 gate has
+    # Print the validated MARKET_BUY_USD. In live mode the startup gate has
     # already raised before reaching here if the env value is missing/invalid,
     # so get_market_buy_usd() returns a real value. In simulation the existing
     # legacy default applies (tracked in the AGENTS.md/CLAUDE.md no-fallback
-    # audit as a pre-existing item, not introduced by Phase 0.3).
+    # audit as a pre-existing item.
     print(f"  Max Trade Size: ${get_market_buy_usd()}")
     print(f"  Order Type: {order_config['order_type']}")
     print(
@@ -7676,7 +7675,7 @@ def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, tes
     polymarket_api_secret = str(polymarket_creds["api_secret"])
     polymarket_passphrase = str(polymarket_creds["passphrase"])
     polymarket_signature_type = int(polymarket_creds["signature_type"])
-    # Phase 0.5a / 1.227.0 migration: Polymarket config field was renamed
+    # Nautilus 1.227.0 compatibility: Polymarket config field was renamed
     # `instrument_provider` -> `instrument_config` in nautilus_trader 1.227.0.
     poly_data_cfg = PolymarketDataClientConfig(
         private_key=polymarket_private_key,
@@ -7786,7 +7785,7 @@ def parse_runtime_args(argv=None):
 def _prompt_for_live_confirmation() -> None:
     """Require the operator to type 'LIVE' to acknowledge --live startup.
 
-    Phase 0.3 live startup gate: --live alone requires the operator to type
+    Live startup gate: --live alone requires the operator to type
     exactly the literal string 'LIVE' (case sensitive, no whitespace tolerance).
     --live --confirm-live skips this prompt with a logged audit line instead.
 
@@ -7818,11 +7817,11 @@ def main():
     simulation = not args.live
 
     if not simulation:
-        # Phase 0.3 gate (1): MARKET_BUY_USD > 5.50 strict before any node startup
+        # Live gate (1): MARKET_BUY_USD > 5.50 strict before any node startup
         enforce_live_market_buy_usd_gate()
         validate_live_order_config()
 
-        # Phase 0.3 gate (2): interactive LIVE confirmation unless --confirm-live
+        # Live gate (2): interactive LIVE confirmation unless --confirm-live
         if args.confirm_live:
             logger.warning(
                 "Live confirmation provided by explicit --confirm-live CLI flag; "
