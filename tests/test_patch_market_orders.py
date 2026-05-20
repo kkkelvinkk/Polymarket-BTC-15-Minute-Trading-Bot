@@ -31,6 +31,10 @@ class PatchMarketOrdersTests(unittest.TestCase):
                 PolymarketExecutionClient.generate_order_status_reports,
             "_parse_trades_response_object":
                 PolymarketExecutionClient._parse_trades_response_object,
+            "_submit_market_order":
+                PolymarketExecutionClient._submit_market_order,
+            "_handle_ws_message":
+                PolymarketExecutionClient._handle_ws_message,
         }
 
     def tearDown(self):
@@ -58,6 +62,16 @@ class PatchMarketOrdersTests(unittest.TestCase):
                 module._dispatch_auto_redeem({"event_type": "auto_redeem", "amount": "1"})
         finally:
             module.unregister_auto_redeem_handler(failing_handler)
+
+    def test_apply_patch_preserves_native_market_order_submit(self):
+        module = load_patch_module()
+        from nautilus_trader.adapters.polymarket.execution import (
+            PolymarketExecutionClient,
+        )
+
+        original_submit = PolymarketExecutionClient._submit_market_order
+        self.assertTrue(module.apply_market_order_patch())
+        self.assertIs(PolymarketExecutionClient._submit_market_order, original_submit)
 
     def test_actual_fill_handler_exception_is_not_swallowed(self):
         module = load_patch_module()

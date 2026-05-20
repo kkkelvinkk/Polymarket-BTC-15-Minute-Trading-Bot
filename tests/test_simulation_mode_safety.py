@@ -13,6 +13,8 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT_RESOLVED = REPO_ROOT.resolve()
+_STUBBED_MODULE_NAMES = []
 
 
 class _DummyLogger:
@@ -106,11 +108,12 @@ class _DummyRedis:
 
 
 def _ensure_module(name):
-    if name in sys.modules:
+    if name in _STUBBED_MODULE_NAMES:
         return sys.modules[name]
 
     module = types.ModuleType(name)
     sys.modules[name] = module
+    _STUBBED_MODULE_NAMES.append(name)
 
     if "." in name:
         parent_name, child_name = name.rsplit(".", 1)
@@ -127,6 +130,14 @@ def _install_module(name, **attrs):
     return module
 
 
+def _is_repo_module(module):
+    module_file = getattr(module, "__file__", None)
+    return (
+        module_file is not None
+        and Path(module_file).resolve().is_relative_to(REPO_ROOT_RESOLVED)
+    )
+
+
 def _install_bot_dependency_stubs():
     _install_module(
         "patch_gamma_markets",
@@ -140,6 +151,10 @@ def _install_bot_dependency_stubs():
         register_auto_redeem_handler=lambda _handler: None,
         unregister_actual_fill_handler=lambda _handler: None,
         unregister_auto_redeem_handler=lambda _handler: None,
+    )
+    _install_module(
+        "patch_polymarket_quote_warnings",
+        apply_polymarket_quote_warning_patch=lambda: True,
     )
     _install_module("polymarket_v2_compat", apply_polymarket_v2_patch=lambda: True)
     _install_module("dotenv", load_dotenv=lambda: None)
@@ -218,10 +233,30 @@ def _install_bot_dependency_stubs():
 class SimulationModeSafetyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls._module_snapshot = dict(sys.modules)
+        cls._path_snapshot = list(sys.path)
+        _STUBBED_MODULE_NAMES.clear()
         _install_bot_dependency_stubs()
+        cls._stubbed_module_names = tuple(_STUBBED_MODULE_NAMES)
         sys.path.insert(0, str(REPO_ROOT))
         sys.modules.pop("bot", None)
         cls.bot = importlib.import_module("bot")
+
+    @classmethod
+    def tearDownClass(cls):
+        if "bot" in cls._module_snapshot:
+            sys.modules["bot"] = cls._module_snapshot["bot"]
+        else:
+            sys.modules.pop("bot", None)
+        for name, module in tuple(sys.modules.items()):
+            if name not in cls._module_snapshot and _is_repo_module(module):
+                sys.modules.pop(name, None)
+        for name in reversed(cls._stubbed_module_names):
+            if name in cls._module_snapshot:
+                sys.modules[name] = cls._module_snapshot[name]
+            else:
+                sys.modules.pop(name, None)
+        sys.path[:] = cls._path_snapshot
 
     def setUp(self):
         self._original_ledger_path = self.bot.LIVE_TRADE_LEDGER_PATH

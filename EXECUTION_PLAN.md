@@ -21,17 +21,17 @@ This document lays out the full sequence of fixes and enhancements before the ne
 | 1.3 `.env.example` | **SHIPPED** | With warning banner; `.gitignore` exception added |
 | 2.4 structured `decisions.jsonl` writer | **SHIPPED + WIRED** | `decision_log.py:DecisionRecord` + 10 tests; wiring landed in `bot.py` `_make_trading_decision_body` with `rec.reject(gate, reason)` at every early-return and `rec.decided(direction=...)` at the positive path |
 | 2.5 dynamic sizing + balance freshness | **VALIDATORS SHIPPED** | `bot.py:get_sizing_mode_for_live` + `get_pct_of_free_collateral_per_trade` + 6 tests; AccountState freshness hook + sizing-mode integration in `_make_trading_decision` still pending |
-| 3 ORDER_TYPE (market_ioc / limit_ioc) | **VALIDATORS + LIMIT HELPERS SHIPPED** | `bot.py:get_order_type_for_live`, `get_validated_limit_required_edge`, `compute_limit_price`, `compute_limit_order_token_qty` + 15 tests. LIMIT order-factory branch in `_place_real_order` + 1.227.0 wire-format verification deferred (still blocked by Phase 4/4.5 data gates per plan) |
+| 3 ORDER_TYPE (market_ioc / limit_ioc) + quote stability | **MANDATORY LIVE-RESUME BLOCKER - PARTIAL SHIP** | `bot.py:get_order_type_for_live`, `get_validated_limit_required_edge`, `compute_limit_price`, `compute_limit_order_token_qty` + 15 tests shipped. LIMIT order-factory branch in `_place_real_order`, startup/runtime `ORDER_TYPE` enforcement, configurable `QUOTE_STABILITY_REQUIRED`, wire-format tests, and live smoke verification now block live resume. |
 | 4 calibration analysis | **SCRIPT SHIPPED, DATA PENDING** | `analyze_calibration.py` + 16 tests; needs `n>=100` settled live trades to decide |
 | 4.5 strategy timing / price-band evaluation | **OBSERVABILITY FIELDS SHIPPED** | `bot.py:trade_window_label_for_seconds_into_sub_interval` + `trend_price_band_for` populate `seconds_into_sub_interval`, `trade_window_label`, `trend_price_band` on every `decisions.jsonl` record. Full shadow-policy observation mode (run candidate windows without submitting) deferred — needs accumulated data and a separate review cycle |
 | 5A market-depth estimator helpers + EV-gate WIRING | **SHIPPED + WIRED** | `depth_estimator.py` + 22 tests; EV-gate now uses `_compute_depth_aware_entry` to compute VWAP via `estimate_market_ioc_fill` on the SELECTED token's asks (YES book for long, NO book for short). Fail-closed on missing token id, fetch error, empty asks, invalid book level, or book too thin. 5 new wiring tests covering each fail-closed branch. |
-| 5B LIMIT_IOC depth integration | **UNIFIED HELPER SHIPPED** | `depth_estimator.estimate_fill_for_order_type` dispatches by ORDER_TYPE + 7 tests; EV-gate caller wiring in `_make_trading_decision` deferred (needs own review cycle per CLAUDE.md rule #5) |
+| 5B LIMIT_IOC depth integration | **MANDATORY LIVE-RESUME BLOCKER - PARTIAL SHIP** | `depth_estimator.estimate_fill_for_order_type` dispatches by ORDER_TYPE + 7 tests shipped; EV-gate caller wiring in `_make_trading_decision` is mandatory before `ORDER_TYPE=limit_ioc` can be used for live trading. |
 | 6 SOPS credential management | **GUARD MODULE + TEMPLATES SHIPPED** | `phase_6_sops_check.py:refuse_plaintext_env_in_live_mode` (Pattern A check, 9 tests) + `deploy/.env.sops.yaml.example` + `deploy/polybot.service` SOPS variant + `deploy/README.md` SOPS section. Wiring into `bot.py` is a one-line operator opt-in (per plan: "Operator must approve exactly one implementation before Phase 6 work starts") |
 | 7 live env reload | **DECIDED — Option C** | "Don't implement"; restart-driven config workflow documented in `README.md` + `deploy/README.md`. Effort: 0 days per plan |
 | 7.5 multi-asset evaluation | **EVALUATION TEMPLATE SHIPPED** | `deploy/PHASE_7_5_multi_asset_evaluation_template.md` — operator fills in asset selection + topology + per-asset calibration decision; follow-up implementation effort sized in the template by topology choice |
 | 8 Linux deployment | **TEMPLATES SHIPPED** | `deploy/polybot.service` + `deploy/polybot.logrotate` + `deploy/polybot-ledger-backup.cron` + `deploy/README.md` (install runbook + monitoring + security checklist). Operator copies into place on the target server |
 
-**Live mode is technically unblocked.** All Phase 0 defects that would have blocked or corrupted live trading are now fixed (either upstream via 1.227.0 or in-tree via the Phase 0.4 UUID guard patch). Operator must still complete Phase 0.7 manual recovery of the lost `$11` trade before resuming any live trading.
+**Live mode is not approved for resume yet.** All Phase 0 defects that would have blocked or corrupted live trading are now fixed (either upstream via 1.227.0 or in-tree via the Phase 0.4 UUID guard patch), but operator must still complete Phase 0.7 manual recovery of the lost `$11` trade and the mandatory Phase 3 + Phase 5B limit-price order path before resuming live trading.
 
 
 
@@ -340,7 +340,7 @@ For a filled order-status report where `avg_px is None`:
 1. Fetch `client.get_trades(TradeParams(market=condition_id, asset_id=token_id, after=<order_submit_ts - 5s>, before=<now + 1s>))`.
 2. Filter the returned trades by **exact predicate per order type** (no "as appropriate" guessing):
    - **`MARKET_IOC` (current production path):** match where `t.taker_order_id == venue_order_id`. The bot crosses the spread, so it is always the taker.
-   - **`LIMIT_IOC` (Phase 3, future):** match where `t.taker_order_id == venue_order_id`. IOC limit orders that fill immediately are also takers — they don't rest, so they cannot be the maker side of a match.
+   - **`LIMIT_IOC` (mandatory Phase 3 path):** match where `t.taker_order_id == venue_order_id`. IOC limit orders that fill immediately are also takers — they don't rest, so they cannot be the maker side of a match.
    - **If we ever add `LIMIT_GTC` or resting orders (out of scope):** match where `t.maker_order_id == venue_order_id`. Not in scope today; document only.
    - **Fail closed:** if no trade matches the expected predicate, dispatch `{"status": "failed", "reason": "no_matching_trade"}` — do NOT fall back to the other predicate. The role is determined by order type at submission and is unambiguous.
 3. Compute size-weighted VWAP across matched trades: `vwap = sum(t.price * t.size) / sum(t.size)`.
@@ -989,9 +989,10 @@ API/dependency changes required to upgrade this repo to 1.227.0:
 
 Plan decision (per the section's "Decision after audit" rubric):
 - 1.227.0 fixes Phase 0.3, 0.4 (dust), and 0.5 natively → **dependency
-  upgrade plus the migration steps above is SHIPPED** in
+  upgrade plus the compatibility update steps above is SHIPPED** in
   ``requirements.txt`` (`nautilus_trader==1.227.0`) and ``bot.py``
-  (`instrument_provider` → `instrument_config` rename).
+  (`instrument_provider` → `instrument_config` rename). This is dependency/API
+  compatibility work, not a ledger, config, or runtime-state migration.
 - 1.227.0 does NOT remove the UUID fallback → **in-tree patch SHIPPED** as
   ``apply_uuid_fallback_guard_patch`` in ``patch_market_orders.py`` (replaces
   the 3 UUID4 client-id synthesis sites with `_dispatch_actual_fill` +
@@ -1092,12 +1093,12 @@ Use the same `venv/bin/python` and the same `--ledger` path as the prerequisite 
 - [ ] Lost trade reconstructed in `live_trades.json` via `--create-unknown-from-external-order`.
 - [ ] **Lost trade fully resolved.** Operator has run `--order-id BTC-15MIN-\$11-... --payout <verified> --reason ...` with the externally verified payout. The ledger entry now has `settlement_source: "manual_reconciliation"` and `needs_reconciliation: false`.
 - [ ] **No remaining live-blocking unresolved state for this order.** Reconstruction alone is not sufficient: the live-trading pause gate checks settled-record OR semantics (`needs_reconciliation is True` or `settlement_source == "SETTLEMENT_UNKNOWN"`) plus `pending_actual_fills`, unresolved `submitted_order_intents`, and `LEDGER_BLOCKED`. Confirm this order has no matching unresolved settled record, pending actual fill, or submitted intent before live smoke testing.
-- [ ] avg_px present in fill events for new live market BUYs via the deterministic `get_trades` path (verify with one minimum allowed live smoke trade, e.g. `$5.51`, after the lost trade is fully resolved).
+- [ ] avg_px present in fill events for new live `LIMIT_IOC` BUYs via the deterministic `get_trades` path (verify with one minimum allowed live smoke trade, e.g. `$5.51`, only after the lost trade is fully resolved and mandatory Phase 3 + Phase 5B are complete).
 - [ ] Token-dust overfill within tolerance no longer rejected; ledger preserves actual filled units via the side-channel.
 - [ ] Real overfill (outside tolerance) dispatches `status=failed, reason=real_overfill_rejected` and creates a durable SETTLEMENT_UNKNOWN entry that survives restart.
 - [ ] `_record_live_order_fill` refuses non-positive `fill_price`.
 - [ ] All Phase 0 regression tests pass, including the installed Nautilus UUID-fallback guard and quote-quantity units-mismatch case.
-- [ ] One deliberately tiny allowed live smoke trade (`MARKET_BUY_USD=5.51`, strictly greater than the `5.50` live gate) has been placed and observed to flow cleanly through: order submitted → actual-fill callback fires with `status="ok"` and matching VWAP → ledger records actual filled units → `auto_redeem` resolves → final ledger entry shows correct payout and P&L.
+- [ ] One deliberately tiny allowed live `LIMIT_IOC` smoke trade (`ORDER_TYPE=limit_ioc`, `MARKET_BUY_USD=5.51`, `QUOTE_STABILITY_REQUIRED=3`, `LIMIT_IOC_FILL_POLICY=partial_ok`) has been placed and observed to flow cleanly through: order submitted → actual-fill callback fires with `status="ok"` and matching VWAP → ledger records actual filled units → `auto_redeem` resolves → final ledger entry shows correct payout and P&L.
 
 ### Effort
 
@@ -1107,7 +1108,7 @@ Use the same `venv/bin/python` and the same `--ledger` path as the prerequisite 
 
 ## Phase 1 — Environment Variable Audit & Documentation
 
-**Status:** High. Several env vars listed in README / current env docs don't actually do anything. Operator may be tuning values that have zero effect. (`.env.example` does not yet exist — Phase 1.3 creates it. Until then, the env reference surface is the README and inline code comments only.)
+**Status:** High. Several env vars listed in README / current env docs don't actually do anything. Operator may be tuning values that have zero effect. (`.env.example` now exists; Phase 3 must update it for mandatory `ORDER_TYPE`, `QUOTE_STABILITY_REQUIRED`, and `LIMIT_IOC_FILL_POLICY` semantics.)
 
 ### Currently wired (read from `os.environ` per decision/tick)
 
@@ -1168,7 +1169,7 @@ Add a clear table in README distinguishing per-decision-read vs startup-read env
 
 #### 1.3 — Create `.env.example`
 
-**Note:** `.env.example` does **not** currently exist in the repo. This phase must **create** it (not "clean up"). It should include:
+**Note:** `.env.example` exists in the repo. Keep it current as live-order semantics change. It should include:
 - All env vars actually wired (per the tables above)
 - Comments next to each var marking per-decision vs startup
 - Recommended default values where appropriate
@@ -1220,7 +1221,7 @@ MAX_LOSS_PER_DAY=11.02
 MAX_DRAWDOWN_PCT=0.15
 ```
 
-Same shape, slightly above the strict `MARKET_BUY_USD > 5.50` live gate and ~1/10 the normal exposure. This is smoke-test-only: use it for the first live smoke trade after Phase 0 completes, then scale to the intended normal `$55 / $385 / 7 positions / $110 daily loss` config after the smoke trade settles cleanly.
+Same shape, slightly above the strict `MARKET_BUY_USD > 5.50` live gate and ~1/10 the normal exposure. This is smoke-test-only: use it for the first live `LIMIT_IOC` smoke trade only after Phase 0.7 recovery, mandatory Phase 3, and Phase 5B are complete. Smoke uses `ORDER_TYPE=limit_ioc` unless the operator explicitly approves a separate `market_ioc` risk test; then scale to the intended normal `$55 / $385 / 7 positions / $110 daily loss` config after the smoke trade settles cleanly.
 
 ### Important constraints
 
@@ -1424,7 +1425,7 @@ The percent-mode computation uses the same account-state cache as the fixed-mode
 
 After computing `per_trade_usd`, ALL of the following must pass or the trade is rejected:
 
-1. `per_trade_usd >= MARKET_MINIMUM_USD` (Polymarket: $1 for market orders, or $5 × `limit_price` worth of tokens for limit orders — see Phase 3 5-token-minimum logic).
+1. `per_trade_usd >= MARKET_MINIMUM_USD` (Polymarket: $1 for market orders, or $5 × `submitted_limit_price` worth of tokens for limit orders — see Phase 3 5-token-minimum logic).
 2. `per_trade_usd <= MAX_POSITION_SIZE` — operator-enforced ceiling. Computed amount exceeding this is **rejected**, NOT clamped. Clamping would silently shrink the operator's intended size.
 3. `current_exposure + per_trade_usd <= MAX_TOTAL_EXPOSURE` — pre-trade exposure check using risk engine.
 4. `current_position_count < MAX_POSITIONS` — pre-trade count check.
@@ -1471,23 +1472,39 @@ These allow Phase 4 calibration to detect whether bigger-vs-smaller positions pe
 
 ---
 
-## Phase 3 — Configurable Order Type (`MARKET_IOC` vs `LIMIT_IOC`)
+## Phase 3 — Configurable Order Type (`MARKET_IOC` vs `LIMIT_IOC`) + Quote Stability
 
-**Status:** Strategic. Major change. Depends on Phase 0 (fill reconciliation must work first), Phase 4 (calibration validation), Phase 4.5 (strategy timing/price-band evaluation), and Phase 5A (market-depth estimator/per-side book infrastructure). Phase 5B limit-depth wiring depends on this Phase 3 order-type scaffold and must ship before `ORDER_TYPE=limit_ioc` is enabled for normal live trading.
+**Status:** Mandatory live-resume blocker. The current market-IOC-only live path can sweep worse book levels than the EV gate accepted, so configurable limit-price order support is now required before any live resume. The quote-stability gate is part of the same safety boundary: the bot must not compute and submit a limit price from an insufficiently stable quote stream. Phase 0 fill reconciliation and Phase 5A selected-token depth estimation must remain intact. Phase 4 calibration and Phase 4.5 timing/price-band evaluation remain required before scaling or changing strategy policy, but they no longer defer the price-cap safety work. Phase 5B limit-depth wiring depends on this Phase 3 order-type scaffold and must ship before `ORDER_TYPE=limit_ioc` is enabled for live trading.
 
 ### Motivation
 
-Current behavior: bot submits market IOC orders. A $1 (or $5) budget sweeps the book until exhausted. Average fill price can be substantially worse than the top-of-book ask the EV gate evaluated.
+Current behavior: bot submits market IOC orders. A $1 (or $5) budget sweeps the book until exhausted. Average fill price can be substantially worse than the top-of-book ask or VWAP snapshot the EV gate evaluated.
 
-Desired behavior: operator selects between:
+Mandatory behavior: live order construction is selected explicitly by configuration:
 - **`MARKET_IOC`** (current behavior): immediate fill at whatever price is available, up to budget.
-- **`LIMIT_IOC`**: immediate fill at the EV-accepted price or cancel. No resting state.
+- **`LIMIT_IOC`**: immediate fill at or better than the EV-accepted price cap, then cancel any unfilled remainder. No resting state.
 
-Both are explicit operator choices. This is not a silent fallback — the operator must set `ORDER_TYPE` explicitly (no default).
+Both are explicit operator choices. This is not a silent fallback - the operator must set `ORDER_TYPE` explicitly (no default). The implementation work for `LIMIT_IOC` is mandatory, not a later enhancement. `MARKET_IOC` may remain available only as an explicit operator-selected mode; it must never be the implicit default and must never be used to claim that a price-accepted decision was protected by a limit price.
+
+The current hardcoded `QUOTE_STABILITY_REQUIRED = 3` must move into Phase 3 live configuration. Normal live configuration should set `QUOTE_STABILITY_REQUIRED=3`. The code must validate it explicitly in live mode instead of silently relying on a module constant.
+
+### 3.0 — Adoption decision from `polymarket-trading-bot`
+
+Review of `/Users/kkkelvinkk/AppDev/AppSrc/CyberSecThreat/polymarket-trading-bot` confirms the correct CLOB limit-order shape:
+- Direct CLOB limit orders sign an order with `token_id`, `price`, `size`, and `side`, then submit `post_order(..., order_type)`.
+- For BUY orders, signed maker amount is `size * price` USDC and taker amount is token `size`; this matches the conservative sizing rule in this plan.
+- Its direct signer/client stack should not be copied into this Nautilus bot. This repo must preserve the Nautilus execution lifecycle, fill events, settlement handling, risk tracking, and ledger accounting. Adopt the semantics, not the transport stack.
+
+Implementation target in this repo:
+- Use `self.order_factory.limit(...)` for `ORDER_TYPE=limit_ioc`.
+- Use `quote_quantity=False`; quantity is token count, not USDC budget.
+- Derive one `submitted_limit_price` from the EV-accepted cap by rounding BUY prices down to the instrument's allowed tick/precision. Never round a BUY limit above the accepted cap. Use this same submitted price for depth estimation, token sizing, risk/free-collateral checks, pre-submit intent, and `Price.from_str`.
+- Use `TimeInForce.IOC`, which installed Nautilus 1.227.0 maps to Polymarket `FAK`; verify this with tests and document the observed mapping.
+- Reject if the rounded token quantity is below Polymarket's 5-token minimum.
 
 ### 3.0a — Decide partial-fill vs all-or-nothing semantics BEFORE the wire-format verification
 
-This is a strategy decision, not a Nautilus question. Phase 3 is blocked until the operator explicitly selects one policy. There is no plan default.
+This is a strategy decision, not a Nautilus question. The live-resume-ready Phase 3 implementation is blocked until the operator explicitly selects one policy. There is no plan default.
 
 **Option FAK (fill-and-kill / partial fill OK):**
 - "Buy up to N tokens at price ≤ cap; whatever fills, fills. Cancel the rest."
@@ -1501,17 +1518,21 @@ This is a strategy decision, not a Nautilus question. Phase 3 is blocked until t
 - Simpler accounting (no partial-fill state).
 - Recommended when the strategy's edge depends on a full position; partial fills would distort risk.
 
-Implementation requirement: add a required live-mode env var such as `LIMIT_IOC_FILL_POLICY`, allowed values `partial_ok` or `all_or_nothing`, and fail startup if `ORDER_TYPE=limit_ioc` and the policy is missing/invalid. If `all_or_nothing` is selected, the strategy-side depth check must reject when `tokens_filled < target_token_qty` before order submission. If `partial_ok` is selected, the existing partial-fill ledger path remains valid. Do not silently infer this policy from Nautilus' `FAK/FOK` mapping.
+Implementation requirement: add a required live-mode env var such as `LIMIT_IOC_FILL_POLICY`, allowed values `partial_ok` or `all_or_nothing`, and fail startup if `ORDER_TYPE=limit_ioc` and the policy is missing/invalid. Do not silently infer this policy from Nautilus' `FAK/FOK` mapping.
+
+Compatibility rule: current workspace verification shows `LIMIT + IOC` maps to Polymarket `FAK`. Under `FAK`, the exchange may partially fill if liquidity changes between the strategy-side depth check and order arrival. Therefore:
+- `LIMIT_IOC_FILL_POLICY=partial_ok` is compatible with the verified `FAK` wire behavior; the existing partial-fill ledger path remains valid.
+- `LIMIT_IOC_FILL_POLICY=all_or_nothing` requires true exchange-enforced `FOK` wire behavior. With the current `IOC -> FAK` mapping, this policy must fail closed at startup until a deliberate FOK submission path is implemented and wire-format tested. A pre-submit depth check alone is not sufficient to enforce all-or-nothing.
 
 ### 3.0b — HARD PREREQUISITE: verify Nautilus wire format for `OrderType.LIMIT + TimeInForce.IOC`
 
-Before any of the Phase 3 implementation begins, verify experimentally that `self.order_factory.limit(... time_in_force=TimeInForce.IOC ...)` actually produces the wire format we expect when it reaches `py_clob_client`. Three things could go wrong, all of which require **deliberate** action — not fallback:
+Before completing the Phase 3 live-order branch, verify experimentally that `self.order_factory.limit(... time_in_force=TimeInForce.IOC ...)` actually produces the wire format we expect when it reaches `py_clob_client`. Three things could go wrong, all of which require **deliberate** action — not fallback:
 
-1. **Nautilus may map `LIMIT + IOC` to Polymarket's `FAK` order type.** Proceed only if the operator-selected `LIMIT_IOC_FILL_POLICY` is compatible with that wire behavior, or add an explicit strategy-side pre-submit check that enforces the selected policy.
-2. **Nautilus may map `LIMIT + IOC` to `FOK`** (fill-or-kill, all-or-nothing). Proceed only if the operator-selected `LIMIT_IOC_FILL_POLICY` is compatible with that wire behavior. If not, Phase 3 remains blocked until a deliberate wire-format design is approved.
+1. **Nautilus may map `LIMIT + IOC` to Polymarket's `FAK` order type.** Proceed only with `LIMIT_IOC_FILL_POLICY=partial_ok`. If the operator selects `all_or_nothing`, block startup until a deliberate FOK submission path is implemented and wire-format tested; a strategy-side pre-submit depth check alone cannot enforce all-or-nothing under `FAK`.
+2. **Nautilus may map `LIMIT + IOC` to `FOK`** (fill-or-kill, all-or-nothing). Proceed only if the operator-selected `LIMIT_IOC_FILL_POLICY` is compatible with that wire behavior. If not, revise the limit-order submission design deliberately before live resume.
 3. **Nautilus may reject the combination outright** and require a different `TimeInForce` value (`GTD`, `FAK` explicit, etc.). If so, choose the Polymarket order type deliberately by reading `py_clob_client` source — do NOT pick whichever value happens to make the rejection go away.
 
-A locally-installed Nautilus reviewer sanity-check during plan review showed `TimeInForce.IOC → FAK`, but that is not a policy default. Verification remains required because the mapping is internal to Nautilus and can change between versions.
+Current workspace verification on 2026-05-20 showed installed Nautilus 1.227.0 maps `TimeInForce.IOC` to Polymarket `FAK`, and its limit submit path calls `create_order(...)` followed by `post_order(..., order_type)`. Keep the unit test anyway because the mapping is internal to Nautilus and can change between versions.
 
 **Verification method (NOT simulation):**
 
@@ -1529,7 +1550,7 @@ Document the actual mapping in the Phase 3 implementation PR. If the mapping doe
 
 Polymarket limit orders require ≥5 tokens. At various target prices with various budget sizes:
 
-| Limit price | $1 budget → tokens | $5.51 smoke budget → tokens | $11 budget → tokens |
+| Submitted limit price | $1 budget → tokens | $5.51 smoke budget → tokens | $11 budget → tokens |
 |---|---|---|---|
 | $0.20 | 5.0 ✅ | 27.55 ✅ | 55.0 ✅ |
 | $0.30 | 3.3 ❌ | 18.37 ✅ | 36.7 ✅ |
@@ -1537,7 +1558,7 @@ Polymarket limit orders require ≥5 tokens. At various target prices with vario
 | $0.62 | 1.6 ❌ | 8.89 ✅ | 17.7 ✅ |
 | $0.80 | 1.25 ❌ | 6.89 ✅ | 13.75 ✅ |
 
-**Implication:** `LIMIT_IOC` is only usable when `MARKET_BUY_USD / limit_price ≥ 5`. At Phase 2's smoke budget (`5.51`, the minimum allowed live size), this works for prices ≤ $1.00 (i.e., all valid prices). At $1 budget, only ≤ $0.20 trades qualify.
+**Implication:** `LIMIT_IOC` is only usable when `MARKET_BUY_USD / submitted_limit_price ≥ 5`. At Phase 2's smoke budget (`5.51`, the minimum allowed live size), this works for prices ≤ $1.00 (i.e., all valid prices). At $1 budget, only ≤ $0.20 trades qualify.
 
 ### 3.2 — `quote_quantity` correctness per order type
 
@@ -1549,7 +1570,7 @@ Polymarket limit orders require ≥5 tokens. At various target prices with vario
 | Limit SELL | `False` | Token count |
 
 The current `patch_market_orders.py` only handles the market BUY USD-amount path. Adding limit-order support means:
-- Compute `token_qty = MARKET_BUY_USD / limit_price`
+- Compute `token_qty = MARKET_BUY_USD / submitted_limit_price`
 - Reject if `token_qty < 5` (Polymarket minimum)
 - Submit with `quote_quantity=False` and the **decimal token quantity rounded down to `instrument.size_precision`** (e.g., 6 decimal places for Polymarket)
 - Submit `price` as a separate field
@@ -1562,7 +1583,21 @@ The current `patch_market_orders.py` only handles the market BUY USD-amount path
 # Required in live mode. No implicit default. Bot refuses to start in live mode without this.
 # Allowed values: market_ioc | limit_ioc
 ORDER_TYPE=
+
+# Required in live mode. No implicit default. Normal value: 3.
+# Number of consecutive valid quote ticks required before live order placement.
+QUOTE_STABILITY_REQUIRED=3
+
+# Required when ORDER_TYPE=limit_ioc. No implicit default.
+# Allowed values: partial_ok | all_or_nothing
+# all_or_nothing requires verified exchange-enforced FOK behavior.
+# Current verified FAK path requires the operator to set partial_ok for routine resume.
+LIMIT_IOC_FILL_POLICY=partial_ok
 ```
+
+Operational policy: after Phase 3 + Phase 5B ship, routine live operation should use `ORDER_TYPE=limit_ioc` so an accepted decision is protected by an exchange-enforced price cap. `ORDER_TYPE=market_ioc` remains a deliberate operator mode for smoke tests, comparison, or emergency operation, but selecting it means the operator explicitly accepts book-sweep price risk.
+
+Quote-stability policy: `QUOTE_STABILITY_REQUIRED` is tied to the limit-price safety path. The bot may only call `_place_real_order` after the current market has produced at least this many consecutive valid quote ticks after the latest market switch or quote-stability reset. For `ORDER_TYPE=limit_ioc`, this prevents submitting a price cap that was computed from a one-off or just-reset quote stream. For `ORDER_TYPE=market_ioc`, this preserves the existing protection against trading immediately after a market switch.
 
 **Validation in `run_integrated_bot` at startup AND at every live trade decision:**
 
@@ -1574,14 +1609,65 @@ def _validate_order_type_for_live() -> str:
     if order_type not in {"market_ioc", "limit_ioc"}:
         raise RuntimeError(f"ORDER_TYPE must be 'market_ioc' or 'limit_ioc', got {order_type!r}")
     return order_type
+
+def _validate_quote_stability_required_for_live() -> int:
+    raw = os.getenv("QUOTE_STABILITY_REQUIRED")
+    if not raw:
+        raise RuntimeError("QUOTE_STABILITY_REQUIRED must be set to a positive integer for live trading")
+    try:
+        required = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"QUOTE_STABILITY_REQUIRED must be a positive integer, got {raw!r}") from exc
+    if required <= 0:
+        raise RuntimeError(f"QUOTE_STABILITY_REQUIRED must be > 0, got {required}")
+    return required
+
+def _validate_limit_ioc_fill_policy_for_live(order_type: str) -> str | None:
+    if order_type != "limit_ioc":
+        return None
+    policy = os.getenv("LIMIT_IOC_FILL_POLICY")
+    if policy not in {"partial_ok", "all_or_nothing"}:
+        raise RuntimeError(
+            "LIMIT_IOC_FILL_POLICY must be set to 'partial_ok' or 'all_or_nothing' "
+            "when ORDER_TYPE=limit_ioc"
+        )
+    if policy == "all_or_nothing":
+        raise RuntimeError(
+            "LIMIT_IOC_FILL_POLICY=all_or_nothing requires verified FOK wire behavior; "
+            "current Nautilus LIMIT+IOC maps to FAK"
+        )
+    return policy
 ```
 
 - **Startup check:** `run_integrated_bot` calls this when `simulation=False`.
-- **Runtime check:** `_place_real_order` ALSO calls this on every live trade. This is required because the bot supports Redis-based mode switching (operator can flip sim→live at runtime). If `ORDER_TYPE` was missing at startup in simulation mode but the Redis flag flips to live, the runtime check must refuse the trade.
+- **Runtime check:** `_place_real_order` ALSO calls these validators on every live trade. This is required because the bot supports Redis-based mode switching (operator can flip sim→live at runtime). If `ORDER_TYPE`, `QUOTE_STABILITY_REQUIRED`, or the required `LIMIT_IOC_FILL_POLICY` for `limit_ioc` was missing/invalid at startup in simulation mode but the Redis flag flips to live, the runtime check must refuse the trade before any order submission.
 
-**No default in any mode.** The previous draft suggested simulation/test mode could default to `market_ioc` — that is a fallback and is now removed. If no live order will be placed, `ORDER_TYPE` is simply unused. Any test that exercises order construction must set `ORDER_TYPE` explicitly.
+**No default in any mode.** The previous draft suggested simulation/test mode could default to `market_ioc` — that is a fallback and is now removed. If no live order will be placed, `ORDER_TYPE`, `QUOTE_STABILITY_REQUIRED`, and `LIMIT_IOC_FILL_POLICY` are simply unused. Any test that exercises live order construction or live quote-stability gating must set the relevant env vars explicitly.
+
+Non-live behavior must be explicit: quote tick counting may still update in simulation/test mode, but the live submission gate must not read an uninitialized `_quote_stability_required` value. Only live mode and tests that intentionally exercise live quote-stability gating construct the strategy with a validated threshold. Decision-observation or test paths that do not place live orders must not mark a market as live-submission-ready based on an implicit simulation threshold.
+
+Quote-stability wiring requirement: the validated value must be stored on the strategy (for example `self._quote_stability_required`) and the quote handler must compare `self._stable_tick_count >= self._quote_stability_required`. Runtime validation inside `_place_real_order` is not enough, because `_market_stable` may have been set earlier under a different threshold. `_place_real_order` must also fail closed if `self._stable_tick_count` is below the validated live threshold at submission time.
+
+**Submitted limit price helper (owned by `_make_trading_decision` before Phase 5B depth estimation):**
+
+```python
+def derive_submitted_limit_price(accepted_limit_price: Decimal, instrument) -> Decimal:
+    price_precision = instrument.price_precision
+    price_quantum = Decimal(10) ** -price_precision
+    submitted_limit_price = Decimal(str(accepted_limit_price)).quantize(
+        price_quantum,
+        rounding=ROUND_DOWN,
+    )
+    if submitted_limit_price <= 0 or submitted_limit_price > accepted_limit_price:
+        raise RuntimeError(
+            f"safe submitted limit price cannot be derived from cap {accepted_limit_price}"
+        )
+    return submitted_limit_price
+```
 
 **Branch in `_place_real_order`:**
+
+`_place_real_order` receives `submitted_limit_price` for `ORDER_TYPE=limit_ioc`. It must not receive only the raw EV cap and re-derive the submitted price locally; the submitted price was already rounded down once before Phase 5B depth estimation and must be passed through unchanged.
 
 ```python
 order_type = os.getenv("ORDER_TYPE")
@@ -1596,16 +1682,17 @@ if order_type == "market_ioc":
         time_in_force=TimeInForce.IOC,
     )
 elif order_type == "limit_ioc":
-    # limit_price was computed once during _make_trading_decision and passed
-    # through to this method as a parameter. Do NOT recompute it here — that
-    # would risk diverging from the value the EV gate accepted.
-    if limit_price is None:
-        return False  # _make_trading_decision already logged the no-edge reason
+    # submitted_limit_price was derived once before depth estimation and passed
+    # through unchanged. Do NOT recompute or re-round it here.
+    if submitted_limit_price is None or submitted_limit_price <= 0:
+        raise RuntimeError(
+            f"submitted_limit_price must be a positive Decimal for LIMIT_IOC, got {submitted_limit_price}"
+        )
 
-    # Token quantity at the WORST case (limit price). If fill price improves,
-    # we spend less than max_usd_amount. The conservative sizing means we
-    # never spend more than the budget; we may spend less.
-    raw_token_qty = Decimal(str(max_usd_amount)) / limit_price
+    # Token quantity at the WORST case (submitted limit price). If fill price
+    # improves, we spend less than max_usd_amount. The conservative sizing
+    # means we never spend more than the budget; we may spend less.
+    raw_token_qty = Decimal(str(max_usd_amount)) / submitted_limit_price
     size_precision = instrument.size_precision
     token_qty = raw_token_qty.quantize(
         Decimal(10) ** -size_precision,
@@ -1614,7 +1701,7 @@ elif order_type == "limit_ioc":
     if token_qty < Decimal("5"):
         logger.warning(
             f"LIMIT_IOC requires ≥5 tokens; "
-            f"budget=${max_usd_amount} / price={limit_price} = {token_qty} tokens "
+            f"budget=${max_usd_amount} / price={submitted_limit_price} = {token_qty} tokens "
             "after rounding to instrument size precision. "
             "Increase MARKET_BUY_USD or skip this trade."
         )
@@ -1623,7 +1710,8 @@ elif order_type == "limit_ioc":
     # the codebase. Direct Price(value, precision=...) / Quantity(value, precision=...)
     # constructors have not been verified to handle Decimal precision the same way.
     qty_str = format(token_qty, f".{size_precision}f")
-    price_str = format(limit_price, f".{instrument.price_precision}f")
+    price_precision = instrument.price_precision
+    price_str = format(submitted_limit_price, f".{price_precision}f")
     order = self.order_factory.limit(
         instrument_id=trade_instrument_id,
         order_side=OrderSide.BUY,
@@ -1635,11 +1723,11 @@ elif order_type == "limit_ioc":
     )
 ```
 
-**Sizing semantics (documented):** `token_qty = budget / limit_price` is conservative. The worst-case fill cost equals the budget. If actual fills happen at prices better than the limit, the spend will be less than the budget. This is intentional: never exceed the budget, but accept under-spending. If the operator wants "spend as close to $5 as possible," that's a different sizing rule (post-fill top-up) and is out of scope.
+**Sizing semantics (documented):** `token_qty = budget / submitted_limit_price` is conservative. The submitted price is rounded down from the accepted cap so the exchange order can never pay more than the price the EV path accepted. The worst-case fill cost equals the budget. If actual fills happen at prices better than the submitted limit, the spend will be less than the budget. This is intentional: never exceed the budget, but accept under-spending. If the operator wants "spend as close to $5 as possible," that's a different sizing rule (post-fill top-up) and is out of scope.
 
 **Token quantity is decimal, not integer.** Use `instrument.size_precision` from Nautilus' instrument metadata. Polymarket fills are decimal token quantities (e.g., `17.460316`). Any earlier wording in this document referring to "integer token count" is wrong and should be ignored — the correct phrasing is "decimal token quantity rounded down to `instrument.size_precision`."
 
-**Limit-price ownership:** `limit_price` is computed exactly **once** during `_make_trading_decision` (after the signal-confirmation gate, before the depth-aware EV gate that uses it). It is then passed as a parameter to `_place_real_order`. This avoids the previous-draft inconsistency where Phase 5 read `limit_price` inside `_make_trading_decision` while Phase 3 computed it again inside `_place_real_order` — same expression, but two independent computations risk divergence under refactoring. One owner, one value.
+**Limit-price ownership:** `limit_price` is computed exactly **once** during `_make_trading_decision` (after the signal-confirmation gate). The code then derives `submitted_limit_price` exactly once by rounding that BUY cap down to the allowed price precision before Phase 5B depth estimation. The depth-aware EV gate, token sizing, risk/free-collateral checks, pre-submit intent, and `_place_real_order` must all use that same submitted price. `_place_real_order` must not recompute or re-round it. This avoids the previous-draft inconsistency where Phase 5 read one limit price while Phase 3 submitted another — even a one-cent rounding-up difference can violate the accepted cap. One accepted cap, one safely rounded submitted price.
 
 **`LIMIT_REQUIRED_EDGE` validation at startup (strict range, no clamping):**
 
@@ -1756,7 +1844,7 @@ The current patch intercepts market BUY orders only. Limit orders need to flow t
 Per the repo's simulation rule, decision-only simulation/test_mode **cannot prove live-equivalent order submission**. To verify the wire format of limit orders before any live run:
 
 1. **Unit test with a mocked `py_clob_client`.** Build a test that constructs the limit order through `order_factory.limit(...)`, intercepts the patched execution path, and asserts that the mocked client's `create_order` (not `create_market_order`) is called with the expected `OrderArgs(token_id=..., price=Decimal("0.50"), size=Decimal("10"), side="BUY", expiration=...)` shape. Separately assert `post_order(signed_order, <mapped_order_type>)` receives the expected `FAK/FOK/GTC` mapping.
-2. **One deliberately tiny live smoke trade** after Phase 0 is closed: place one minimum allowed `$5.51` limit BUY at a moderate price, observe the actual Polymarket order record matches what we submitted (token quantity, limit price, IOC TIF).
+2. **One deliberately tiny live smoke trade** after Phase 0.7 recovery, mandatory Phase 3, and Phase 5B are closed: place one minimum allowed `$5.51` `ORDER_TYPE=limit_ioc` BUY at a moderate price, observe the actual Polymarket order record matches what we submitted (token quantity, limit price, IOC TIF).
 
 Do not use simulation mode for this verification. Decision-only simulation cannot exercise the wire format.
 
@@ -1764,18 +1852,33 @@ Do not use simulation mode for this verification. Decision-only simulation canno
 
 - Test: `ORDER_TYPE=market_ioc` builds market order with `quote_quantity=True`.
 - Test: `ORDER_TYPE=limit_ioc` with sufficient budget builds limit order with `quote_quantity=False` and correct `price`.
+- Test: `ORDER_TYPE=limit_ioc` with an EV-accepted BUY cap that is not exactly representable at instrument precision rounds the submitted price down, never up (e.g., cap `0.626` at 2 decimals submits `0.62`, not `0.63`), and depth/risk/pre-submit intent plus `_place_real_order` all use the same submitted price without local recomputation.
 - Test: `ORDER_TYPE=limit_ioc` with insufficient budget (token_qty < 5) returns False without submitting.
 - Test: missing `ORDER_TYPE` env var raises `RuntimeError` at startup.
 - Test: invalid `ORDER_TYPE` value raises `RuntimeError`.
+- Test: missing or invalid `ORDER_TYPE` raises `RuntimeError` at runtime if Redis flips from simulation to live after startup.
+- Test: missing, non-integer, zero, or negative `QUOTE_STABILITY_REQUIRED` raises `RuntimeError` in startup live validation and runtime live-order validation.
+- Test: configured `QUOTE_STABILITY_REQUIRED` values `1`, `2`, `3`, and `4` each require exactly that many consecutive valid quote ticks after market switch or quote-stability reset before live order placement can proceed.
+- Test: missing `LIMIT_IOC_FILL_POLICY` when `ORDER_TYPE=limit_ioc` raises `RuntimeError`.
+- Test: invalid `LIMIT_IOC_FILL_POLICY` when `ORDER_TYPE=limit_ioc` raises `RuntimeError`.
+- Test: `LIMIT_IOC_FILL_POLICY=partial_ok` is accepted with the verified `IOC -> FAK` wire behavior.
+- Test: `LIMIT_IOC_FILL_POLICY=all_or_nothing` fails closed while the verified wire behavior is `IOC -> FAK`; it can only pass after a deliberate FOK submission path is implemented and wire-format tested.
 
 ### Exit criteria
 
 - [ ] `ORDER_TYPE` required env var validated at startup.
+- [ ] `ORDER_TYPE` required env var validated again at every live order attempt, so Redis simulation→live flips cannot submit with missing or invalid order type.
+- [ ] `QUOTE_STABILITY_REQUIRED` required env var validated at startup and every live order attempt; normal live config sets it to `3`.
+- [ ] Hardcoded `QUOTE_STABILITY_REQUIRED = 3` is removed or replaced by a validated runtime value without adding an implicit default.
+- [ ] Quote-stability gate uses the configured threshold in actual live-order gating, including market-switch and quote-reset paths.
+- [ ] `LIMIT_IOC_FILL_POLICY` is required and enforced for `ORDER_TYPE=limit_ioc`; `partial_ok` is accepted under `FAK`, and `all_or_nothing` blocks startup until a verified FOK path exists.
 - [ ] Both code paths exist and are exercised by tests.
 - [ ] 5-token minimum guard prevents impossible limit orders.
-- [ ] `ORDER_TYPE=limit_ioc` is not enabled for routine live trading until Phase 5B limit-depth wiring is complete.
-- [ ] One minimum allowed `$5.51` live smoke trade with each order type confirms the wire format is right.
+- [ ] `ORDER_TYPE=limit_ioc` is implemented end-to-end and is the intended routine live configuration after Phase 5B limit-depth wiring is complete.
+- [ ] `ORDER_TYPE=market_ioc` remains available only through explicit configuration and is documented as accepting book-sweep price risk.
+- [ ] One minimum allowed `$5.51` live smoke trade with `ORDER_TYPE=limit_ioc` confirms the mandatory live-resume wire format is right. Any `market_ioc` smoke is a separate explicit operator-approved risk test, not a routine resume requirement.
 - [ ] README documents both modes and their trade-offs.
+- [ ] `.env.example` leaves `ORDER_TYPE` blank or commented instead of defaulting to `market_ioc`, includes `QUOTE_STABILITY_REQUIRED=3` as the normal explicit live value, and documents `LIMIT_IOC_FILL_POLICY=partial_ok` as the current FAK-compatible routine resume value that the operator must set deliberately.
 
 ### Effort
 
@@ -1783,9 +1886,9 @@ Do not use simulation mode for this verification. Decision-only simulation canno
 
 ---
 
-## Phase 4 — Calibration Validation (gate before Phase 4.5 and Phase 3)
+## Phase 4 — Calibration Validation (gate before scaling and strategy-policy changes)
 
-**Status:** Strategic. Prerequisite for trusting `LIMIT_IOC` to capture edge.
+**Status:** Strategic. Required before trusting profitability, scaling live size, or changing strategy timing/price-band policy. It is not a blocker for mandatory Phase 3 price-cap safety or Phase 5B limit-depth wiring.
 
 ### Why this matters
 
@@ -1973,7 +2076,7 @@ realized_return = sum_pnl_usd / sum_size_usd
 
 `win_rate - weighted_avg_entry_price` remains a probability-calibration diagnostic, but it is not the primary pass/fail metric for live profitability. Unweighted `win_rate` and simple average entry can be misleading once position sizes vary.
 
-**Three gates must all pass to clear Phase 3:**
+**Three gates must all pass before scaling live size or changing strategy timing/price-band policy:**
 
 1. **Dollar-weighted realized return is positive.** `sum_pnl_usd / sum_size_usd > 0` in at least one well-sampled bucket using net realized P&L. If the ledger's P&L calculation is later found not to include any fee component, add the explicit fee cost to the numerator before computing this metric; do not compare gross P&L to a net-profit gate.
 
@@ -1983,9 +2086,9 @@ realized_return = sum_pnl_usd / sum_size_usd
 
 **Decision:**
 
-- All three gates pass in ≥1 bucket with n ≥ 100: **proceed to Phase 4.5.** Phase 3 remains blocked until Phase 4.5 also clears the timing/price-band policy.
+- All three gates pass in ≥1 bucket with n ≥ 100: **proceed to Phase 4.5.** Mandatory Phase 3/5B price-cap safety can ship independently, but scaling and strategy-policy changes remain blocked until Phase 4.5 also clears the timing/price-band policy.
 - Realized-return gate passes but probability-edge CI lower bound is negative: **collect more data or investigate sizing effects.** The strategy may be profitable due to sizing/gating rather than calibrated confidence.
-- Realized-return gate passes but out-of-sample half is flat or negative: **no shippable edge.** The apparent edge is overfit. Don't ship `LIMIT_IOC` — the strategy needs signal-processor work.
+- Realized-return gate passes but out-of-sample half is flat or negative: **no shippable edge for scaling or policy loosening.** The apparent edge is overfit. Keep mandatory price-cap safety, but improve signal processors before increasing exposure or broadening eligibility.
 - Realized return is at or below zero across buckets: **no realized edge.** Same conclusion.
 - `win_rate < weighted_avg_entry_price` across buckets: **negative probability edge.** Stop the strategy and investigate even if a small realized-return sample looks positive.
 
@@ -1999,7 +2102,7 @@ The win-rate-alone gate (e.g., "70% confidence → 65% win rate") from earlier d
 - [ ] Calibration script exists and runs against **both** `live_trades.json` (Path A) **and** `decisions.jsonl` joined to Polymarket historical resolutions (Path B). Two separate analysis outputs, not one.
 - [ ] **Path A:** sample size **≥100** settled live trades in at least one confidence bucket. Reports `win_rate`, `weighted_avg_entry_price`, `realized_return = sum_pnl_usd / sum_size_usd`, and `win_rate - weighted_avg_entry_price`. (This is the same `n ≥ 100` threshold used by the three-gate rule in 4.3 — unified across the whole document.)
 - [ ] **Path B:** sample size ≥200 decision observations (including rejected) in at least one confidence bucket. Reports the same metrics computed from market resolutions, plus Brier score and log-loss across the full set.
-- [ ] **Decision documented with the numbers from both paths.** If Path A shows positive realized return but Path B shows the same confidence buckets are uncorrelated with outcomes (i.e., the gates are filtering on noise that happens to correlate with profitable trades), Phase 4.5 and Phase 3 are NOT cleared to ship — the apparent edge is in the gates or sizing, not the signal.
+- [ ] **Decision documented with the numbers from both paths.** If Path A shows positive realized return but Path B shows the same confidence buckets are uncorrelated with outcomes (i.e., the gates are filtering on noise that happens to correlate with profitable trades), scaling and strategy-policy changes are NOT cleared — the apparent edge is in the gates or sizing, not the signal. Mandatory Phase 3/5B price-cap safety remains required for live resume.
 
 ### Effort
 
@@ -2009,7 +2112,7 @@ The win-rate-alone gate (e.g., "70% confidence → 65% win rate") from earlier d
 
 ## Phase 4.5 — Strategy Timing and Price-Band Evaluation (no EV-gate loosening)
 
-**Status:** Strategic. Addresses the "late-window edge is gone" concern before changing order type or expanding live trade size.
+**Status:** Strategic. Addresses the "late-window edge is gone" concern before changing strategy timing/price-band policy or expanding live trade size.
 
 ### Current issue
 
@@ -2079,10 +2182,10 @@ If no candidate beats the baseline, keep the current `13_14` and `0.60/0.40` pol
 
 ## Phase 5 — Depth-Aware Fill Estimator (split into 5A / 5B)
 
-**Status:** Improvement. Split to remove the Phase 3/Phase 5 dependency loop.
+**Status:** Phase 5A shipped; Phase 5B is now a mandatory live-resume blocker because `ORDER_TYPE=limit_ioc` must evaluate executable liquidity at the same price cap it submits.
 
 - **Phase 5A:** market-depth estimator + selected-token book cache. Ships before Phase 3 and only wires the current `MARKET_IOC` path.
-- **Phase 5B:** limit-depth integration. Ships after Phase 3 introduces `ORDER_TYPE`, `limit_price`, and target-token sizing. `ORDER_TYPE=limit_ioc` is not enabled for routine live trading until 5B is complete.
+- **Phase 5B:** limit-depth integration. Ships after Phase 3 introduces `ORDER_TYPE`, `limit_price`, and target-token sizing. It must be complete before live trading resumes with `ORDER_TYPE=limit_ioc`.
 
 ### Motivation
 
@@ -2191,7 +2294,7 @@ def estimate_limit_ioc_fill(
     return vwap, total_tokens, total_cost, remaining_tokens <= 0
 ```
 
-**Caller behavior:** in `_make_trading_decision`, wrap the call in `try/except InvalidBookLevelError` and on error: log the error, refuse the trade (return False), and optionally trigger a `_block_live_settlement_ledger` if corruption persists. Never fall back to a partial book or a default price.
+**Caller behavior:** in `_make_trading_decision`, wrap the call in `try/except InvalidBookLevelError` and on error: log the error and refuse the trade (return False) with rejection reason `depth_aware_invalid_book_level`. Do not block the settlement ledger for bad market-data book input; settlement ledger blocks are reserved for submitted/fill/ledger state. Never fall back to a partial book or a default price.
 
 **Usage per order type (different semantics — DO NOT use one estimator for both):**
 
@@ -2225,51 +2328,72 @@ else:
     side_levels = self._latest_no_book["asks"]
 
 side_label = "NO" if direction == "short" else "YES"
+resolved_trade_usd = self._resolved_trade_usd_for_this_decision
 
 estimated_avg, tokens_filled, fully_filled = estimate_market_ioc_fill(
-    side_levels, POSITION_SIZE_USD
+    side_levels, resolved_trade_usd
 )
+if estimated_avg is None or tokens_filled <= 0:
+    logger.warning(f"MARKET_IOC: no executable {side_label} liquidity")
+    return False
 if not fully_filled:
     logger.warning(
-        f"MARKET_IOC: book too thin for full ${POSITION_SIZE_USD} {side_label} sweep — "
+        f"MARKET_IOC: book too thin for full ${resolved_trade_usd} {side_label} sweep — "
         f"only ${tokens_filled * estimated_avg:.2f} available"
     )
     return False
 executable_entry = estimated_avg
 ```
 
-**Phase 5B wiring (after Phase 3):** once Phase 3 introduces `ORDER_TYPE`, `limit_price`, and target-token sizing, replace the Phase 5A market-only call with an explicit order-type branch:
+**Phase 5B wiring (after Phase 3):** once Phase 3 introduces `ORDER_TYPE`, the EV-accepted `limit_price`, the safely rounded `submitted_limit_price`, and target-token sizing, replace the Phase 5A market-only call with an explicit order-type branch:
+
+`resolved_trade_usd` in this pseudocode is the exact per-decision budget passed to `_place_real_order` after fixed/percent sizing and risk checks. Do not re-read a module-level position-size constant inside the depth gate; otherwise Phase 2.5 percent sizing and Phase 5B liquidity checks can disagree about the order being evaluated.
 
 ```python
 if order_type == "market_ioc":
     estimated_avg, tokens_filled, fully_filled = estimate_market_ioc_fill(
-        side_levels, POSITION_SIZE_USD
+        side_levels, resolved_trade_usd
     )
+    if estimated_avg is None or tokens_filled <= 0:
+        logger.warning(f"MARKET_IOC: no executable {side_label} liquidity")
+        return False
     if not fully_filled:
         logger.warning(
-            f"MARKET_IOC: book too thin for full ${POSITION_SIZE_USD} {side_label} sweep — "
+            f"MARKET_IOC: book too thin for full ${resolved_trade_usd} {side_label} sweep — "
             f"only ${tokens_filled * estimated_avg:.2f} available"
         )
         return False
     executable_entry = estimated_avg
 elif order_type == "limit_ioc":
-    target_token_qty = Decimal(str(POSITION_SIZE_USD)) / limit_price
+    target_token_qty = Decimal(str(resolved_trade_usd)) / submitted_limit_price
+    worst_case_submitted_notional = target_token_qty * submitted_limit_price
     estimated_avg, tokens_filled, actual_cost, fully_filled = estimate_limit_ioc_fill(
-        side_levels, target_token_qty, max_price=limit_price
+        side_levels, target_token_qty, max_price=submitted_limit_price
     )
-    if not fully_filled:
+    if estimated_avg is None or tokens_filled <= 0:
         logger.warning(
-            f"LIMIT_IOC: insufficient {side_label} liquidity at price <= {limit_price} "
-            f"for {target_token_qty} target tokens — only {tokens_filled} fillable "
-            f"(actual cost would be ${actual_cost:.2f})"
+            f"LIMIT_IOC: no executable {side_label} liquidity at price <= {submitted_limit_price}"
         )
         return False
+    if limit_ioc_fill_policy == "all_or_nothing":
+        raise RuntimeError(
+            "LIMIT_IOC_FILL_POLICY=all_or_nothing requires verified FOK wire behavior; "
+            "current LIMIT+IOC wire behavior is FAK"
+        )
+    if limit_ioc_fill_policy == "partial_ok" and not fully_filled:
+        logger.warning(
+            f"LIMIT_IOC partial_ok: only {tokens_filled} of {target_token_qty} "
+            f"{side_label} tokens fillable at price <= {submitted_limit_price} "
+            f"(actual cost would be ${actual_cost:.2f})"
+        )
     executable_entry = estimated_avg
+    executable_cost = actual_cost
+    risk_notional = worst_case_submitted_notional
 else:
     raise RuntimeError(f"unexpected ORDER_TYPE after validation: {order_type!r}")
 ```
 
-The LIMIT_IOC path uses `target_token_qty` and reports the actual cost (which may be less than the budget) in the log. The EV gate downstream uses `executable_entry` (VWAP), which is the same field name as before — only the upstream computation differs by order type.
+The `LIMIT_IOC` path uses `target_token_qty` and reports the estimated executable cost (which may be less than the budget) in the log. Under `partial_ok`, positive executable liquidity may proceed to the EV gate using the estimated VWAP and estimated executable cost. Risk checks, free-collateral checks, pre-submit intent, and exposure reservation must still use the worst-case submitted notional (`target_token_qty * submitted_limit_price`, equivalent to `resolved_trade_usd` before quantization) because the exchange can fill the full submitted IOC limit quantity if liquidity changes before arrival. If quantization makes the worst-case submitted notional exceed the resolved budget, reject before submission. Under `all_or_nothing`, the bot must fail closed until true exchange-enforced FOK behavior exists. The EV gate downstream uses `executable_entry` (VWAP), which is the same field name as before — only the upstream computation differs by order type.
 
 #### 5.3 — Cache the book once per decision
 
@@ -2282,7 +2406,7 @@ Current state: `OrderBookImbalanceProcessor` fetches the book during signal proc
 
 - [ ] **Two estimators** exist with unit tests, NOT one unified helper: `estimate_market_ioc_fill(levels, usd_to_spend)` (budget-driven) and `estimate_limit_ioc_fill(levels, target_token_qty, max_price)` (token-driven). Book level units documented as token-quantity in both.
 - [ ] Phase 5A: EV gate uses estimated avg price from the **selected token's book** (YES for long, NO for short), not top-of-book, for `MARKET_IOC`.
-- [ ] Phase 5B: after Phase 3, `LIMIT_IOC` uses `estimate_limit_ioc_fill(...)`; `ORDER_TYPE=limit_ioc` remains disabled for routine live trading until this is wired and tested.
+- [ ] Phase 5B: after Phase 3, `LIMIT_IOC` uses `estimate_limit_ioc_fill(...)`; live resume is blocked until this is wired and tested.
 - [ ] Single YES book fetch and single NO book fetch per decision (no duplicate HTTP per side).
 - [ ] Test: synthetic book `[{"price": "0.62", "size": "10"}, {"price": "0.70", "size": "15"}]` (i.e., 10 tokens at $0.62 and 15 tokens at $0.70) with $10 budget. First level USD capacity = `0.62 × 10 = $6.20`, second level capacity needed = `$3.80 / 0.70 ≈ 5.43 tokens`. VWAP ≈ `$10 / (10 + 5.43) ≈ 0.6481`. Assert returned avg matches.
 - [ ] Test: empty book returns `fully_filled=False`.
@@ -2290,6 +2414,10 @@ Current state: `OrderBookImbalanceProcessor` fetches the book during signal proc
 - [ ] Test (market): `estimate_market_ioc_fill(asks, usd_to_spend=$10)` with book `[{"price": "0.62", "size": "10"}, {"price": "0.70", "size": "15"}]` returns VWAP ≈ 0.6481, `tokens_filled ≈ 15.43`, `fully_filled=True` — sweeps through both levels.
 - [ ] Test (limit, sufficient liquidity): `estimate_limit_ioc_fill(asks, target_token_qty=10, max_price=$0.50)` with book `[{"price": "0.40", "size": "10"}]` returns VWAP=$0.40, `tokens_filled=10`, `actual_cost=$4.00`, `fully_filled=True` — confirms the reviewer-flagged correctness case where USD budget would have under-counted.
 - [ ] Test (limit, price cap): `estimate_limit_ioc_fill(asks, target_token_qty=20, max_price=$0.62)` with book `[{"price": "0.62", "size": "10"}, {"price": "0.70", "size": "15"}]` returns `tokens_filled=10`, `fully_filled=False` (stops at the cap, doesn't sweep through to $0.70).
+- [ ] Test (limit submitted-price precision): an EV-accepted BUY cap such as `0.626` at 2-decimal price precision derives `submitted_limit_price=0.62`, and the depth estimator, token sizing, risk/free-collateral checks, pre-submit intent, and submitted Nautilus `Price.from_str` all use `0.62`.
+- [ ] Test (Phase 5B caller, `partial_ok`): with `ORDER_TYPE=limit_ioc`, `LIMIT_IOC_FILL_POLICY=partial_ok`, target 20 tokens, and only 10 tokens executable under the cap, the depth gate proceeds to EV evaluation using `estimated_avg` and `actual_cost`, while risk/free-collateral checks, pre-submit intent, and exposure reservation use worst-case submitted notional (`target_token_qty * submitted_limit_price` / `resolved_trade_usd`).
+- [ ] Test (Phase 5B caller, no executable liquidity): with `ORDER_TYPE=limit_ioc` and no asks at or below the limit price, the depth gate rejects before order submission.
+- [ ] Test (Phase 5B caller, `all_or_nothing` under current FAK mapping): startup/runtime validation fails closed before order submission.
 
 ### Effort
 
@@ -2403,7 +2531,7 @@ If operator wants finer-grained control later, Option B (Redis-backed risk confi
 
 ## Implementation Order
 
-Strict dependency order:
+Strict dependency order for the mandatory live-resume path:
 
 ```
 Phase 0 (lost-fill reconciliation + fill guards) ─────┐
@@ -2424,17 +2552,20 @@ Phase 0 (lost-fill reconciliation + fill guards) ─────┐
                                        Phase 5A (market-depth estimator + per-side book)
                                                       │
                                                       ▼
+                                       Phase 3 (ORDER_TYPE + quote stability)
+                                                      │
+                                                      ▼
+                                       Phase 5B (LIMIT_IOC depth integration)
+                                                      │
+                                                      ▼
+                                       Mandatory live-resume safety gate
+                                                      │
+                                                      ├── before scaling or strategy-policy changes
+                                                      ▼
                                        Phase 4 (calibration analysis)
                                                       │
                                                       ▼
                                        Phase 4.5 (strategy timing + price-band evaluation)
-                                                      │
-                                                      ├── if calibration + strategy-policy gates pass
-                                                      ▼
-                                       Phase 3 (ORDER_TYPE configurable: LIMIT_IOC)
-                                                      │
-                                                      ▼
-                                       Phase 5B (LIMIT_IOC depth integration)
                                                       │
                                                       ▼
                                        Phase 7.5 (multi-asset evaluation: ETH/SOL/XRP/...) ── NEW, operator-driven
@@ -2447,14 +2578,14 @@ Phase 0 (lost-fill reconciliation + fill guards) ─────┐
                                        Phase 7 (live reload — recommend: don't implement)
 ```
 
-Phase 2.4 must ship before Phase 2.5 because the dynamic sizing rejection gates are recorded through `decisions.jsonl`. Phase 2.5 then adds the percent-mode option after Phase 2 confirms the operator's fixed-mode sizing target. Phase 4.5 runs after baseline calibration because timing/price-band changes must be measured against the existing `13_14` and `0.60/0.40` policy without loosening the EV gate. Phase 7.5 is operator-driven evaluation only (no code in this phase) and gates whether Phase 8 deploys for BTC alone or for a wider asset set. Phase 8 follows Phase 7.5 so the deployment is built around the operator's final asset selection.
+Phase 2.4 must ship before Phase 2.5 because the dynamic sizing rejection gates are recorded through `decisions.jsonl`. Phase 2.5 then adds the percent-mode option after Phase 2 confirms the operator's fixed-mode sizing target. Phase 3 and Phase 5B are now on the mandatory live-resume path because live trading must support explicit `ORDER_TYPE=limit_ioc` with configured quote stability before routine use. Phase 4.5 runs after baseline calibration because timing/price-band changes must be measured against the existing `13_14` and `0.60/0.40` policy without loosening the EV gate; those strategic phases gate scaling and policy changes, not the mandatory price-cap safety implementation. Phase 7.5 is operator-driven evaluation only (no code in this phase) and gates whether Phase 8 deploys for BTC alone or for a wider asset set. Phase 8 follows Phase 7.5 so the deployment is built around the operator's final asset selection.
 
 ### Critical path
 
-- **Must ship before next live run:** Phase 0 (lost trade reconciled, fill guards in place).
+- **Must ship before next live run:** Phase 0.7 recovery fully resolved, Phase 0 fill guards in place, Phase 0.5a audit completed, Phase 5A selected-token depth available, mandatory Phase 3 `ORDER_TYPE` + `QUOTE_STABILITY_REQUIRED` wiring complete, Phase 5B `LIMIT_IOC` depth integration complete, and the live config explicitly set by the operator. For the current verified FAK path, routine resume requires the operator to set `ORDER_TYPE=limit_ioc`, `QUOTE_STABILITY_REQUIRED=3`, and `LIMIT_IOC_FILL_POLICY=partial_ok`.
 - **Phase 1 status:** Phase 1.1 (wire `SPIKE_THRESHOLD` / `DIVERGENCE_THRESHOLD` to env) is **runtime-behavior** code and DOES block live if the operator intends to tune via env. Phase 1.2 / 1.3 (README + `.env.example`) are documentation-only and do NOT block live. Effort table updated accordingly: Phase 1.1 blocks, 1.2/1.3 do not.
-- **Should ship before scaling trade size:** Phase 5A (market-depth estimator).
-- **Strategic decision gate:** Phase 4 must satisfy **all three** of the gates in 4.3 (dollar-weighted realized return, probability-edge CI cross-check, out-of-sample persistence) in at least one bucket with **n ≥ 100** Path A trades AND ≥200 Path B observations, and Phase 4.5 must show that the selected timing/price-band policy is at least as good as the current late-window baseline. A single positive bucket at small n is noise. The earlier "n ≥ 50" wording was inconsistent and is replaced everywhere with n ≥ 100. If calibration or Phase 4.5 fails, the fix is to improve signal processors or policy selection, not to change order type or loosen the EV gate.
+- **Should ship before scaling trade size:** Phase 4 calibration and Phase 4.5 timing/price-band evaluation.
+- **Strategic decision gate:** Phase 4 must satisfy **all three** of the gates in 4.3 (dollar-weighted realized return, probability-edge CI cross-check, out-of-sample persistence) in at least one bucket with **n ≥ 100** Path A trades AND ≥200 Path B observations, and Phase 4.5 must show that the selected timing/price-band policy is at least as good as the current late-window baseline. A single positive bucket at small n is noise. The earlier "n ≥ 50" wording was inconsistent and is replaced everywhere with n ≥ 100. If calibration or Phase 4.5 fails, the fix is to improve signal processors or policy selection, not to change order type or loosen the EV gate. Mandatory Phase 3/5B price-cap safety still remains part of live resume.
 
 ### Important caveat
 
@@ -2686,34 +2817,35 @@ operator → ssh server
 | 1.2-1.3. Env audit docs + `.env.example` | 0.25 day | Documentation | No (cleanup) |
 | 2. Sizing config + balance pre-flight | 10 min | Operator action | No (operator decision) |
 | 2.4. Structured `decisions.jsonl` writer | 0.5 day | Code | No (prerequisite for 2.5 + Phase 4 data) |
-| **2.5. Dynamic trade sizing + balance freshness (NEW)** | **2 days** | **Code (AccountState hook + sizing modes + stale-balance invalidation)** | **No (feature, operator-requested)** |
-| 5A. Market-depth estimator + selected-token book cache | 0.5 day | Code | No (improvement; prerequisite for Phase 3) |
-| 4. Calibration | 4h + elapsed time for data | Analysis | No (decision gate before Phase 4.5 + 3) |
+| **2.5. Dynamic trade sizing + balance freshness (NEW)** | **2 days** | **Code (AccountState hook + sizing modes + stale-balance invalidation)** | **No (operator-requested sizing enhancement)** |
+| 5A. Market-depth estimator + selected-token book cache | 0.5 day | Code | Yes - prerequisite for mandatory Phase 5B live safety |
+| 4. Calibration | 4h + elapsed time for data | Analysis | No (decision gate before scaling and strategy-policy changes) |
 | 4.5. Strategy timing + price-band evaluation | 0.5-1 day + elapsed observations | Code + analysis | No (decision gate; no live-policy change without approval) |
-| 3. ORDER_TYPE | 3 days | Code | No (feature, blocked by Phase 4 + 4.5) |
-| 5B. LIMIT_IOC depth integration | 0.5 day | Code | No (required before enabling `limit_ioc`) |
+| 3. ORDER_TYPE + quote stability | 3 days | Code | Yes - mandatory live-resume blocker |
+| 5B. LIMIT_IOC depth integration | 0.5 day | Code | Yes - mandatory before live `limit_ioc` |
 | **7.5. Multi-asset evaluation (NEW)** | **Operator-driven, no code** | **Decision** | **No (gates deployment scope)** |
 | 6. SOPS | 0.5 day | Code + ops | No (future) |
 | **8. Linux deployment (NEW)** | **1 day operator** | **Ops scaffolding** | **No (production deploy)** |
 | 7. Live reload | 0 days (Option C) | Docs only | No |
 
-**Minimum to resume live trading safely:** 3.25 days + Phase 0.5a audit time (Phase 0 + Phase 1.1).
+**Minimum to resume live trading safely:** Phase 0.7 recovery + Phase 0 fill guards + Phase 0.5a audit + Phase 5A selected-token depth + mandatory Phase 3 + Phase 5B limit-price order path + operator-explicit live config. For the current verified FAK path, routine resume requires `ORDER_TYPE=limit_ioc`, `QUOTE_STABILITY_REQUIRED=3`, and `LIMIT_IOC_FILL_POLICY=partial_ok`. Market-IOC-only live trading is no longer an approved resume state.
 
-**Recommended before scaling:** 6.5–8 days (add Phases 2.4 + 4 + 4.5 + 5A).
+**Recommended before scaling:** add Phases 2.4 + 4 + 4.5 after the mandatory live-resume path. Phase 5A is already in the minimum live-safety path, not a scaling-only add-on.
 
-**Full enhancement (limit orders + everything):** ~9.5–10 days plus calibration/observation windows.
+**Full enhancement (everything beyond mandatory limit-price safety):** remaining calibration/observation windows plus deployment hardening.
 
 ---
 
 ## Open Decisions Required From Operator
 
-1. **Trade size for live operation.** The intended normal config is `$55 / $385 / 7 positions / $110 daily loss`. The `$5.51 / $22.04` config is smoke-test-only after Phase 0, not the normal target.
+1. **Trade size for live operation.** The intended normal config is `$55 / $385 / 7 positions / $110 daily loss`. The `$5.51 / $22.04` config is smoke-test-only after Phase 0.7 recovery, mandatory Phase 3, and Phase 5B, not the normal target.
 2. **Wire or remove `STOP_LOSS_PCT` / `TAKE_PROFIT_PCT` / `SPIKE_THRESHOLD` / `DIVERGENCE_THRESHOLD`.** Recommendation: remove the first two, wire the latter two.
 3. **Calibration data source.** Are there ≥100 settled live trades available? If not, what's the data collection plan?
-4. **`ORDER_TYPE` for live mode.** Live mode requires an explicit value. No implicit default in code. `.env.example` should leave it blank or commented with both allowed values shown, so the operator must consciously choose `market_ioc` or `limit_ioc`. This matches the `AGENTS.md` no-silent-fallback rule.
-5. **`LIMIT_IOC` partial-fill policy.** Phase 3 is blocked until operator explicitly chooses `partial_ok` or `all_or_nothing`; there is no plan default.
-6. **Strategy timing/price-band policy.** After Phase 4.5 reports the baseline vs candidate windows/bands, operator must explicitly approve either "keep current `13_14` + `0.60/0.40`" or one exact replacement policy. No automatic switch based on analysis output.
-7. **SOPS adoption timeline.** Phase 6 is ready when the team's key management approach is decided.
+4. **`ORDER_TYPE` for live mode.** Live mode requires an explicit value. No implicit default in code. `.env.example` should leave it blank or commented with both allowed values shown, so the operator must consciously choose `market_ioc` or `limit_ioc`. Routine live operation should use `limit_ioc`; choosing `market_ioc` means the operator explicitly accepts book-sweep price risk. This matches the `AGENTS.md` no-silent-fallback rule.
+5. **`QUOTE_STABILITY_REQUIRED` for live mode.** Live mode requires an explicit positive integer. Normal live config is `QUOTE_STABILITY_REQUIRED=3`; changing it is an operator decision because it directly affects whether a submitted limit price was computed from a stable quote stream.
+6. **`LIMIT_IOC` partial-fill policy.** Live resume is blocked until operator explicitly chooses `partial_ok` or `all_or_nothing`; there is no plan default. This decision is mandatory before live resume because `limit_ioc` is now part of the minimum safety path.
+7. **Strategy timing/price-band policy.** After Phase 4.5 reports the baseline vs candidate windows/bands, operator must explicitly approve either "keep current `13_14` + `0.60/0.40`" or one exact replacement policy. No automatic switch based on analysis output.
+8. **SOPS adoption timeline.** Phase 6 is ready when the team's key management approach is decided.
 
 ---
 
@@ -2730,8 +2862,8 @@ The trade `BTC-15MIN-$11-1779093783343` is real on Polymarket but missing from t
 7. **Reconstruct the unknown record.** Run `venv/bin/python mark_settlement_resolved.py --create-unknown-from-external-order ...` per the Phase 0.7 command, using actual values (no placeholders).
 8. **Immediately resolve with verified payout.** Run `venv/bin/python mark_settlement_resolved.py --order-id ... --payout <verified> ...` **without waiting** for `auto_redeem` or the grace timeout. Polymarket does not replay missed websocket events; the market has already resolved; the bot will not receive any future `auto_redeem` for this trade.
 9. **Confirm no remaining unresolved entries.** The live-trading pause gate in `bot.py` uses **OR**, not AND, across all unresolved classes: any settled record with `needs_reconciliation is True` **OR** `settlement_source == "SETTLEMENT_UNKNOWN"`, any `pending_actual_fills` entry, any unresolved `submitted_order_intents` entry, or the in-memory `LEDGER_BLOCKED` marker. Inspect `live_trades.json` and process logs/metrics and confirm zero live-blocking unresolved states remain. A reconstructed-but-unresolved entry (which has both settled flags set) will still pause live; a partially-resolved entry that updated only one flag will also still pause live. Resolution must set `settlement_source` to a real value (e.g., `"manual_reconciliation"`) AND set `needs_reconciliation` to `false`, and all pending actual fills/submitted intents must be explicitly converted or resolved.
-10. **Smoke-test before resuming.** Start the bot in `--test-mode` to verify decision/test startup is not blocked by the live-only adapter guard. Verify the new adapter callback path with the Phase 0 unit/integration harness, then run one deliberately tiny allowed `$5.51` live trade and confirm the actual-fill side channel + ledger record + `auto_redeem` settlement all complete cleanly.
-11. **Then, and only then, resume normal live trading with the `$55 / $385 / 7 positions / $110 daily loss` config.**
+10. **Smoke-test before resuming.** Start the bot in `--test-mode` to verify decision/test startup is not blocked by the live-only adapter guard. Verify the new adapter callback path with the Phase 0 unit/integration harness. After mandatory Phase 3 and Phase 5B are complete, run one deliberately tiny allowed `$5.51` live smoke trade using `ORDER_TYPE=limit_ioc`, `QUOTE_STABILITY_REQUIRED=3`, and `LIMIT_IOC_FILL_POLICY=partial_ok`; confirm the actual-fill side channel + ledger record + `auto_redeem` settlement all complete cleanly. Any `market_ioc` smoke trade is a separate explicit operator-approved risk test and is not part of routine live resume.
+11. **Then, and only then, resume normal live trading with the `$55 / $385 / 7 positions / $110 daily loss` config and routine `ORDER_TYPE=limit_ioc`.**
 
 **Earlier contradictions resolved:**
 - The "recover before any other work" wording is dropped. The scaffold must ship before the zero-price guard, and the full adapter normalization must ship before recovery to prevent the next bad fill from re-creating the same problem during reconciliation.
