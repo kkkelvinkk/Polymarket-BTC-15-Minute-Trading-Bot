@@ -692,6 +692,36 @@ class SimulationModeSafetyTests(unittest.TestCase):
         self.assertAlmostEqual(float(vwap), 0.62, places=8)
         self.assertIsNone(rec.fields["rejected_at_gate"])
 
+    def test_compute_depth_aware_entry_market_ioc_records_explicit_cost(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=True,
+            )
+        )
+        rec = self.bot.DecisionRecord(current_price=None)
+        details = asyncio.run(
+            strategy._compute_depth_aware_entry_details(
+                side_token_id="TOKEN",
+                entry_source="YES ask",
+                position_size_usd=Decimal("10"),
+                top_of_book_entry=Decimal("0.62"),
+                rec=rec,
+                order_book={
+                    "bids": [],
+                    "asks": [
+                        {"price": "0.62", "size": "100"},
+                        {"price": "0.70", "size": "100"},
+                    ],
+                },
+            )
+        )
+
+        self.assertIsNotNone(details)
+        self.assertEqual(details.actual_cost, Decimal("10"))
+        self.assertIsNone(rec.fields["rejected_at_gate"])
+
     def test_compute_depth_aware_entry_fails_closed_on_missing_token_id(self):
         strategy = self._track_strategy(
             self.bot.IntegratedBTCStrategy(
@@ -1927,6 +1957,119 @@ class SimulationModeSafetyTests(unittest.TestCase):
         self.assertEqual(captured["direction"], "long")
         self.assertEqual(rec.fields["submitted_limit_price"], "0.62")
         self.assertEqual(rec.fields["limit_order_token_qty"], "8.887096")
+        self.assertEqual(rec.fields["estimated_tokens_filled"], Decimal("8.887096"))
+        self.assertEqual(rec.fields["estimated_actual_cost"], Decimal("5.50999952"))
+        self.assertTrue(rec.fields["depth_fully_filled"])
+
+    def test_decision_path_fails_closed_when_depth_actual_cost_is_missing(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+        strategy._stable_tick_count = 3
+        strategy.price_history = [Decimal("0.70")] * 20
+        strategy.instrument_id = "yes-instrument"
+        strategy._yes_instrument_id = "yes-instrument"
+        strategy._yes_token_id = "yes-token"
+        strategy._last_bid_ask = (Decimal("0.60"), Decimal("0.62"))
+
+        class _Instrument:
+            size_precision = 6
+            price_precision = 2
+            info = {}
+
+        class _Cache:
+            def instrument(self, _instrument_id):
+                return _Instrument()
+
+        strategy.cache = _Cache()
+        fused = types.SimpleNamespace(
+            source="Fusion",
+            direction=types.SimpleNamespace(value="bullish"),
+            score=77,
+            confidence=0.67,
+        )
+        strategy._process_signals = lambda _current_price, _metadata: [fused]
+        strategy.fusion_engine = types.SimpleNamespace(
+            fuse_signals=lambda _signals, min_signals, min_score: fused
+        )
+
+        async def _market_context(_current_price):
+            return {
+                "deviation": 0.0,
+                "momentum": 0.0,
+                "volatility": 0.0,
+                "tick_buffer": [],
+                "yes_token_id": "yes-token",
+                "yes_order_book": {
+                    "bids": [],
+                    "asks": [{"price": "0.62", "size": "20"}],
+                },
+            }
+
+        async def _bad_depth_entry(**_kwargs):
+            return self.bot.DepthAwareEntry(
+                executable_entry=Decimal("0.62"),
+                tokens_filled=Decimal("8.887096"),
+                actual_cost=None,
+                fully_filled=True,
+            )
+
+        async def _unexpected_place(*_args, **_kwargs):
+            raise AssertionError("order placement must not run with missing actual_cost")
+
+        strategy._fetch_market_context = _market_context
+        strategy._compute_depth_aware_entry_details = _bad_depth_entry
+        strategy._place_real_order = _unexpected_place
+        now = datetime.now(timezone.utc)
+        strategy._current_market_metadata = lambda: {
+            "slug": "slug-decision-missing-cost",
+            "condition_id": "condition-decision-missing-cost",
+            "yes_token_id": "yes-token",
+            "no_token_id": "no-token",
+            "start_time": (now - timedelta(minutes=15)).isoformat(),
+            "end_time": (now + timedelta(minutes=15)).isoformat(),
+        }
+
+        original_values = {
+            key: os.environ.get(key)
+            for key in (
+                "MARKET_BUY_USD",
+                "ORDER_TYPE",
+                "QUOTE_STABILITY_REQUIRED",
+                "MIN_SIGNAL_CONFIDENCE",
+                "EV_FEE_BUFFER",
+                "EV_SPREAD_BUFFER",
+            )
+        }
+        try:
+            os.environ["MARKET_BUY_USD"] = "5.51"
+            os.environ["ORDER_TYPE"] = "market_ioc"
+            os.environ["QUOTE_STABILITY_REQUIRED"] = "3"
+            os.environ["MIN_SIGNAL_CONFIDENCE"] = "0.60"
+            os.environ["EV_FEE_BUFFER"] = "0.005"
+            os.environ["EV_SPREAD_BUFFER"] = "0.01"
+            rec = self.bot.DecisionRecord(current_price=Decimal("0.70"))
+            with self.assertRaisesRegex(RuntimeError, "actual_cost must be explicit"):
+                asyncio.run(
+                    strategy._make_trading_decision_body(
+                        Decimal("0.70"),
+                        trade_key=("unit", 1),
+                        is_simulation=False,
+                        rec=rec,
+                    )
+                )
+        finally:
+            for key, value in original_values.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.assertIsNone(rec.fields["estimated_actual_cost"])
 
     def test_fetch_market_context_uses_market_metadata_yes_token_for_order_book(self):
         strategy = self._new_strategy()

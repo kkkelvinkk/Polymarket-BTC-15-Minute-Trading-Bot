@@ -346,9 +346,7 @@ class GrafanaMetricsExporter:
             if exec_stats:
                 # Update counters if needed
                 pass
-            
-            logger.debug("Metrics updated successfully")
-            
+
         except Exception as e:
             logger.error(f"Error updating metrics: {e}")
     

@@ -307,6 +307,65 @@ live-equivalent order submission, fill tracking, settlement ledger writes,
 `PENDING` and must not be used as a win-rate or P&L source until a separate
 live-equivalent paper execution engine is implemented.
 
+### Decision/paper observation result estimates
+
+`decisions.jsonl` does not store the final market outcome at decision time,
+because the BTC 15-minute market is normally still open when the decision is
+recorded. It stores the join keys and decision-side estimate instead:
+
+- `slug`
+- `condition_id`
+- `yes_token_id` / `no_token_id`
+- `decided_direction`
+- `executable_entry`
+- `estimated_tokens_filled`
+- `estimated_actual_cost`
+- `depth_fully_filled`
+
+`estimate_decision_results.py` resolves the final outcome later by fetching the
+closed Polymarket Gamma market for each logged `slug`. It maps `Yes`/`Up` to
+`long`, maps `No`/`Down` to `short`, keeps still-open markets as `PENDING`, and
+fails closed if a closed market does not have exactly one winning outcome.
+
+For quick observation, use simulation/test mode, not `--live`. Example `.env`
+settings:
+
+```env
+ORDER_TYPE=limit_ioc
+QUOTE_STABILITY_REQUIRED=1
+LIMIT_REQUIRED_EDGE=0.05
+LIMIT_IOC_FILL_POLICY=partial_ok
+EV_FEE_BUFFER=0.005
+EV_SPREAD_BUFFER=0.01
+```
+
+Run:
+
+```bash
+venv/bin/python bot.py --test-mode
+```
+
+Observe raw decision records:
+
+```bash
+tail -f decisions.jsonl
+tail -f paper_trades.json
+venv/bin/python view_paper_trades.py
+```
+
+After one or more observed markets have closed, estimate resolved win/loss:
+
+```bash
+venv/bin/python estimate_decision_results.py decisions.jsonl --stake-usd 5.51
+```
+
+This report is an estimate only. It uses the logged decision-side estimated fill
+size/cost and the later Gamma outcome. It excludes real order submission
+failures, live fill drift, fees, settlement timing, ledger repair paths, and
+realized live P&L accounting. Older decided records that do not include
+`estimated_tokens_filled` and `estimated_actual_cost` are not suitable for this
+estimator.
+
 For Polymarket's current deposit-wallet flow, `POLYMARKET_PK` is the private key for the signer wallet and `POLYMARKET_FUNDER` is the Polymarket deposit wallet address. Do not guess the funder address from MetaMask; discover it from Polymarket:
 
 ```bash

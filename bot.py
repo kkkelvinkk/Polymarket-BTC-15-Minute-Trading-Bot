@@ -149,7 +149,7 @@ TERMINAL_NO_FILL_INTENT_STATUSES = frozenset(
 class DepthAwareEntry:
     executable_entry: Decimal
     tokens_filled: Decimal
-    actual_cost: Optional[Decimal]
+    actual_cost: Decimal
     fully_filled: bool
 
 
@@ -4739,7 +4739,14 @@ class IntegratedBTCStrategy(Strategy):
         if depth_entry is None:
             return False
         executable_entry = depth_entry.executable_entry
-        rec.update(executable_entry=executable_entry)
+        if depth_entry.actual_cost is None:
+            raise RuntimeError("depth-aware entry actual_cost must be explicit")
+        rec.update(
+            executable_entry=executable_entry,
+            estimated_tokens_filled=depth_entry.tokens_filled,
+            estimated_actual_cost=depth_entry.actual_cost,
+            depth_fully_filled=depth_entry.fully_filled,
+        )
 
         # This is a heuristic confidence filter, not a calibrated EV model.
         # The processor confidence values are not yet trained settlement probabilities.
@@ -4976,7 +4983,7 @@ class IntegratedBTCStrategy(Strategy):
             return DepthAwareEntry(
                 executable_entry=vwap,
                 tokens_filled=tokens_filled,
-                actual_cost=None,
+                actual_cost=position_size_usd,
                 fully_filled=fully_filled,
             )
 
