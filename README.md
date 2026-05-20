@@ -36,7 +36,7 @@ A production-grade algorithmic trading bot for **Polymarket's 15-minute BTC pric
 |---------|-------------|
 | **7-Phase Architecture** | Modular, testable, production-ready design |
 | **Multi-Signal Intelligence** | Spike Detection, Sentiment Analysis, Price Divergence |
-| **Risk-First Design** | $1 max per trade, 30% stop loss, 20% take profit |
+| **Risk-First Design** | Strict live size gate, explicit `limit_ioc` order config, exposure caps, and settlement reconciliation pause |
 | **Explicit Mode Operation** | Simulation observes decisions; live startup requires Redis control |
 | **Real-Time Monitoring** | Grafana dashboards + Prometheus metrics |
 | **Self-Learning** | Automatically optimizes signal weights based on performance |
@@ -63,7 +63,7 @@ A production-grade algorithmic trading bot for **Polymarket's 15-minute BTC pric
     end
     
     subgraph Output[OUTPUT]
-        R[Risk Management<br/>$1 Max, Stop Loss]
+        R[Risk Management<br/>Size Gate, Exposure Caps]
         E[Execution<br/>Polymarket Orders]
         M[Monitoring<br/>Grafana Dashboard]
         L[Learning<br/>Weight Optimization]
@@ -143,6 +143,12 @@ LIVE_SETTLEMENT_GRACE_SECONDS=3600
 REQUIRE_AUTO_REDEEM_TOKEN_HINT=true
 LIVE_TRADE_LEDGER_PATH=live_trades.json
 POLYGON_RPC_URL=https://your-polygon-rpc.example
+
+# Live order type. Routine live resume should use limit_ioc.
+ORDER_TYPE=limit_ioc
+QUOTE_STABILITY_REQUIRED=3
+LIMIT_REQUIRED_EDGE=0.05
+LIMIT_IOC_FILL_POLICY=partial_ok
 ```
 
 Boolean flags accept only explicit values: `true`, `false`, `1`, `0`, `yes`,
@@ -161,7 +167,7 @@ The following were previously listed but are not read by the bot. Setting them i
 
 ### Live startup gates
 
-`--live` enforces two startup gates before any Nautilus node is built:
+`--live` enforces three startup gates before any Nautilus node is built:
 
 1. **Strict minimum trade size.** `MARKET_BUY_USD > 5.50` is required (the
    comparison is strict — `5.50` is blocked, `5.51` is the smoke-test minimum).
@@ -170,16 +176,30 @@ The following were previously listed but are not read by the bot. Setting them i
    also blocked. Missing, malformed, non-finite, zero, negative, or `<= 5.50`
    values abort startup before the Nautilus node starts.
 
-   The same check runs again before any live order is submitted. This protects
-   against Redis-driven sim→live transitions: a process started in simulation
-   that later flips to live via Redis would otherwise bypass the startup gate.
-   At the runtime call site the gate **rejects the individual trade
-   (fail-closed)** rather than aborting the process, so the trading loop
+   The same check runs again before any live order is submitted. Runtime
+   validation protects live-enabled processes if the environment changes after
+   startup or a nonstandard call path reaches order submission; a process
+   launched without `--live` is simulation-only and cannot later become live
+   through Redis. At the runtime call site the gate **rejects the individual
+   trade (fail-closed)** rather than aborting the process, so the trading loop
    continues evaluating decisions but no live order is submitted. If you see
    repeated "LIVE ORDER BLOCKED: MARKET_BUY_USD must be greater than 5.50"
    log lines, fix `MARKET_BUY_USD` and restart.
 
-2. **Explicit live confirmation.** `--live` alone prompts the operator to type
+2. **Explicit order configuration.** Order-capable runs require `ORDER_TYPE`
+   and `QUOTE_STABILITY_REQUIRED`; live mode validates them before building the
+   Nautilus node and the strategy validates them again at every decision.
+   Routine live resume should use
+   `ORDER_TYPE=limit_ioc`, `QUOTE_STABILITY_REQUIRED=3`,
+   `LIMIT_REQUIRED_EDGE=0.05`, and `LIMIT_IOC_FILL_POLICY=partial_ok`.
+   The bot enforces `LIMIT_REQUIRED_EDGE >= EV_FEE_BUFFER + EV_SPREAD_BUFFER`
+   so the limit cap and EV gate are configured consistently.
+   `market_ioc` remains available only when the operator explicitly accepts
+   book-sweep price risk. The current `limit_ioc` path uses Nautilus
+   `TimeInForce.IOC`, which maps to Polymarket FAK, so `all_or_nothing` is
+   blocked until a verified FOK submission path exists.
+
+3. **Explicit live confirmation.** `--live` alone prompts the operator to type
    exactly the literal `LIVE` (case sensitive, no whitespace tolerance). Pass
    `--live --confirm-live` to skip the prompt for unattended startup (systemd,
    cron, Docker without `-it`, etc.). `--confirm-live` without `--live` is
@@ -348,13 +368,15 @@ bash
 python view_paper_trades.py
 ```
 ## Trading Modes
-Switch Modes Without Restarting (Redis)
+Redis controls the active mode only inside a live-enabled `--live` process.
+A process launched without `--live` is simulation-only and cannot become live
+through Redis; restart with `--live` for real order submission.
 
-# Switch to simulation mode (safe)
+# Pause a live-enabled process into simulation mode (safe)
 ```
 python redis_control.py sim -- not stable yet
 ```
-# Switch to live trading mode (REAL MONEY!)
+# Resume live trading inside a live-enabled process (REAL MONEY!)
 ```
 python redis_control.py live --not stable yet
 ``` 
@@ -386,7 +408,7 @@ polymarket-btc-15m-bot/
 ├── execution/                   # Phase 5: Order placement & risk control
 │   ├── execution_engine.py      # Main order execution coordinator
 │   ├── polymarket_client.py     # Polymarket API wrapper & order logic
-│   └── risk_engine.py           # Position sizing, SL/TP, exposure limits
+│   └── risk_engine.py           # Position sizing and exposure limits
 │
 ├── monitoring/                  # Phase 6: Performance tracking & metrics
 │   ├── grafana_exporter.py      # Prometheus metrics exporter
@@ -410,7 +432,7 @@ polymarket-btc-15m-bot/
 ├── .env.example                 # Template for environment variables
 ├── .gitignore
 ├── patch_gamma_markets.py       # Temporary patch/fix for Polymarket API
-├── redis_control.py             # Switch trading mode (sim/live/test)
+├── redis_control.py             # Runtime mode control for live-enabled runs
 ├── requirements.txt             # Python dependencies
 ├── bot.py                       # Main bot entry point
 ├── 15m_bot_runner.py            # Auto-restart wrapper for bot.py
@@ -458,7 +480,9 @@ Open a Pull Request
 ## ❓ FAQ
 
 **Q: How much money do I need to start?**  
-**A:** The bot caps each trade at $1, so you can start with as little as $10–20.
+**A:** Live mode requires `MARKET_BUY_USD > 5.50`. Use `$5.51` only for the
+first smoke test; normal live sizing should follow the plan/config, currently
+the `$55` per-trade target.
 
 **Q: Is this profitable?**  
 **A:** No claim is made from simulation records. Current simulation is

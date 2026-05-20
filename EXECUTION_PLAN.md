@@ -281,7 +281,7 @@ Phase 0.3 must also tighten live-start control before any adapter-patched live o
    Current MARKET_BUY_USD=<value>. Increase it to at least 5.51 or run without --live.
    ```
 
-   This check must not be bypassed by Redis mode switching or any later live-execution transition. If the process starts in observation/simulation and later attempts to enable live execution, the same `MARKET_BUY_USD > 5.50` gate must run before the first live order can be submitted. Do not add an alternate size default or automatic resize.
+   This check must not be bypassed by Redis mode switching inside a live-enabled process or by any nonstandard live-submission call path. A process launched without live execution enabled remains simulation-only; every path that can submit a live order must still run the same `MARKET_BUY_USD > 5.50` gate before the first live order. Do not add an alternate size default or automatic resize.
 
 2. **Explicit non-interactive live confirmation flag.** Keep the current manual `LIVE` typing requirement for `--live` by default. Add exactly one command-line-only argument, `--confirm-live`, that means "the operator intentionally accepts live startup for this invocation" and skips the interactive prompt.
 
@@ -297,7 +297,7 @@ Acceptance criteria:
 - [ ] `venv/bin/python bot.py --live` with `MARKET_BUY_USD=5.51` still requires typing `LIVE`.
 - [ ] `venv/bin/python bot.py --live --confirm-live` with `MARKET_BUY_USD=5.51` starts without the interactive prompt.
 - [ ] `venv/bin/python bot.py --confirm-live` fails argument parsing because `--live` was not supplied.
-- [ ] Any Redis-driven transition into live execution enforces the same minimum trade-size gate before submitting a live order.
+- [ ] Any live-enabled Redis mode change, environment change after startup, or nonstandard live-submission path enforces the same minimum trade-size gate before submitting a live order.
 
 **Exact adapter hook point (no more "patch order-status report normalization" ambiguity):**
 
@@ -648,7 +648,7 @@ Do **not** rely on hand-editing `venv/` as the durable fix. The repo must provid
 
 The implementation PR must choose exactly one of those two durability mechanisms and document the choice. Do not implement a runtime fallback from one mechanism to the other.
 
-Decision/test-mode startup should not be blocked by this live adapter guard, because no live execution client is allowed to submit orders in those modes. Live mode must still fail before Redis can switch the strategy into live trading if the UUID guard detects a reachable fallback path.
+Decision/test-mode startup should not be blocked by this live adapter guard, because no live execution client is allowed to submit orders in those modes. Live mode must still fail before any live-enabled process can submit orders if the UUID guard detects a reachable fallback path.
 
 Because `pip install -r requirements.txt`, venv recreation, or Nautilus upgrades can erase direct site-packages edits, Phase 0 is not complete until this guard is applied from tracked repo code or verified at startup.
 
@@ -1181,7 +1181,7 @@ Add a clear table in README distinguishing per-decision-read vs startup-read env
 - [ ] README has a "Environment Variables" section with per-decision-read vs startup-read clearly marked.
 - [ ] README explicitly states that editing `.env` does not propagate at runtime — restart required.
 - [ ] `SPIKE_THRESHOLD` / `DIVERGENCE_THRESHOLD` wired or struck from docs.
-- [ ] `STOP_LOSS_PCT` / `TAKE_PROFIT_PCT` struck from docs with a note explaining why they're not implemented.
+- [x] `STOP_LOSS_PCT` / `TAKE_PROFIT_PCT` struck from docs with a note explaining why they're not implemented.
 
 ### Effort
 
@@ -1577,16 +1577,19 @@ The current `patch_market_orders.py` only handles the market BUY USD-amount path
 
 ### 3.3 — Implementation
 
-**Env var (required in live mode, no default):**
+**Env vars (required for order-capable runs, no implicit defaults):**
 
 ```env
-# Required in live mode. No implicit default. Bot refuses to start in live mode without this.
+# Required for order-capable runs. No implicit default in code.
 # Allowed values: market_ioc | limit_ioc
-ORDER_TYPE=
+ORDER_TYPE=limit_ioc
 
-# Required in live mode. No implicit default. Normal value: 3.
-# Number of consecutive valid quote ticks required before live order placement.
+# Required for order-capable runs. No implicit default in code. Normal value: 3.
+# Number of consecutive valid quote ticks required before order decisions proceed.
 QUOTE_STABILITY_REQUIRED=3
+
+# Required when ORDER_TYPE=limit_ioc. No implicit default.
+LIMIT_REQUIRED_EDGE=0.05
 
 # Required when ORDER_TYPE=limit_ioc. No implicit default.
 # Allowed values: partial_ok | all_or_nothing
@@ -1599,13 +1602,13 @@ Operational policy: after Phase 3 + Phase 5B ship, routine live operation should
 
 Quote-stability policy: `QUOTE_STABILITY_REQUIRED` is tied to the limit-price safety path. The bot may only call `_place_real_order` after the current market has produced at least this many consecutive valid quote ticks after the latest market switch or quote-stability reset. For `ORDER_TYPE=limit_ioc`, this prevents submitting a price cap that was computed from a one-off or just-reset quote stream. For `ORDER_TYPE=market_ioc`, this preserves the existing protection against trading immediately after a market switch.
 
-**Validation in `run_integrated_bot` at startup AND at every live trade decision:**
+**Validation in `run_integrated_bot` at startup AND at every order decision/live trade attempt:**
 
 ```python
 def _validate_order_type_for_live() -> str:
     order_type = os.getenv("ORDER_TYPE")
     if not order_type:
-        raise RuntimeError("ORDER_TYPE must be set to 'market_ioc' or 'limit_ioc' for live trading")
+        raise RuntimeError("ORDER_TYPE must be set to 'market_ioc' or 'limit_ioc'")
     if order_type not in {"market_ioc", "limit_ioc"}:
         raise RuntimeError(f"ORDER_TYPE must be 'market_ioc' or 'limit_ioc', got {order_type!r}")
     return order_type
@@ -1613,7 +1616,7 @@ def _validate_order_type_for_live() -> str:
 def _validate_quote_stability_required_for_live() -> int:
     raw = os.getenv("QUOTE_STABILITY_REQUIRED")
     if not raw:
-        raise RuntimeError("QUOTE_STABILITY_REQUIRED must be set to a positive integer for live trading")
+        raise RuntimeError("QUOTE_STABILITY_REQUIRED must be set to a positive integer")
     try:
         required = int(raw)
     except ValueError as exc:
@@ -1639,12 +1642,12 @@ def _validate_limit_ioc_fill_policy_for_live(order_type: str) -> str | None:
     return policy
 ```
 
-- **Startup check:** `run_integrated_bot` calls this when `simulation=False`.
-- **Runtime check:** `_place_real_order` ALSO calls these validators on every live trade. This is required because the bot supports Redis-based mode switching (operator can flip sim→live at runtime). If `ORDER_TYPE`, `QUOTE_STABILITY_REQUIRED`, or the required `LIMIT_IOC_FILL_POLICY` for `limit_ioc` was missing/invalid at startup in simulation mode but the Redis flag flips to live, the runtime check must refuse the trade before any order submission.
+- **Startup check:** `run_integrated_bot` calls this for every bot run that processes quote-driven order decisions, including simulation/decision-observation runs. This keeps the pre-submit decision gates using the same order-type, quote-stability, limit-edge, and EV-buffer validation as live.
+- **Runtime check:** `_place_real_order` ALSO calls these validators on every live trade. This is defense-in-depth against environment changes after startup or nonstandard call paths reaching live order submission. A process launched without live execution enabled is simulation-only and cannot flip live through Redis, but any live submission path must still refuse missing or invalid `ORDER_TYPE`, `QUOTE_STABILITY_REQUIRED`, or `LIMIT_IOC_FILL_POLICY` before an order is submitted.
 
-**No default in any mode.** The previous draft suggested simulation/test mode could default to `market_ioc` — that is a fallback and is now removed. If no live order will be placed, `ORDER_TYPE`, `QUOTE_STABILITY_REQUIRED`, and `LIMIT_IOC_FILL_POLICY` are simply unused. Any test that exercises live order construction or live quote-stability gating must set the relevant env vars explicitly.
+**No default in any mode.** The previous draft suggested simulation/test mode could default to `market_ioc` — that is a fallback and is now removed. Any bot run or test that exercises quote-driven order decisions, live order construction, or quote-stability gating must set the relevant env vars explicitly. Pure helper/unit tests that do not construct the strategy or process order decisions may leave them unset.
 
-Non-live behavior must be explicit: quote tick counting may still update in simulation/test mode, but the live submission gate must not read an uninitialized `_quote_stability_required` value. Only live mode and tests that intentionally exercise live quote-stability gating construct the strategy with a validated threshold. Decision-observation or test paths that do not place live orders must not mark a market as live-submission-ready based on an implicit simulation threshold.
+Non-live behavior must be explicit: quote tick counting may still update in simulation/test mode, but the gate must not read an uninitialized `_quote_stability_required` value. Simulation/decision-observation paths that process quote-driven decisions construct the strategy with a validated threshold and order type, but they remain decision/paper-observation only: they do not model fills, settlement, ledger accounting, or P&L, and must not be represented as live-equivalent trade simulation.
 
 Quote-stability wiring requirement: the validated value must be stored on the strategy (for example `self._quote_stability_required`) and the quote handler must compare `self._stable_tick_count >= self._quote_stability_required`. Runtime validation inside `_place_real_order` is not enough, because `_market_stable` may have been set earlier under a different threshold. `_place_real_order` must also fail closed if `self._stable_tick_count` is below the validated live threshold at submission time.
 
@@ -1667,7 +1670,7 @@ def derive_submitted_limit_price(accepted_limit_price: Decimal, instrument) -> D
 
 **Branch in `_place_real_order`:**
 
-`_place_real_order` receives `submitted_limit_price` for `ORDER_TYPE=limit_ioc`. It must not receive only the raw EV cap and re-derive the submitted price locally; the submitted price was already rounded down once before Phase 5B depth estimation and must be passed through unchanged.
+`_place_real_order` receives both `accepted_limit_price` and `submitted_limit_price` for `ORDER_TYPE=limit_ioc`. It must not receive only the raw EV inputs and re-derive or re-round the submitted price locally; the submitted price was already rounded down once before Phase 5B depth estimation and must be passed through unchanged. The submit boundary only verifies `submitted_limit_price <= accepted_limit_price`, exact venue precision, and worst-case notional.
 
 ```python
 order_type = os.getenv("ORDER_TYPE")
@@ -1752,7 +1755,7 @@ def _get_validated_limit_required_edge() -> Decimal:
     return value
 ```
 
-Called once during `run_integrated_bot` when `ORDER_TYPE=limit_ioc`, and the resolved `Decimal` is stored on the strategy as `self._limit_required_edge`.
+Validated during order-config validation when `ORDER_TYPE=limit_ioc`; the resolved `Decimal` feeds the decision path that computes `accepted_limit_price`.
 
 **`_compute_limit_price` helper (returns Optional, rejects without clamping):**
 
@@ -1806,7 +1809,7 @@ In effect:
 - `LIMIT_REQUIRED_EDGE` reserves room *above* what we're willing to pay at the order level.
 - `EV_FEE_BUFFER + EV_SPREAD_BUFFER` add the realized-cost buffer that the entry price plus fees must still leave room under confidence.
 
-These are **not** the same number and they are **not** double-counted. `LIMIT_REQUIRED_EDGE` is gross edge above order-placement cap; EV buffers are applied to the actual executable entry separately. The operator should set `LIMIT_REQUIRED_EDGE ≥ EV_FEE_BUFFER + EV_SPREAD_BUFFER` so that orders that pass the limit step also have a reasonable chance of passing the EV gate, but the two checks are independent gates and the bot enforces both.
+These are **not** the same number and they are **not** double-counted. `LIMIT_REQUIRED_EDGE` is gross edge above order-placement cap; EV buffers are applied to the actual executable entry separately. The bot enforces `LIMIT_REQUIRED_EDGE ≥ EV_FEE_BUFFER + EV_SPREAD_BUFFER` so that the limit cap cannot drift below the EV-gate buffer requirement.
 
 Example with `fused.confidence = 0.78`, `LIMIT_REQUIRED_EDGE = 0.05`, `EV_FEE_BUFFER = 0.005`, `EV_SPREAD_BUFFER = 0.01`:
 - `limit_price = 0.78 - 0.05 = 0.73` → order placed at price ≤ 0.73
@@ -1820,7 +1823,7 @@ Same example but `LIMIT_REQUIRED_EDGE = 0.01` (tighter):
 - `limit_price = 0.78 - 0.01 = 0.77`. Suppose fill VWAP at 0.77.
 - `breakeven_confidence = 0.77 + 0.015 = 0.785` → check `0.78 < 0.785`? Yes. **EV gate rejects.**
 
-So setting `LIMIT_REQUIRED_EDGE < EV_FEE_BUFFER + EV_SPREAD_BUFFER` produces orders that pass the limit step but get rejected by the EV gate every time. Operator should configure with `LIMIT_REQUIRED_EDGE ≥ EV_FEE_BUFFER + EV_SPREAD_BUFFER` for the two to be self-consistent. The plan does not enforce this at startup (the operator may intentionally want the asymmetry for diagnostic purposes), but the README should document the relationship.
+So setting `LIMIT_REQUIRED_EDGE < EV_FEE_BUFFER + EV_SPREAD_BUFFER` produces orders that pass the limit step but get rejected by the EV gate every time. The bot must enforce `LIMIT_REQUIRED_EDGE ≥ EV_FEE_BUFFER + EV_SPREAD_BUFFER` at startup and at runtime for `ORDER_TYPE=limit_ioc`; diagnostic asymmetry is not allowed on an order-capable path.
 
 ```python
 def _get_required_env_decimal(name: str) -> Decimal:
@@ -1856,7 +1859,7 @@ Do not use simulation mode for this verification. Decision-only simulation canno
 - Test: `ORDER_TYPE=limit_ioc` with insufficient budget (token_qty < 5) returns False without submitting.
 - Test: missing `ORDER_TYPE` env var raises `RuntimeError` at startup.
 - Test: invalid `ORDER_TYPE` value raises `RuntimeError`.
-- Test: missing or invalid `ORDER_TYPE` raises `RuntimeError` at runtime if Redis flips from simulation to live after startup.
+- Test: missing or invalid `ORDER_TYPE` raises `RuntimeError` at runtime for live-enabled Redis mode changes, environment changes after startup, or nonstandard live-submission call paths.
 - Test: missing, non-integer, zero, or negative `QUOTE_STABILITY_REQUIRED` raises `RuntimeError` in startup live validation and runtime live-order validation.
 - Test: configured `QUOTE_STABILITY_REQUIRED` values `1`, `2`, `3`, and `4` each require exactly that many consecutive valid quote ticks after market switch or quote-stability reset before live order placement can proceed.
 - Test: missing `LIMIT_IOC_FILL_POLICY` when `ORDER_TYPE=limit_ioc` raises `RuntimeError`.
@@ -1867,7 +1870,7 @@ Do not use simulation mode for this verification. Decision-only simulation canno
 ### Exit criteria
 
 - [ ] `ORDER_TYPE` required env var validated at startup.
-- [ ] `ORDER_TYPE` required env var validated again at every live order attempt, so Redis simulation→live flips cannot submit with missing or invalid order type.
+- [ ] `ORDER_TYPE` required env var validated again at every live order attempt, so live-enabled Redis mode changes, environment changes after startup, or nonstandard live-submission call paths cannot submit with missing or invalid order type.
 - [ ] `QUOTE_STABILITY_REQUIRED` required env var validated at startup and every live order attempt; normal live config sets it to `3`.
 - [ ] Hardcoded `QUOTE_STABILITY_REQUIRED = 3` is removed or replaced by a validated runtime value without adding an implicit default.
 - [ ] Quote-stability gate uses the configured threshold in actual live-order gating, including market-switch and quote-reset paths.
@@ -1878,7 +1881,7 @@ Do not use simulation mode for this verification. Decision-only simulation canno
 - [ ] `ORDER_TYPE=market_ioc` remains available only through explicit configuration and is documented as accepting book-sweep price risk.
 - [ ] One minimum allowed `$5.51` live smoke trade with `ORDER_TYPE=limit_ioc` confirms the mandatory live-resume wire format is right. Any `market_ioc` smoke is a separate explicit operator-approved risk test, not a routine resume requirement.
 - [ ] README documents both modes and their trade-offs.
-- [ ] `.env.example` leaves `ORDER_TYPE` blank or commented instead of defaulting to `market_ioc`, includes `QUOTE_STABILITY_REQUIRED=3` as the normal explicit live value, and documents `LIMIT_IOC_FILL_POLICY=partial_ok` as the current FAK-compatible routine resume value that the operator must set deliberately.
+- [ ] `.env.example` sets the routine explicit resume example to `ORDER_TYPE=limit_ioc`, includes `QUOTE_STABILITY_REQUIRED=3` and `LIMIT_REQUIRED_EDGE=0.05`, and documents `LIMIT_IOC_FILL_POLICY=partial_ok` as the current FAK-compatible routine resume value. `market_ioc` remains documented only as an explicit operator-selected risk mode.
 
 ### Effort
 
@@ -2717,7 +2720,7 @@ Critical notes:
 
 ### Redis dependency
 
-The bot requires Redis for simulation/live mode switching. Either:
+Live-enabled deployments require Redis for runtime pause/resume mode control. Either:
 
 - Install `redis-server` from distro packages and set `After=redis.service` in the unit file (shown above).
 - Or run Redis in Docker / on a different host; remove the `After=redis.service` line and set `REDIS_HOST` / `REDIS_PORT` env vars accordingly.
@@ -2839,9 +2842,9 @@ operator → ssh server
 ## Open Decisions Required From Operator
 
 1. **Trade size for live operation.** The intended normal config is `$55 / $385 / 7 positions / $110 daily loss`. The `$5.51 / $22.04` config is smoke-test-only after Phase 0.7 recovery, mandatory Phase 3, and Phase 5B, not the normal target.
-2. **Wire or remove `STOP_LOSS_PCT` / `TAKE_PROFIT_PCT` / `SPIKE_THRESHOLD` / `DIVERGENCE_THRESHOLD`.** Recommendation: remove the first two, wire the latter two.
+2. **Signal threshold env wiring.** `STOP_LOSS_PCT` / `TAKE_PROFIT_PCT` are resolved as not implemented as active controls and removed from operator config; remaining decision is whether to wire or remove `SPIKE_THRESHOLD` / `DIVERGENCE_THRESHOLD`.
 3. **Calibration data source.** Are there ≥100 settled live trades available? If not, what's the data collection plan?
-4. **`ORDER_TYPE` for live mode.** Live mode requires an explicit value. No implicit default in code. `.env.example` should leave it blank or commented with both allowed values shown, so the operator must consciously choose `market_ioc` or `limit_ioc`. Routine live operation should use `limit_ioc`; choosing `market_ioc` means the operator explicitly accepts book-sweep price risk. This matches the `AGENTS.md` no-silent-fallback rule.
+4. **`ORDER_TYPE` for live mode.** Live mode requires an explicit value. No implicit default in code. `.env.example` now shows the routine explicit resume example `ORDER_TYPE=limit_ioc`; choosing `market_ioc` means the operator explicitly accepts book-sweep price risk. This matches the `AGENTS.md` no-silent-fallback rule.
 5. **`QUOTE_STABILITY_REQUIRED` for live mode.** Live mode requires an explicit positive integer. Normal live config is `QUOTE_STABILITY_REQUIRED=3`; changing it is an operator decision because it directly affects whether a submitted limit price was computed from a stable quote stream.
 6. **`LIMIT_IOC` partial-fill policy.** Live resume is blocked until operator explicitly chooses `partial_ok` or `all_or_nothing`; there is no plan default. This decision is mandatory before live resume because `limit_ioc` is now part of the minimum safety path.
 7. **Strategy timing/price-band policy.** After Phase 4.5 reports the baseline vs candidate windows/bands, operator must explicitly approve either "keep current `13_14` + `0.60/0.40`" or one exact replacement policy. No automatic switch based on analysis output.

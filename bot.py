@@ -56,7 +56,7 @@ from nautilus_trader.adapters.polymarket.factories import (
 from nautilus_trader.trading.strategy import Strategy
 from nautilus_trader.model.identifiers import InstrumentId, ClientOrderId
 from nautilus_trader.model.enums import OrderSide, TimeInForce
-from nautilus_trader.model.objects import Quantity
+from nautilus_trader.model.objects import Price, Quantity
 from nautilus_trader.model.data import QuoteTick
 
 from dotenv import load_dotenv
@@ -92,6 +92,7 @@ from patch_market_orders import (
 from decision_log import DecisionRecord
 from depth_estimator import (
     InvalidBookLevelError,
+    estimate_limit_ioc_fill,
     estimate_market_ioc_fill,
 )
 patch_applied = False
@@ -119,7 +120,6 @@ else:
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-QUOTE_STABILITY_REQUIRED = 3      # Need only 3 valid ticks to be stable (faster startup)
 QUOTE_MIN_SPREAD = 0.001          # Both bid AND ask must be at least this
 MARKET_INTERVAL_SECONDS = 900     # 15-minute markets
 LIVE_TRADE_LEDGER_SCHEMA_VERSION = 3
@@ -145,6 +145,26 @@ TERMINAL_NO_FILL_INTENT_STATUSES = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class DepthAwareEntry:
+    executable_entry: Decimal
+    tokens_filled: Decimal
+    actual_cost: Optional[Decimal]
+    fully_filled: bool
+
+
+@dataclass(frozen=True)
+class TerminalFillDetails:
+    quantity: Decimal
+    price: Decimal
+    field_source: str
+    quantity_semantics: str
+    price_semantics: str
+
+
+_ORDER_BOOK_NOT_PROVIDED = object()
+
+
 def _fsync_parent_directory(path: Path) -> None:
     dir_fd = os.open(str(path.parent), os.O_RDONLY)
     try:
@@ -160,6 +180,25 @@ AUTO_REDEEM_TOKEN_HINT_KEYS = (
     "tokenId",
     "clobTokenId",
     "clob_token_id",
+)
+FILL_METADATA_IDENTITY_KEYS = (
+    "venue_order_id",
+    "condition_id",
+    "token_id",
+    "slug",
+    "instrument_id",
+)
+FILL_INFO_CONDITION_HINT_KEYS = (
+    "condition_id",
+    "conditionId",
+    "market",
+    "market_id",
+    "marketId",
+)
+FILL_INFO_SLUG_HINT_KEYS = (
+    "slug",
+    "market_slug",
+    "marketSlug",
 )
 AUTO_REDEEM_OUTCOME_HINT_KEYS = (
     "outcome",
@@ -346,33 +385,95 @@ def get_sizing_mode_for_live() -> str:
     return raw
 
 
-# --- Phase 3 ORDER_TYPE validation ---------------------------------------
+# --- Order-type validation ------------------------------------------------
 
 ORDER_TYPE_MARKET_IOC = "market_ioc"
 ORDER_TYPE_LIMIT_IOC = "limit_ioc"
 _ALLOWED_ORDER_TYPES = frozenset({ORDER_TYPE_MARKET_IOC, ORDER_TYPE_LIMIT_IOC})
+LIMIT_IOC_FILL_POLICY_PARTIAL_OK = "partial_ok"
+LIMIT_IOC_FILL_POLICY_ALL_OR_NOTHING = "all_or_nothing"
+_ALLOWED_LIMIT_IOC_FILL_POLICIES = frozenset(
+    {LIMIT_IOC_FILL_POLICY_PARTIAL_OK, LIMIT_IOC_FILL_POLICY_ALL_OR_NOTHING}
+)
 
 
 def get_order_type_for_live() -> str:
-    """Phase 3 — required env var when ``--live``. No implicit default.
+    """Required env var for order-capable runtime. No implicit default.
 
     Returns the validated order type. Raises ``RuntimeError`` if
     ``ORDER_TYPE`` is missing or not one of ``market_ioc`` / ``limit_ioc``.
-
-    Wiring into ``_place_real_order`` is gated on Phase 4/4.5 calibration
-    pass (per the plan's dependency chain). Until then, this validator
-    can be called explicitly but is not yet enforced at startup.
     """
     raw = os.getenv("ORDER_TYPE")
     if raw is None or raw == "":
         raise RuntimeError(
-            "ORDER_TYPE must be set to 'market_ioc' or 'limit_ioc' for live trading"
+            "ORDER_TYPE must be set to 'market_ioc' or 'limit_ioc'"
         )
     if raw not in _ALLOWED_ORDER_TYPES:
         raise RuntimeError(
             f"ORDER_TYPE must be 'market_ioc' or 'limit_ioc', got {raw!r}"
         )
     return raw
+
+
+def get_quote_stability_required_for_live() -> int:
+    """Required quote-stability threshold. No implicit default."""
+    raw = os.getenv("QUOTE_STABILITY_REQUIRED")
+    if raw is None or raw == "":
+        raise RuntimeError(
+            "QUOTE_STABILITY_REQUIRED must be set to a positive integer"
+        )
+    try:
+        required = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"QUOTE_STABILITY_REQUIRED must be a positive integer, got {raw!r}"
+        ) from exc
+    if required <= 0:
+        raise RuntimeError(f"QUOTE_STABILITY_REQUIRED must be > 0, got {required}")
+    return required
+
+
+def get_limit_ioc_fill_policy_for_live(order_type: str) -> Optional[str]:
+    """Validate LIMIT_IOC partial-fill policy for live trading."""
+    if order_type != ORDER_TYPE_LIMIT_IOC:
+        return None
+    policy = os.getenv("LIMIT_IOC_FILL_POLICY")
+    if policy not in _ALLOWED_LIMIT_IOC_FILL_POLICIES:
+        raise RuntimeError(
+            "LIMIT_IOC_FILL_POLICY must be set to 'partial_ok' or 'all_or_nothing' "
+            "when ORDER_TYPE=limit_ioc"
+        )
+    if policy == LIMIT_IOC_FILL_POLICY_ALL_OR_NOTHING:
+        raise RuntimeError(
+            "LIMIT_IOC_FILL_POLICY=all_or_nothing requires verified FOK wire behavior; "
+            "current LIMIT+IOC wire behavior is FAK"
+        )
+    return policy
+
+
+def validate_live_order_config() -> Dict[str, Any]:
+    """Validate live order configuration as one explicit contract."""
+    order_type = get_order_type_for_live()
+    quote_stability_required = get_quote_stability_required_for_live()
+    fill_policy = get_limit_ioc_fill_policy_for_live(order_type)
+    limit_required_edge = None
+    ev_fee_buffer, ev_spread_buffer = get_validated_ev_buffers()
+    if order_type == ORDER_TYPE_LIMIT_IOC:
+        limit_required_edge = get_validated_limit_required_edge()
+        if limit_required_edge < ev_fee_buffer + ev_spread_buffer:
+            raise RuntimeError(
+                "LIMIT_REQUIRED_EDGE must be >= EV_FEE_BUFFER + EV_SPREAD_BUFFER "
+                f"when ORDER_TYPE=limit_ioc ({limit_required_edge} < "
+                f"{ev_fee_buffer + ev_spread_buffer})"
+            )
+    return {
+        "order_type": order_type,
+        "quote_stability_required": quote_stability_required,
+        "limit_ioc_fill_policy": fill_policy,
+        "limit_required_edge": limit_required_edge,
+        "ev_fee_buffer": ev_fee_buffer,
+        "ev_spread_buffer": ev_spread_buffer,
+    }
 
 
 def trade_window_label_for_seconds_into_sub_interval(seconds: float) -> str:
@@ -482,6 +583,32 @@ def compute_limit_order_token_qty(
     return token_qty
 
 
+def derive_submitted_limit_price(
+    accepted_limit_price: Decimal,
+    price_precision: int,
+) -> Decimal:
+    """Round a BUY limit cap down to the venue price precision.
+
+    The submitted price must never exceed the EV-accepted cap. A caller must
+    use this returned value consistently for depth, sizing, risk, intent, and
+    order submission.
+    """
+    if price_precision < 0:
+        raise ValueError(
+            f"price_precision must be non-negative, got {price_precision}"
+        )
+    price_quantum = Decimal(10) ** -price_precision if price_precision > 0 else Decimal("1")
+    submitted_limit_price = Decimal(str(accepted_limit_price)).quantize(
+        price_quantum,
+        rounding=ROUND_DOWN,
+    )
+    if submitted_limit_price <= 0 or submitted_limit_price > accepted_limit_price:
+        raise RuntimeError(
+            f"safe submitted limit price cannot be derived from cap {accepted_limit_price}"
+        )
+    return submitted_limit_price
+
+
 def get_validated_limit_required_edge() -> Decimal:
     """Phase 3 — required env var when ``ORDER_TYPE=limit_ioc``.
 
@@ -511,6 +638,35 @@ def get_validated_limit_required_edge() -> Decimal:
             f"Polymarket binary outcome token."
         )
     return value
+
+
+def _get_required_decimal_env(name: str) -> Decimal:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        raise RuntimeError(f"{name} must be set to a decimal value")
+    try:
+        value = Decimal(raw)
+    except InvalidOperation as exc:
+        raise RuntimeError(f"{name} must be a decimal, got {raw!r}") from exc
+    if not value.is_finite():
+        raise RuntimeError(f"{name} must be finite, got {raw!r}")
+    return value
+
+
+def get_validated_ev_buffers() -> tuple[Decimal, Decimal]:
+    """Validate EV-gate buffers used by both decision and startup checks."""
+    fee_buffer = _get_required_decimal_env("EV_FEE_BUFFER")
+    spread_buffer = _get_required_decimal_env("EV_SPREAD_BUFFER")
+    if fee_buffer < Decimal("0"):
+        raise RuntimeError(f"EV_FEE_BUFFER must be >= 0, got {fee_buffer}")
+    if spread_buffer < Decimal("0"):
+        raise RuntimeError(f"EV_SPREAD_BUFFER must be >= 0, got {spread_buffer}")
+    if fee_buffer + spread_buffer >= Decimal("1"):
+        raise RuntimeError(
+            "EV_FEE_BUFFER + EV_SPREAD_BUFFER must be < 1, "
+            f"got {fee_buffer + spread_buffer}"
+        )
+    return fee_buffer, spread_buffer
 
 
 def get_pct_of_free_collateral_per_trade() -> Decimal:
@@ -650,6 +806,8 @@ class IntegratedBTCStrategy(Strategy):
         # Quote-stability tracking
         self._stable_tick_count = 0
         self._market_stable = False
+        self._quote_stability_required = get_quote_stability_required_for_live()
+        self._quote_stability_missing_logged = False
         self._last_instrument_switch = None
         
         # =========================================================================
@@ -807,6 +965,7 @@ class IntegratedBTCStrategy(Strategy):
             logger.warning(f"Market stability RESET{' – ' + reason if reason else ''}")
         self._market_stable = False
         self._stable_tick_count = 0
+        self._quote_stability_missing_logged = False
 
     # ------------------------------------------------------------------
     # Redis
@@ -1388,6 +1547,64 @@ class IntegratedBTCStrategy(Strategy):
         return self._parse_utc_datetime(payload.get("submission_not_seen_at")) is not None
 
     def _terminal_no_fill_evidence_is_valid(self, payload: Dict[str, Any]) -> bool:
+        def _captured_fill_fields_are_zero(fields: Dict[str, Any]) -> bool:
+            for key in ("last_qty", "filled_qty", "filled"):
+                if key not in fields:
+                    continue
+                try:
+                    parsed = Decimal(str(fields[key]))
+                except Exception:
+                    return False
+                if not parsed.is_finite() or parsed != 0:
+                    return False
+            for key in ("last_px", "avg_px"):
+                value = fields.get(key)
+                if value in (None, ""):
+                    continue
+                try:
+                    parsed = Decimal(str(value))
+                except Exception:
+                    return False
+                if not parsed.is_finite() or parsed != 0:
+                    return False
+            return all(
+                fields.get(key) in (None, "")
+                for key in ACTUAL_FILL_UNIQUE_KEY_FIELDS
+            )
+
+        terminal_event = payload.get("terminal_no_fill_event")
+        if not isinstance(terminal_event, dict):
+            return False
+        raw_event = terminal_event.get("raw_event")
+        if not isinstance(raw_event, dict) or not raw_event:
+            return False
+        if raw_event.get("event_type") in (None, ""):
+            return False
+        raw_fields = raw_event.get("fields")
+        if not isinstance(raw_fields, dict):
+            return False
+        if not _captured_fill_fields_are_zero(raw_fields):
+            return False
+        top_level_fields = {
+            key: terminal_event[key]
+            for key in (
+                "last_qty",
+                "filled_qty",
+                "filled",
+                "last_px",
+                "avg_px",
+                *ACTUAL_FILL_UNIQUE_KEY_FIELDS,
+            )
+            if key in terminal_event
+        }
+        if not _captured_fill_fields_are_zero(top_level_fields):
+            return False
+        instance_attrs = raw_event.get("instance_attrs")
+        if instance_attrs is not None:
+            if not isinstance(instance_attrs, dict):
+                return False
+            if not _captured_fill_fields_are_zero(instance_attrs):
+                return False
         evidence = payload.get("terminal_no_fill_zero_quantity_evidence")
         if not isinstance(evidence, dict) or not evidence:
             return False
@@ -1400,6 +1617,20 @@ class IntegratedBTCStrategy(Strategy):
             except Exception:
                 return False
             if not parsed.is_finite() or parsed != 0:
+                return False
+        for key, value in evidence.items():
+            if key not in raw_fields:
+                return False
+            try:
+                raw_parsed = Decimal(str(raw_fields[key]))
+                evidence_parsed = Decimal(str(value))
+            except Exception:
+                return False
+            if (
+                not raw_parsed.is_finite()
+                or not evidence_parsed.is_finite()
+                or raw_parsed != evidence_parsed
+            ):
                 return False
         return True
 
@@ -1662,6 +1893,7 @@ class IntegratedBTCStrategy(Strategy):
                 "condition_id": payload.get("condition_id", source_meta.get("condition_id")),
                 "token_id": payload.get("token_id", source_meta.get("token_id")),
                 "slug": payload.get("slug", source_meta.get("slug")),
+                "instrument_id": payload.get("instrument_id", source_meta.get("instrument_id")),
                 "direction": payload.get("direction", source_meta.get("direction")),
                 "trade_label": payload.get("trade_label", source_meta.get("trade_label")),
                 "submitted_at": payload.get("submitted_at", source_meta.get("submitted_at")),
@@ -1673,7 +1905,10 @@ class IntegratedBTCStrategy(Strategy):
                 record["size"] = accounting_size
             if skip_venue_validation:
                 record["venue_conflict_payload_venue_order_id"] = venue_order_id
-                record["venue_conflict_tracked_venue_order_id"] = source_meta.get("venue_order_id")
+                tracked_venue_order_id = payload.get("tracked_venue_order_id")
+                if tracked_venue_order_id in (None, ""):
+                    tracked_venue_order_id = source_meta.get("venue_order_id")
+                record["venue_conflict_tracked_venue_order_id"] = tracked_venue_order_id
             if submitted_size not in (None, ""):
                 record["submitted_size"] = submitted_size
             if has_positive_actual_fill:
@@ -1717,6 +1952,13 @@ class IntegratedBTCStrategy(Strategy):
         if 0 <= self.current_instrument_index < len(self.all_btc_instruments):
             return self.all_btc_instruments[self.current_instrument_index]
         return {}
+
+    def _require_current_market_metadata(self, context: str) -> Dict[str, Any]:
+        """Return current market metadata or fail closed before order decisions."""
+        metadata = self._current_market_metadata()
+        if not metadata:
+            raise RuntimeError(f"{context}: current market metadata is unavailable")
+        return metadata
 
     def _parse_event_time(self, payload: Dict[str, Any]) -> Optional[datetime]:
         """Parse a Polymarket event timestamp without fabricating a substitute."""
@@ -1939,6 +2181,34 @@ class IntegratedBTCStrategy(Strategy):
         raw_id = str(instrument_id)
         without_suffix = raw_id.split('.')[0] if '.' in raw_id else raw_id
         return without_suffix.split('-')[-1] if '-' in without_suffix else without_suffix
+
+    def _extract_polymarket_instrument_identity(
+        self,
+        instrument_id,
+        context: str,
+        *,
+        block_settlement_ledger: bool = False,
+    ) -> Dict[str, str]:
+        raw_id = str(instrument_id)
+        suffix = ".POLYMARKET"
+        if not raw_id.endswith(suffix):
+            reason = f"{context}: malformed Polymarket instrument_id {raw_id!r}"
+            if block_settlement_ledger:
+                self._block_live_settlement_ledger(reason)
+                raise SettlementLedgerError(reason)
+            raise RuntimeError(reason)
+        condition_id, separator, token_id = raw_id[: -len(suffix)].rpartition("-")
+        if separator == "" or condition_id == "" or token_id == "":
+            reason = f"{context}: malformed Polymarket instrument_id {raw_id!r}"
+            if block_settlement_ledger:
+                self._block_live_settlement_ledger(reason)
+                raise SettlementLedgerError(reason)
+            raise RuntimeError(reason)
+        return {
+            "instrument_id": raw_id,
+            "condition_id": condition_id,
+            "token_id": token_id,
+        }
 
     def _infer_polymarket_token_outcome(self, instrument, token_id: str) -> str:
         """Infer whether a Polymarket instrument is the Up/Yes or Down/No token."""
@@ -2208,6 +2478,59 @@ class IntegratedBTCStrategy(Strategy):
         self._validate_pending_actual_fill_aggregate(order_id, aggregate)
         return total_qty, total_notional, vwap
 
+    def _limit_ioc_fill_envelope_violation(
+        self,
+        meta: Dict[str, Any],
+        filled_qty: Decimal,
+        vwap: Decimal,
+    ) -> Optional[str]:
+        raw_order_type = meta.get("order_type")
+        if raw_order_type in (None, ""):
+            return "missing_order_type_for_fill_envelope"
+        order_type = str(raw_order_type)
+        if order_type not in _ALLOWED_ORDER_TYPES:
+            return f"invalid_order_type_for_fill_envelope:{order_type!r}"
+        if order_type != ORDER_TYPE_LIMIT_IOC:
+            return None
+        raw_limit_price = meta.get("submitted_limit_price")
+        raw_submitted_qty = meta.get("estimated_tokens")
+        missing = [
+            key
+            for key, value in (
+                ("submitted_limit_price", raw_limit_price),
+                ("estimated_tokens", raw_submitted_qty),
+            )
+            if value in (None, "")
+        ]
+        if missing:
+            return "limit_ioc_missing_fill_envelope:" + ",".join(missing)
+        try:
+            submitted_limit_price = Decimal(str(raw_limit_price))
+            submitted_qty = Decimal(str(raw_submitted_qty))
+        except Exception as exc:
+            return f"limit_ioc_invalid_fill_envelope_decimal:{type(exc).__name__}"
+        if (
+            not submitted_limit_price.is_finite()
+            or not submitted_qty.is_finite()
+            or submitted_limit_price <= 0
+            or submitted_limit_price > 1
+            or submitted_qty < POLYMARKET_LIMIT_MIN_TOKENS
+        ):
+            return "limit_ioc_impossible_fill_envelope"
+        if vwap > submitted_limit_price:
+            return (
+                "limit_ioc_fill_price_above_submitted_limit:"
+                f"vwap={vwap},submitted_limit_price={submitted_limit_price}"
+            )
+        if filled_qty > submitted_qty:
+            return (
+                "limit_ioc_fill_qty_above_submitted_quantity:"
+                f"filled_qty={filled_qty},submitted_qty={submitted_qty}"
+            )
+        if filled_qty * vwap > submitted_qty * submitted_limit_price:
+            return "limit_ioc_fill_notional_above_submitted_worst_case"
+        return None
+
     def _mark_pending_actual_fill_external_repair(
         self,
         order_id,
@@ -2411,6 +2734,27 @@ class IntegratedBTCStrategy(Strategy):
                     )
                     return
 
+                limit_violation = self._limit_ioc_fill_envelope_violation(
+                    source_meta,
+                    actual_filled_qty,
+                    actual_vwap,
+                )
+                if limit_violation:
+                    repair_payload = dict(payload)
+                    repair_payload["requires_external_fill_repair"] = True
+                    repair_payload["external_fill_repair_reason"] = limit_violation
+                    self._mark_pending_actual_fill_external_repair(order_id, repair_payload, limit_violation)
+                    self._create_durable_settlement_unknown_from_actual_fill(
+                        client_order_id=client_order_id,
+                        payload=repair_payload,
+                        reason=limit_violation,
+                    )
+                    self._block_live_settlement_ledger(
+                        f"actual-fill callback for {order_id} violates LIMIT_IOC envelope: "
+                        f"{limit_violation}; SETTLEMENT_UNKNOWN created"
+                    )
+                    return
+
                 pending_submitted_size = payload.get("submitted_size")
                 if pending_submitted_size is None:
                     pending_submitted_size = source_meta.get("submitted_size")
@@ -2584,10 +2928,30 @@ class IntegratedBTCStrategy(Strategy):
                         raise SettlementLedgerError(str(exc)) from exc
                     updated_fills = copy.deepcopy(existing_fills)
                     updated_fills.append(fill_entry)
+                    limit_violation = self._limit_ioc_fill_envelope_violation(
+                        source_meta,
+                        actual_filled_qty,
+                        actual_vwap,
+                    )
+                    if limit_violation:
+                        repair_payload = dict(payload)
+                        repair_payload["requires_external_fill_repair"] = True
+                        repair_payload["external_fill_repair_reason"] = limit_violation
+                        self._mark_pending_actual_fill_external_repair(order_id, repair_payload, limit_violation)
                     total_qty, total_notional, aggregate_vwap = self._aggregate_actual_fill_entries(
                         order_id,
                         updated_fills,
                     )
+                    limit_violation = self._limit_ioc_fill_envelope_violation(
+                        source_meta,
+                        total_qty,
+                        aggregate_vwap,
+                    )
+                    if limit_violation:
+                        repair_payload = dict(payload)
+                        repair_payload["requires_external_fill_repair"] = True
+                        repair_payload["external_fill_repair_reason"] = limit_violation
+                        self._mark_pending_actual_fill_external_repair(order_id, repair_payload, limit_violation)
                     updated_pending["fills"] = updated_fills
                     updated_pending["total_filled_qty"] = str(total_qty)
                     updated_pending["total_filled_notional"] = str(total_notional)
@@ -3826,7 +4190,7 @@ class IntegratedBTCStrategy(Strategy):
             # Stability gate
             if not self._market_stable:
                 self._stable_tick_count += 1
-                if self._stable_tick_count >= QUOTE_STABILITY_REQUIRED:
+                if self._stable_tick_count >= self._quote_stability_required:
                     self._market_stable = True
                     logger.info(
                         f"✓ Market STABLE after {self._stable_tick_count} valid quote ticks"
@@ -3976,6 +4340,16 @@ class IntegratedBTCStrategy(Strategy):
         variance = sum((p - sma_20) ** 2 for p in recent_prices) / len(recent_prices)
         volatility = math.sqrt(variance)
 
+        market_meta = self._require_current_market_metadata("market context fetch")
+        yes_token_id = market_meta.get("yes_token_id")
+        if yes_token_id in (None, ""):
+            raise RuntimeError("market context fetch: current market metadata missing yes_token_id")
+        if self._yes_token_id not in (None, "") and self._yes_token_id != yes_token_id:
+            raise RuntimeError(
+                "market context fetch: cached YES token_id does not match current market metadata "
+                f"({self._yes_token_id!r} != {yes_token_id!r})"
+            )
+        no_token_id = market_meta.get("no_token_id")
         metadata = {
             "deviation": deviation,
             "momentum": momentum,
@@ -3983,8 +4357,19 @@ class IntegratedBTCStrategy(Strategy):
             # Tick buffer for TickVelocityProcessor
             "tick_buffer": list(self._tick_buffer),
             # YES token id for OrderBookImbalanceProcessor
-            "yes_token_id": self._yes_token_id,
+            "yes_token_id": yes_token_id,
         }
+        if no_token_id not in (None, ""):
+            metadata["no_token_id"] = no_token_id
+        metadata["yes_order_book"] = await asyncio.to_thread(
+            self.orderbook_processor.fetch_order_book,
+            yes_token_id,
+        )
+        if no_token_id not in (None, ""):
+            metadata["no_order_book"] = await asyncio.to_thread(
+                self.orderbook_processor.fetch_order_book,
+                no_token_id,
+            )
 
         # --- Real sentiment: Fear & Greed Index via NewsSocialDataSource ---
         try:
@@ -4061,6 +4446,10 @@ class IntegratedBTCStrategy(Strategy):
         rec: DecisionRecord,
     ) -> bool:
         logger.info(f"Mode: {'SIMULATION' if is_simulation else 'LIVE TRADING'}")
+        order_config = validate_live_order_config()
+        order_type = order_config["order_type"]
+        quote_stability_required = order_config["quote_stability_required"]
+        limit_ioc_fill_policy = order_config["limit_ioc_fill_policy"]
         if not is_simulation:
             unresolved = self._unresolved_settlement_unknowns()
             if unresolved:
@@ -4074,6 +4463,16 @@ class IntegratedBTCStrategy(Strategy):
                     f"{len(unresolved)} unresolved item(s)",
                 )
                 return False
+        if self._stable_tick_count < quote_stability_required:
+            logger.error(
+                "ORDER BLOCKED: quote stability below configured threshold "
+                f"({self._stable_tick_count} < {quote_stability_required})"
+            )
+            rec.reject(
+                "quote_stability_below_configured_threshold",
+                f"stable_tick_count={self._stable_tick_count} < required={quote_stability_required}",
+            )
+            return False
 
         # --- Minimum history guard ---
         if len(self.price_history) < 20:
@@ -4088,7 +4487,7 @@ class IntegratedBTCStrategy(Strategy):
 
         # --- Phase 4a: Build real metadata for processors ---
         metadata = await self._fetch_market_context(current_price)
-        market_meta = self._current_market_metadata() or {}
+        market_meta = self._require_current_market_metadata("trading decision")
         rec.update(
             slug=market_meta.get("slug"),
             condition_id=market_meta.get("condition_id"),
@@ -4240,6 +4639,7 @@ class IntegratedBTCStrategy(Strategy):
             top_of_book_entry = yes_ask
             entry_source = "YES ask"
             side_token_id = market_meta.get("yes_token_id")
+            selected_order_book_key = "yes_order_book"
         else:
             no_tick = getattr(self, "_last_no_bid_ask", None)
             if not no_tick:
@@ -4250,29 +4650,101 @@ class IntegratedBTCStrategy(Strategy):
             top_of_book_entry = no_ask
             entry_source = "NO ask"
             side_token_id = market_meta.get("no_token_id")
+            selected_order_book_key = "no_order_book"
             rec.update(no_ask=no_ask)
 
-        # Phase 5A — depth-aware executable_entry. Replace top-of-book ask
-        # with the VWAP estimate_market_ioc_fill returns for the selected
-        # token's asks at the configured POSITION_SIZE_USD budget. Fail
-        # closed (reject the trade) when the book is unavailable, has
-        # invalid level data, or is too thin to fill the full budget.
-        executable_entry = await self._compute_depth_aware_entry(
+        if selected_order_book_key not in metadata:
+            logger.warning(f"SKIP: {entry_source} order-book snapshot missing from market context")
+            rec.reject(
+                "depth_aware_book_snapshot_missing",
+                f"{selected_order_book_key} missing from market context",
+            )
+            return False
+        selected_order_book = metadata[selected_order_book_key]
+        accepted_limit_price = None
+        submitted_limit_price = None
+        limit_order_token_qty = None
+
+        if order_type == ORDER_TYPE_LIMIT_IOC:
+            accepted_limit_price = compute_limit_price(
+                fused.confidence,
+                order_config["limit_required_edge"],
+            )
+            if accepted_limit_price is None:
+                logger.info(
+                    "SKIP: LIMIT_IOC accepted cap is outside Polymarket token bounds"
+                )
+                rec.reject(
+                    "limit_price_out_of_bounds",
+                    f"fused.confidence={fused.confidence:.4f}",
+                )
+                return False
+            if direction == "long":
+                if not hasattr(self, "_yes_instrument_id") or self._yes_instrument_id is None:
+                    logger.warning("SKIP: YES token instrument unavailable for LIMIT_IOC")
+                    rec.reject("limit_ioc_no_yes_instrument", "_yes_instrument_id is None")
+                    return False
+                trade_instrument_id = self._yes_instrument_id
+            else:
+                if not hasattr(self, "_no_instrument_id") or self._no_instrument_id is None:
+                    logger.warning("SKIP: NO token instrument unavailable for LIMIT_IOC")
+                    rec.reject("limit_ioc_no_no_instrument", "_no_instrument_id is None")
+                    return False
+                trade_instrument_id = self._no_instrument_id
+            instrument = self.cache.instrument(trade_instrument_id)
+            if not instrument:
+                logger.error(f"SKIP: instrument not in cache for LIMIT_IOC: {trade_instrument_id}")
+                rec.reject(
+                    "limit_ioc_instrument_not_cached",
+                    f"instrument_id={trade_instrument_id}",
+                )
+                return False
+            submitted_limit_price = derive_submitted_limit_price(
+                accepted_limit_price,
+                instrument.price_precision,
+            )
+            limit_order_token_qty = compute_limit_order_token_qty(
+                POSITION_SIZE_USD,
+                submitted_limit_price,
+                instrument.size_precision,
+            )
+            if limit_order_token_qty is None:
+                logger.warning(
+                    "SKIP: LIMIT_IOC token quantity is below Polymarket 5-token minimum"
+                )
+                rec.reject(
+                    "limit_ioc_below_min_tokens",
+                    f"budget={POSITION_SIZE_USD} submitted_limit_price={submitted_limit_price}",
+                )
+                return False
+            rec.update(
+                limit_price=str(accepted_limit_price),
+                submitted_limit_price=str(submitted_limit_price),
+                limit_order_token_qty=str(limit_order_token_qty),
+            )
+
+        depth_entry = await self._compute_depth_aware_entry_details(
             side_token_id=side_token_id,
             entry_source=entry_source,
             position_size_usd=POSITION_SIZE_USD,
             top_of_book_entry=top_of_book_entry,
             rec=rec,
             market_meta=market_meta,
+            order_type=order_type,
+            submitted_limit_price=submitted_limit_price,
+            limit_order_token_qty=limit_order_token_qty,
+            limit_ioc_fill_policy=limit_ioc_fill_policy,
+            order_book=selected_order_book,
         )
-        if executable_entry is None:
+        if depth_entry is None:
             return False
+        executable_entry = depth_entry.executable_entry
         rec.update(executable_entry=executable_entry)
 
         # This is a heuristic confidence filter, not a calibrated EV model.
         # The processor confidence values are not yet trained settlement probabilities.
-        fee_buffer = Decimal(os.getenv("EV_FEE_BUFFER", "0.005"))
-        spread_buffer = Decimal(os.getenv("EV_SPREAD_BUFFER", "0.01"))
+        fee_buffer = order_config["ev_fee_buffer"]
+        spread_buffer = order_config["ev_spread_buffer"]
         min_required_confidence = executable_entry + fee_buffer + spread_buffer
         if Decimal(str(fused.confidence)) < min_required_confidence:
             logger.info(
@@ -4349,7 +4821,16 @@ class IntegratedBTCStrategy(Strategy):
         if is_simulation:
             placed = await self._record_paper_trade(fused, POSITION_SIZE_USD, current_price, direction)
         else:
-            placed = await self._place_real_order(fused, POSITION_SIZE_USD, current_price, direction)
+            placed = await self._place_real_order(
+                fused,
+                POSITION_SIZE_USD,
+                current_price,
+                direction,
+                order_type=order_type,
+                accepted_limit_price=accepted_limit_price,
+                submitted_limit_price=submitted_limit_price,
+                limit_order_token_qty=limit_order_token_qty,
+            )
         if not placed:
             # Reject reason tracked at the executor layer; surface a generic
             # late-stage rejection so the record still reflects the outcome.
@@ -4366,15 +4847,44 @@ class IntegratedBTCStrategy(Strategy):
         top_of_book_entry: Decimal,
         rec: DecisionRecord,
         market_meta: Optional[Dict[str, Any]] = None,
+        order_book: Any = _ORDER_BOOK_NOT_PROVIDED,
     ) -> Optional[Decimal]:
+        details = await self._compute_depth_aware_entry_details(
+            side_token_id=side_token_id,
+            entry_source=entry_source,
+            position_size_usd=position_size_usd,
+            top_of_book_entry=top_of_book_entry,
+            rec=rec,
+            market_meta=market_meta,
+            order_book=order_book,
+            order_type=ORDER_TYPE_MARKET_IOC,
+        )
+        if details is None:
+            return None
+        return details.executable_entry
+
+    async def _compute_depth_aware_entry_details(
+        self,
+        side_token_id: Optional[str],
+        entry_source: str,
+        position_size_usd: Decimal,
+        top_of_book_entry: Decimal,
+        rec: DecisionRecord,
+        market_meta: Optional[Dict[str, Any]] = None,
+        order_type: str = ORDER_TYPE_MARKET_IOC,
+        submitted_limit_price: Optional[Decimal] = None,
+        limit_order_token_qty: Optional[Decimal] = None,
+        limit_ioc_fill_policy: Optional[str] = None,
+        order_book: Any = _ORDER_BOOK_NOT_PROVIDED,
+    ) -> Optional[DepthAwareEntry]:
         """Phase 5A — return the VWAP executable entry for the selected
         token's asks, or None when the book cannot be evaluated.
 
-        Fail-closed semantics: if the token id is unknown, if the HTTP book
-        fetch fails or yields no asks, if any book level is malformed, or
-        if the book is too thin to fill the full position size, this
-        method logs the reason via ``rec.reject`` and returns None. Callers
-        treat None as "skip the trade."
+        Fail-closed semantics: if the caller omits the decision-cycle snapshot,
+        this raises. If the token id is unknown, if the provided snapshot has no
+        asks, if any book level is malformed, or if the book is too thin to fill
+        the full position size, this method logs the reason via ``rec.reject``
+        and returns None. Callers treat None as "skip the trade."
 
         When ``market_meta`` is supplied, the helper additionally enforces
         that ``side_token_id`` actually belongs to the side named in
@@ -4414,22 +4924,16 @@ class IntegratedBTCStrategy(Strategy):
                     f"for entry_source={entry_source!r}",
                 )
                 return None
-        try:
-            book = await asyncio.to_thread(
-                self.orderbook_processor.fetch_order_book, side_token_id
+        if order_book is _ORDER_BOOK_NOT_PROVIDED:
+            raise RuntimeError(
+                "depth-aware entry requires caller-provided order_book snapshot"
             )
-        except Exception as exc:
-            logger.warning(f"SKIP: depth-aware book fetch raised: {exc}")
-            rec.reject(
-                "depth_aware_book_fetch_error",
-                f"fetch_order_book({entry_source}) raised {type(exc).__name__}: {exc}",
-            )
-            return None
+        book = order_book
         if not book:
-            logger.warning("SKIP: depth-aware book fetch returned no book")
+            logger.warning("SKIP: depth-aware order-book snapshot is empty")
             rec.reject(
                 "depth_aware_no_book",
-                f"fetch_order_book({entry_source}) returned None/empty",
+                f"{entry_source} provided order_book snapshot is None/empty",
             )
             return None
         asks = book.get("asks") or []
@@ -4440,9 +4944,51 @@ class IntegratedBTCStrategy(Strategy):
                 f"{entry_source} book has no ask levels",
             )
             return None
+        if order_type == ORDER_TYPE_MARKET_IOC:
+            try:
+                vwap, tokens_filled, fully_filled = estimate_market_ioc_fill(
+                    asks, Decimal(str(position_size_usd))
+                )
+            except InvalidBookLevelError as exc:
+                logger.warning(f"SKIP: depth-aware book has invalid level: {exc}")
+                rec.reject(
+                    "depth_aware_invalid_book_level",
+                    f"{entry_source}: {exc}",
+                )
+                return None
+            if vwap is None or not fully_filled:
+                tokens_str = f"{float(tokens_filled):.6f}" if tokens_filled else "0"
+                logger.warning(
+                    f"SKIP: depth-aware book too thin for ${float(position_size_usd):.2f} "
+                    f"{entry_source} sweep (tokens fillable: {tokens_str})"
+                )
+                rec.reject(
+                    "depth_aware_book_too_thin",
+                    f"{entry_source} cannot fill ${float(position_size_usd):.2f} "
+                    f"(tokens fillable: {tokens_str})",
+                )
+                return None
+            logger.info(
+                f"DEPTH-AWARE entry: {entry_source} VWAP=${float(vwap):.4f} "
+                f"(top-of-book ${float(top_of_book_entry):.4f}, "
+                f"fills {float(tokens_filled):.4f} tokens at ${float(position_size_usd):.2f})"
+            )
+            return DepthAwareEntry(
+                executable_entry=vwap,
+                tokens_filled=tokens_filled,
+                actual_cost=None,
+                fully_filled=fully_filled,
+            )
+
+        if order_type != ORDER_TYPE_LIMIT_IOC:
+            raise RuntimeError(f"unexpected ORDER_TYPE after validation: {order_type!r}")
+        if submitted_limit_price is None or limit_order_token_qty is None:
+            raise RuntimeError("LIMIT_IOC depth estimation requires submitted_limit_price and token quantity")
         try:
-            vwap, tokens_filled, fully_filled = estimate_market_ioc_fill(
-                asks, Decimal(str(position_size_usd))
+            vwap, tokens_filled, actual_cost, fully_filled = estimate_limit_ioc_fill(
+                asks,
+                limit_order_token_qty,
+                submitted_limit_price,
             )
         except InvalidBookLevelError as exc:
             logger.warning(f"SKIP: depth-aware book has invalid level: {exc}")
@@ -4451,24 +4997,46 @@ class IntegratedBTCStrategy(Strategy):
                 f"{entry_source}: {exc}",
             )
             return None
-        if vwap is None or not fully_filled:
+        if vwap is None or tokens_filled <= 0:
             tokens_str = f"{float(tokens_filled):.6f}" if tokens_filled else "0"
             logger.warning(
-                f"SKIP: depth-aware book too thin for ${float(position_size_usd):.2f} "
-                f"{entry_source} sweep (tokens fillable: {tokens_str})"
+                f"SKIP: LIMIT_IOC no executable {entry_source} liquidity at "
+                f"price <= ${float(submitted_limit_price):.4f} "
+                f"(tokens fillable: {tokens_str})"
             )
             rec.reject(
-                "depth_aware_book_too_thin",
-                f"{entry_source} cannot fill ${float(position_size_usd):.2f} "
-                f"(tokens fillable: {tokens_str})",
+                "depth_aware_limit_ioc_no_liquidity",
+                f"{entry_source} no fill at submitted_limit_price={submitted_limit_price}",
             )
             return None
+        if limit_ioc_fill_policy == LIMIT_IOC_FILL_POLICY_ALL_OR_NOTHING:
+            raise RuntimeError(
+                "LIMIT_IOC_FILL_POLICY=all_or_nothing requires verified FOK wire behavior; "
+                "current LIMIT+IOC wire behavior is FAK"
+            )
+        if limit_ioc_fill_policy != LIMIT_IOC_FILL_POLICY_PARTIAL_OK:
+            raise RuntimeError(
+                f"LIMIT_IOC depth estimation requires partial_ok policy, got {limit_ioc_fill_policy!r}"
+            )
+        if not fully_filled:
+            logger.info(
+                f"LIMIT_IOC partial_ok: {float(tokens_filled):.6f} of "
+                f"{float(limit_order_token_qty):.6f} tokens executable at "
+                f"price <= ${float(submitted_limit_price):.4f}; "
+                f"estimated cost ${float(actual_cost):.2f}"
+            )
         logger.info(
             f"DEPTH-AWARE entry: {entry_source} VWAP=${float(vwap):.4f} "
             f"(top-of-book ${float(top_of_book_entry):.4f}, "
-            f"fills {float(tokens_filled):.4f} tokens at ${float(position_size_usd):.2f})"
+            f"LIMIT_IOC fills {float(tokens_filled):.4f} tokens at "
+            f"estimated cost ${float(actual_cost):.2f})"
         )
-        return vwap
+        return DepthAwareEntry(
+            executable_entry=vwap,
+            tokens_filled=tokens_filled,
+            actual_cost=actual_cost,
+            fully_filled=fully_filled,
+        )
 
     async def _record_paper_trade(self, signal, position_size, current_price, direction) -> bool:
         exit_delta = timedelta(minutes=1) if self.test_mode else timedelta(minutes=15)
@@ -4513,17 +5081,27 @@ class IntegratedBTCStrategy(Strategy):
     # Real order (unchanged)
     # ------------------------------------------------------------------
 
-    async def _place_real_order(self, signal, position_size, current_price, direction) -> bool:
+    async def _place_real_order(
+        self,
+        signal,
+        position_size,
+        current_price,
+        direction,
+        *,
+        order_type: str,
+        accepted_limit_price: Optional[Decimal] = None,
+        submitted_limit_price: Optional[Decimal] = None,
+        limit_order_token_qty: Optional[Decimal] = None,
+    ) -> bool:
         if not self.instrument_id:
             logger.error("No instrument available")
             return False
 
-        # Phase 0.3 runtime gate: enforce MARKET_BUY_USD > 5.50 before any live
-        # order submission. Defends against Redis-driven sim->live transitions
-        # bypassing the startup gate in main(). Uses the non-raising validator
-        # so the live path is a structured fail-closed "reject the trade" (an
-        # explicitly allowed fail-closed outcome per the No-Fallback Policy),
-        # not a try/except that hides the underlying error.
+        # Runtime gate: enforce MARKET_BUY_USD > 5.50 before any live order
+        # submission. This is defense-in-depth for live-enabled processes whose
+        # environment changes after startup or for nonstandard submit call paths.
+        # The live path rejects the trade without using exception conversion as
+        # control flow.
         gate_ok, gate_err, gate_amount = validate_live_market_buy_usd()
         if not gate_ok:
             logger.error(f"LIVE ORDER BLOCKED: {gate_err}")
@@ -4542,6 +5120,48 @@ class IntegratedBTCStrategy(Strategy):
             )
             return False
 
+        runtime_order_config = validate_live_order_config()
+        runtime_order_type = runtime_order_config["order_type"]
+        if runtime_order_type != order_type:
+            logger.error(
+                f"LIVE ORDER BLOCKED: order_type changed between decision and submit "
+                f"({order_type!r} -> {runtime_order_type!r})"
+            )
+            return False
+        quote_stability_required = runtime_order_config["quote_stability_required"]
+        if self._stable_tick_count < quote_stability_required:
+            logger.error(
+                "LIVE ORDER BLOCKED: quote stability below configured threshold "
+                f"({self._stable_tick_count} < {quote_stability_required})"
+            )
+            return False
+        limit_ioc_fill_policy = runtime_order_config["limit_ioc_fill_policy"]
+        if order_type == ORDER_TYPE_LIMIT_IOC:
+            if accepted_limit_price is None:
+                logger.error("LIVE ORDER BLOCKED: LIMIT_IOC requires accepted_limit_price from decision path")
+                return False
+            accepted_limit_price = Decimal(str(accepted_limit_price))
+            if (
+                not accepted_limit_price.is_finite()
+                or accepted_limit_price <= 0
+                or accepted_limit_price >= 1
+            ):
+                logger.error(
+                    f"LIVE ORDER BLOCKED: accepted_limit_price must be in (0, 1), got {accepted_limit_price}"
+                )
+                return False
+            if submitted_limit_price is None or submitted_limit_price <= 0:
+                logger.error(
+                    f"LIVE ORDER BLOCKED: submitted_limit_price must be positive, got {submitted_limit_price}"
+                )
+                return False
+            if limit_order_token_qty is None or limit_order_token_qty < POLYMARKET_LIMIT_MIN_TOKENS:
+                logger.error(
+                    f"LIVE ORDER BLOCKED: limit_order_token_qty must be >= "
+                    f"{POLYMARKET_LIMIT_MIN_TOKENS}, got {limit_order_token_qty}"
+                )
+                return False
+
         try:
             # instrument is fetched below after determining YES vs NO token
 
@@ -4556,17 +5176,21 @@ class IntegratedBTCStrategy(Strategy):
             side = OrderSide.BUY
 
             if direction == "long":
-                trade_instrument_id = getattr(self, '_yes_instrument_id', self.instrument_id)
+                if not hasattr(self, "_yes_instrument_id") or self._yes_instrument_id is None:
+                    logger.warning(
+                        "YES token instrument not found for this market — skipping trade."
+                    )
+                    return False
+                trade_instrument_id = self._yes_instrument_id
                 trade_label = "YES (UP)"
             else:
-                no_id = getattr(self, '_no_instrument_id', None)
-                if no_id is None:
+                if not hasattr(self, "_no_instrument_id") or self._no_instrument_id is None:
                     logger.warning(
                         "NO token instrument not found for this market — "
                         "cannot bet DOWN. Skipping trade."
                     )
                     return False
-                trade_instrument_id = no_id
+                trade_instrument_id = self._no_instrument_id
                 trade_label = "NO (DOWN)"
 
             instrument = self.cache.instrument(trade_instrument_id)
@@ -4594,28 +5218,21 @@ class IntegratedBTCStrategy(Strategy):
                 quoted_price = no_ask
                 price_source = "NO ask"
 
-            trade_price = float(quoted_price)
-            if not math.isfinite(trade_price) or trade_price <= 0:
-                logger.error(f"Live order rejected: invalid {price_source} price {quoted_price!r}")
-                return False
-            estimated_tokens = max_usd_amount / trade_price
-            logger.info(
-                f"BUY {trade_label}: spending ${max_usd_amount:.2f} USDC.e "
-                f"(estimated {estimated_tokens:.6f} tokens at ${trade_price:.4f} from {price_source})"
-            )
-
-            qty = Quantity.from_str(f"{max_usd_amount:.2f}")
             timestamp_ms = int(time.time() * 1000)
             unique_id = f"BTC-15MIN-${max_usd_amount:.0f}-{timestamp_ms}"
             submitted_at = datetime.now(timezone.utc)
-            market_meta = self._current_market_metadata()
-            instrument_info = getattr(instrument, "info", {}) or {}
-            market_slug = market_meta.get("slug") or instrument_info.get("market_slug")
-            condition_id = market_meta.get("condition_id") or instrument_info.get("condition_id")
+            market_meta = self._require_current_market_metadata("live order placement")
+            market_slug = market_meta.get("slug")
+            condition_id = market_meta.get("condition_id")
+            if market_slug in (None, "") or condition_id in (None, ""):
+                logger.error(
+                    "Live order rejected: current market metadata missing slug or condition_id"
+                )
+                return False
             market_end_time = self._parse_utc_datetime(market_meta.get("end_time"))
             if market_end_time is None:
                 logger.error(
-                    f"Live order rejected: missing/invalid market_end_time for {market_slug or trade_instrument_id}"
+                    f"Live order rejected: missing/invalid market_end_time for {market_slug}"
                 )
                 return False
             token_id = (
@@ -4623,22 +5240,124 @@ class IntegratedBTCStrategy(Strategy):
                 if direction == "long"
                 else market_meta.get("no_token_id")
             )
-
-            order = self.order_factory.market(
-                instrument_id=trade_instrument_id,
-                order_side=side,
-                quantity=qty,
-                client_order_id=ClientOrderId(unique_id),
-                quote_quantity=True,
-                time_in_force=TimeInForce.IOC,
+            if token_id in (None, ""):
+                logger.error(
+                    f"Live order rejected: current market metadata missing token_id for {trade_label}"
+                )
+                return False
+            instrument_identity = self._extract_polymarket_instrument_identity(
+                trade_instrument_id,
+                "live order placement",
             )
+            if instrument_identity["condition_id"] != str(condition_id):
+                logger.error(
+                    "Live order rejected: trade instrument condition_id does not match "
+                    f"current market metadata ({instrument_identity['condition_id']} != {condition_id})"
+                )
+                return False
+            if instrument_identity["token_id"] != str(token_id):
+                logger.error(
+                    "Live order rejected: trade instrument token_id does not match "
+                    f"current market metadata ({instrument_identity['token_id']} != {token_id})"
+                )
+                return False
+
+            if order_type == ORDER_TYPE_MARKET_IOC:
+                trade_price = float(quoted_price)
+                if not math.isfinite(trade_price) or trade_price <= 0:
+                    logger.error(f"Live order rejected: invalid {price_source} price {quoted_price!r}")
+                    return False
+                estimated_tokens = max_usd_amount / trade_price
+                logger.info(
+                    f"BUY {trade_label}: spending ${max_usd_amount:.2f} USDC.e "
+                    f"(estimated {estimated_tokens:.6f} tokens at ${trade_price:.4f} from {price_source})"
+                )
+                qty = Quantity.from_str(f"{max_usd_amount:.2f}")
+                order = self.order_factory.market(
+                    instrument_id=trade_instrument_id,
+                    order_side=side,
+                    quantity=qty,
+                    client_order_id=ClientOrderId(unique_id),
+                    quote_quantity=True,
+                    time_in_force=TimeInForce.IOC,
+                )
+                entry_price_for_intent = Decimal(str(trade_price))
+                estimated_tokens_for_intent = Decimal(str(estimated_tokens))
+                quantity_mode = "quote_quantity"
+                quote_quantity = True
+                submitted_price_for_intent = None
+            elif order_type == ORDER_TYPE_LIMIT_IOC:
+                size_precision = instrument.size_precision
+                price_precision = instrument.price_precision
+                if submitted_limit_price > accepted_limit_price:
+                    logger.error(
+                        "LIVE ORDER BLOCKED: submitted LIMIT_IOC price exceeds accepted cap "
+                        f"({submitted_limit_price} > {accepted_limit_price})"
+                    )
+                    return False
+                qty_str = format(limit_order_token_qty, f".{size_precision}f")
+                price_str = format(submitted_limit_price, f".{price_precision}f")
+                qty_roundtrip = Decimal(qty_str)
+                price_roundtrip = Decimal(price_str)
+                if qty_roundtrip != limit_order_token_qty:
+                    logger.error(
+                        "LIVE ORDER BLOCKED: LIMIT_IOC quantity is not exactly representable "
+                        f"at venue precision ({limit_order_token_qty} -> {qty_str})"
+                    )
+                    return False
+                if price_roundtrip != submitted_limit_price:
+                    logger.error(
+                        "LIVE ORDER BLOCKED: LIMIT_IOC price is not exactly representable "
+                        f"at venue precision ({submitted_limit_price} -> {price_str})"
+                    )
+                    return False
+                if price_roundtrip > accepted_limit_price:
+                    logger.error(
+                        "LIVE ORDER BLOCKED: formatted LIMIT_IOC price exceeds accepted cap "
+                        f"({price_roundtrip} > {accepted_limit_price})"
+                    )
+                    return False
+                worst_case_notional = qty_roundtrip * price_roundtrip
+                if worst_case_notional > Decimal(str(position_size)):
+                    logger.error(
+                        "LIVE ORDER BLOCKED: LIMIT_IOC worst-case notional exceeds budget "
+                        f"({worst_case_notional} > {position_size})"
+                    )
+                    return False
+                order = self.order_factory.limit(
+                    instrument_id=trade_instrument_id,
+                    order_side=side,
+                    quantity=Quantity.from_str(qty_str),
+                    price=Price.from_str(price_str),
+                    client_order_id=ClientOrderId(unique_id),
+                    quote_quantity=False,
+                    time_in_force=TimeInForce.IOC,
+                )
+                entry_price_for_intent = submitted_limit_price
+                estimated_tokens_for_intent = limit_order_token_qty
+                quantity_mode = "base_quantity"
+                quote_quantity = False
+                submitted_price_for_intent = submitted_limit_price
+                logger.info(
+                    f"BUY {trade_label}: LIMIT_IOC {limit_order_token_qty} tokens "
+                    f"at price <= ${float(submitted_limit_price):.4f}; "
+                    f"worst-case spend ${max_usd_amount:.2f}"
+                )
+            else:
+                raise RuntimeError(f"unexpected ORDER_TYPE after validation: {order_type!r}")
 
             submitted_meta = {
-                "entry_price": Decimal(str(trade_price)),
+                "entry_price": entry_price_for_intent,
                 "size": position_size,
                 "direction": direction,
                 "trade_label": trade_label,
-                "estimated_tokens": Decimal(str(estimated_tokens)),
+                "estimated_tokens": estimated_tokens_for_intent,
+                "order_type": order_type,
+                "quote_quantity": quote_quantity,
+                "quantity_mode": quantity_mode,
+                "limit_ioc_fill_policy": limit_ioc_fill_policy,
+                "accepted_limit_price": accepted_limit_price,
+                "submitted_limit_price": submitted_price_for_intent,
                 "instrument_id": str(trade_instrument_id),
                 "token_id": token_id,
                 "slug": market_slug,
@@ -4668,7 +5387,7 @@ class IntegratedBTCStrategy(Strategy):
                 self.risk_engine.add_position(
                     position_id=unique_id,
                     size=position_size,
-                    entry_price=Decimal(str(trade_price)),
+                    entry_price=entry_price_for_intent,
                     direction="buy_yes" if direction == "long" else "buy_no",
                 )
 
@@ -4679,9 +5398,9 @@ class IntegratedBTCStrategy(Strategy):
             logger.info(f"  Direction: {trade_label}")
             logger.info(f"  Side: BUY")
             logger.info(f"  Spend Amount: ${max_usd_amount:.2f} USDC.e")
-            logger.info(f"  Estimated Tokens: {estimated_tokens:.6f}")
-            logger.info(f"  Estimated Price: ${trade_price:.4f} ({price_source})")
-            logger.info("  Quantity Mode: quote_quantity=True (USDC spend)")
+            logger.info(f"  Estimated Tokens: {float(estimated_tokens_for_intent):.6f}")
+            logger.info(f"  Estimated Price: ${float(entry_price_for_intent):.4f} ({price_source})")
+            logger.info(f"  Quantity Mode: {quantity_mode}")
             logger.info("=" * 80)
 
             self._track_order_event("placed")
@@ -4694,6 +5413,8 @@ class IntegratedBTCStrategy(Strategy):
             if "unique_id" in locals():
                 self._release_submitted_position(unique_id)
             self._track_order_event("rejected")
+            if order_type == ORDER_TYPE_LIMIT_IOC:
+                raise
             return False
 
     # ------------------------------------------------------------------
@@ -4840,6 +5561,9 @@ class IntegratedBTCStrategy(Strategy):
             "size",
             "estimated_tokens",
             "entry_price",
+            "order_type",
+            "quote_quantity",
+            "quantity_mode",
             "instrument_id",
             "token_id",
             "slug",
@@ -4858,14 +5582,19 @@ class IntegratedBTCStrategy(Strategy):
             reason = f"submitted_order_intent_invalid_direction:{direction!r}"
             self._block_live_settlement_ledger(reason)
             raise SettlementLedgerError(reason)
+        order_type = str(meta["order_type"])
+        if order_type not in _ALLOWED_ORDER_TYPES:
+            reason = f"submitted_order_intent_invalid_order_type:{order_type!r}"
+            self._block_live_settlement_ledger(reason)
+            raise SettlementLedgerError(reason)
         return {
             "client_order_id": order_id,
             "order_id": order_id,
             "status": "INTENT_PERSISTED",
             "order_side": "BUY",
-            "order_type": "market_ioc",
-            "quote_quantity": True,
-            "quantity_mode": "quote_quantity",
+            "order_type": order_type,
+            "quote_quantity": meta["quote_quantity"],
+            "quantity_mode": meta["quantity_mode"],
             "direction": direction,
             "outcome_side": "YES" if direction == "long" else "NO",
             "trade_label": meta["trade_label"],
@@ -4874,6 +5603,9 @@ class IntegratedBTCStrategy(Strategy):
             "estimated_tokens": meta["estimated_tokens"],
             "estimated_price": meta["entry_price"],
             "entry_price": meta["entry_price"],
+            "limit_ioc_fill_policy": meta.get("limit_ioc_fill_policy"),
+            "accepted_limit_price": meta.get("accepted_limit_price"),
+            "submitted_limit_price": meta.get("submitted_limit_price"),
             "price_source": price_source,
             "instrument_id": meta["instrument_id"],
             "token_id": meta["token_id"],
@@ -4908,9 +5640,30 @@ class IntegratedBTCStrategy(Strategy):
         )
         self._apply_saved_live_trade_ledger_state(saved_state)
 
+    def _terminal_event_json_snapshot(self, value):
+        if isinstance(value, Decimal):
+            return str(value)
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, dict):
+            return {
+                str(key): self._terminal_event_json_snapshot(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [self._terminal_event_json_snapshot(item) for item in value]
+        return str(value)
+
     def _terminal_event_audit_payload(self, event) -> Dict[str, Any]:
         """Capture terminal event fields for submitted-intent audit."""
         payload = {"event_type": type(event).__name__}
+        raw_event = {
+            "event_type": type(event).__name__,
+            "repr": repr(event),
+            "fields": {},
+        }
         for key in (
             "client_order_id",
             "venue_order_id",
@@ -4919,10 +5672,28 @@ class IntegratedBTCStrategy(Strategy):
             "ts_init",
             "account_id",
             "instrument_id",
+            "info",
+            "last_qty",
+            "filled_qty",
+            "filled",
+            "last_px",
+            "avg_px",
+            *ACTUAL_FILL_UNIQUE_KEY_FIELDS,
         ):
             if hasattr(event, key):
                 value = getattr(event, key)
                 payload[key] = str(value) if value is not None else None
+                raw_event["fields"][key] = self._terminal_event_json_snapshot(value)
+        if hasattr(event, "__dict__"):
+            event_dict = event.__dict__
+            if not isinstance(event_dict, dict):
+                reason = (
+                    f"terminal event {type(event).__name__} __dict__ is not a JSON object"
+                )
+                self._block_live_settlement_ledger(reason)
+                raise SettlementLedgerError(reason)
+            raw_event["instance_attrs"] = self._terminal_event_json_snapshot(event_dict)
+        payload["raw_event"] = raw_event
         return payload
 
     def _decimal_from_terminal_event_field(self, field: str, value) -> Decimal:
@@ -4977,10 +5748,12 @@ class IntegratedBTCStrategy(Strategy):
             if parsed != 0:
                 non_zero_evidence[key] = str(value)
 
-        if hasattr(event, "trade_id"):
-            value = getattr(event, "trade_id")
+        for key in ACTUAL_FILL_UNIQUE_KEY_FIELDS:
+            if not hasattr(event, key):
+                continue
+            value = getattr(event, key)
             if value not in (None, ""):
-                non_zero_evidence["trade_id"] = str(value)
+                non_zero_evidence[key] = str(value)
 
         if non_zero_evidence:
             reason = (
@@ -5048,6 +5821,848 @@ class IntegratedBTCStrategy(Strategy):
             self._apply_saved_live_trade_ledger_state(saved_state)
             return True
 
+    def _positive_recorded_fill_qty(self, order_id: str, context: str, raw_qty) -> bool:
+        try:
+            qty = Decimal(str(raw_qty))
+        except Exception as exc:
+            reason = f"{context} for {order_id} has invalid fill quantity: {raw_qty!r}"
+            self._block_live_settlement_ledger(reason)
+            raise SettlementLedgerError(reason) from exc
+        if not qty.is_finite() or qty < 0:
+            reason = f"{context} for {order_id} has impossible fill quantity: {raw_qty!r}"
+            self._block_live_settlement_ledger(reason)
+            raise SettlementLedgerError(reason)
+        return qty > 0
+
+    def _terminal_event_fill_detail_candidates(
+        self,
+        order_id: str,
+        event,
+    ) -> List[TerminalFillDetails]:
+        field_pairs = (
+            ("filled_qty", "avg_px", "cumulative", "average_price"),
+            ("filled", "avg_px", "cumulative", "average_price"),
+            ("last_qty", "last_px", "incremental", "last_price"),
+            ("last_qty", "avg_px", "incremental", "average_price"),
+            ("filled_qty", "last_px", "cumulative", "last_price"),
+            ("filled", "last_px", "cumulative", "last_price"),
+        )
+        candidates = []
+        for qty_field, price_field, quantity_semantics, price_semantics in field_pairs:
+            if not hasattr(event, qty_field) or not hasattr(event, price_field):
+                continue
+            raw_qty = getattr(event, qty_field)
+            raw_price = getattr(event, price_field)
+            if raw_qty in (None, "") or raw_price in (None, ""):
+                continue
+            qty = self._decimal_from_terminal_event_field(qty_field, raw_qty)
+            price = self._decimal_from_terminal_event_field(price_field, raw_price)
+            if qty < 0 or price < 0:
+                reason = (
+                    f"terminal order event for {order_id} has negative fill details; "
+                    f"{qty_field}={raw_qty!r} {price_field}={raw_price!r}"
+                )
+                self._block_live_settlement_ledger(reason)
+                raise SettlementLedgerError(reason)
+            if qty > 0 and price > 0:
+                candidates.append(
+                    TerminalFillDetails(
+                        quantity=qty,
+                        price=price,
+                        field_source=f"{qty_field}/{price_field}",
+                        quantity_semantics=quantity_semantics,
+                        price_semantics=price_semantics,
+                    )
+                )
+            if qty > 0 and price <= 0:
+                reason = (
+                    f"terminal order event for {order_id} has positive fill quantity "
+                    f"but non-positive fill price; {qty_field}={raw_qty!r} "
+                    f"{price_field}={raw_price!r}"
+                )
+                self._block_live_settlement_ledger(reason)
+                raise SettlementLedgerError(reason)
+        return candidates
+
+    def _terminal_event_fill_details(
+        self,
+        order_id: str,
+        event,
+    ) -> Optional[TerminalFillDetails]:
+        candidates = self._terminal_event_fill_detail_candidates(order_id, event)
+        if not candidates:
+            return None
+        return candidates[0]
+
+    def _terminal_event_positive_quantities(self, order_id: str, event) -> Dict[str, Decimal]:
+        quantities = {}
+        for qty_field in ("last_qty", "filled_qty", "filled"):
+            if not hasattr(event, qty_field):
+                continue
+            raw_qty = getattr(event, qty_field)
+            if raw_qty in (None, ""):
+                continue
+            qty = self._decimal_from_terminal_event_field(qty_field, raw_qty)
+            if qty < 0:
+                reason = (
+                    f"terminal order event for {order_id} has negative fill quantity; "
+                    f"{qty_field}={raw_qty!r}"
+                )
+                self._block_live_settlement_ledger(reason)
+                raise SettlementLedgerError(reason)
+            if qty > 0:
+                quantities[qty_field] = qty
+        return quantities
+
+    def _terminal_event_quantity_values(self, order_id: str, event) -> Dict[str, Decimal]:
+        quantities = {}
+        for qty_field in ("last_qty", "filled_qty", "filled"):
+            if not hasattr(event, qty_field):
+                continue
+            raw_qty = getattr(event, qty_field)
+            if raw_qty in (None, ""):
+                continue
+            qty = self._decimal_from_terminal_event_field(qty_field, raw_qty)
+            if qty < 0:
+                reason = (
+                    f"terminal order event for {order_id} has negative fill quantity; "
+                    f"{qty_field}={raw_qty!r}"
+                )
+                self._block_live_settlement_ledger(reason)
+                raise SettlementLedgerError(reason)
+            quantities[qty_field] = qty
+        return quantities
+
+    def _add_fill_metadata_value(
+        self,
+        metadata: Dict[str, str],
+        key: str,
+        value,
+        source: str,
+        order_id: str,
+    ) -> None:
+        if value in (None, ""):
+            return
+        value_str = str(value)
+        existing_value = metadata.get(key)
+        if existing_value is not None and existing_value != value_str:
+            reason = (
+                f"fill metadata for {order_id} conflicts on {key}: "
+                f"{existing_value!r} != {value_str!r} from {source}"
+            )
+            self._block_live_settlement_ledger(reason)
+            raise SettlementLedgerError(reason)
+        metadata[key] = value_str
+
+    def _terminal_event_fill_metadata(self, event) -> Dict[str, str]:
+        order_id = str(getattr(event, "client_order_id", "<missing-client-order-id>"))
+        metadata = {}
+        for key in FILL_METADATA_IDENTITY_KEYS:
+            if hasattr(event, key):
+                self._add_fill_metadata_value(
+                    metadata,
+                    key,
+                    getattr(event, key),
+                    f"event.{key}",
+                    order_id,
+                )
+        info = getattr(event, "info", None)
+        if info not in (None, ""):
+            if not isinstance(info, dict):
+                reason = f"fill metadata for {order_id} has non-dict event.info"
+                self._block_live_settlement_ledger(reason)
+                raise SettlementLedgerError(reason)
+            for source_key in AUTO_REDEEM_TOKEN_HINT_KEYS:
+                if source_key in info:
+                    self._add_fill_metadata_value(
+                        metadata,
+                        "token_id",
+                        info[source_key],
+                        f"event.info[{source_key!r}]",
+                        order_id,
+                    )
+            for source_key in FILL_INFO_CONDITION_HINT_KEYS:
+                if source_key in info:
+                    self._add_fill_metadata_value(
+                        metadata,
+                        "condition_id",
+                        info[source_key],
+                        f"event.info[{source_key!r}]",
+                        order_id,
+                    )
+            for source_key in FILL_INFO_SLUG_HINT_KEYS:
+                if source_key in info:
+                    self._add_fill_metadata_value(
+                        metadata,
+                        "slug",
+                        info[source_key],
+                        f"event.info[{source_key!r}]",
+                        order_id,
+                    )
+        if "instrument_id" in metadata:
+            instrument_identity = self._extract_polymarket_instrument_identity(
+                metadata["instrument_id"],
+                f"fill metadata for {order_id}",
+                block_settlement_ledger=True,
+            )
+            for key, value in instrument_identity.items():
+                self._add_fill_metadata_value(
+                    metadata,
+                    key,
+                    value,
+                    "event.instrument_id",
+                    order_id,
+                )
+        return metadata
+
+    def _recorded_fill_accounting_snapshot(self, order_id: str) -> Optional[Dict[str, Any]]:
+        with self._settlement_lock:
+            open_meta = self._open_live_trades.get(order_id)
+            if open_meta is not None:
+                if not isinstance(open_meta, dict):
+                    reason = f"open live trade for {order_id} is not a JSON object"
+                    self._block_live_settlement_ledger(reason)
+                    raise SettlementLedgerError(reason)
+                size, filled_qty, entry_price = self._settlement_accounting_values(order_id, open_meta)
+                return {
+                    "source": "open_live_trades",
+                    "filled_qty": filled_qty,
+                    "filled_notional": size,
+                    "vwap": entry_price,
+                    "meta": copy.deepcopy(open_meta),
+                }
+
+            submitted_meta = self._submitted_positions.get(order_id)
+            if submitted_meta is not None and not isinstance(submitted_meta, dict):
+                reason = f"submitted position for {order_id} is not a JSON object"
+                self._block_live_settlement_ledger(reason)
+                raise SettlementLedgerError(reason)
+            if isinstance(submitted_meta, dict):
+                actual_qty = submitted_meta.get("_actual_filled_qty")
+                actual_vwap = submitted_meta.get("_actual_fill_vwap")
+                if (actual_qty in (None, "")) != (actual_vwap in (None, "")):
+                    reason = f"submitted position for {order_id} has incomplete actual-fill evidence"
+                    self._block_live_settlement_ledger(reason)
+                    raise SettlementLedgerError(reason)
+                if actual_qty not in (None, ""):
+                    try:
+                        filled_qty = Decimal(str(actual_qty))
+                        vwap = Decimal(str(actual_vwap))
+                    except Exception as exc:
+                        reason = f"submitted position for {order_id} has invalid actual-fill evidence"
+                        self._block_live_settlement_ledger(reason)
+                        raise SettlementLedgerError(reason) from exc
+                    if (
+                        not filled_qty.is_finite()
+                        or not vwap.is_finite()
+                        or filled_qty <= 0
+                        or vwap <= 0
+                        or vwap > 1
+                    ):
+                        reason = f"submitted position for {order_id} has impossible actual-fill evidence"
+                        self._block_live_settlement_ledger(reason)
+                        raise SettlementLedgerError(reason)
+                    return {
+                        "source": "submitted_position_actual_fill_override",
+                        "filled_qty": filled_qty,
+                        "filled_notional": filled_qty * vwap,
+                        "vwap": vwap,
+                        "meta": copy.deepcopy(submitted_meta),
+                    }
+
+            pending_actual_fill = self._pending_actual_fills.get(order_id)
+            if pending_actual_fill is None:
+                return None
+            if not isinstance(pending_actual_fill, dict):
+                reason = f"pending actual fill for {order_id} is not a JSON object"
+                self._block_live_settlement_ledger(reason)
+                raise SettlementLedgerError(reason)
+            if pending_actual_fill.get("requires_external_fill_repair") is True:
+                reason = f"pending actual fill for {order_id} already requires external repair"
+                self._block_live_settlement_ledger(reason)
+                raise SettlementLedgerError(reason)
+            filled_qty, filled_notional, vwap = self._validate_pending_actual_fill_aggregate(
+                order_id,
+                pending_actual_fill,
+            )
+            return {
+                "source": "pending_actual_fills",
+                "filled_qty": filled_qty,
+                "filled_notional": filled_notional,
+                "vwap": vwap,
+                "meta": copy.deepcopy(pending_actual_fill),
+            }
+
+    def _record_terminal_cumulative_fill_unknown(
+        self,
+        order_id: str,
+        fill_details: TerminalFillDetails,
+        fill_metadata: Dict[str, str],
+        reason: str,
+        recorded_snapshot: Optional[Dict[str, Any]],
+    ) -> None:
+        payload = {
+            "status": "failed",
+            "reason": reason,
+            "fill_price": str(fill_details.price),
+            "fill_qty": str(fill_details.quantity),
+            "terminal_fill_field_source": fill_details.field_source,
+            "terminal_fill_quantity_semantics": fill_details.quantity_semantics,
+            "terminal_fill_price_semantics": fill_details.price_semantics,
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if recorded_snapshot is not None:
+            payload["recorded_fill_source"] = recorded_snapshot["source"]
+            payload["recorded_filled_qty"] = str(recorded_snapshot["filled_qty"])
+            payload["recorded_filled_notional"] = str(recorded_snapshot["filled_notional"])
+            payload["recorded_vwap"] = str(recorded_snapshot["vwap"])
+        payload = self._fill_failure_payload_with_identity(payload, fill_metadata)
+        self._create_direct_fill_unknown_preserving_pending(order_id, payload)
+        self._block_live_settlement_ledger(
+            f"refused terminal cumulative fill for {order_id}: {reason}; "
+            "SETTLEMENT_UNKNOWN created for manual reconciliation"
+        )
+        raise SettlementLedgerError(reason)
+
+    def _record_terminal_fill_evidence_unknown(
+        self,
+        order_id: str,
+        fill_metadata: Dict[str, str],
+        reason: str,
+        recorded_snapshot: Optional[Dict[str, Any]],
+        evidence_payload: Dict[str, Any],
+    ) -> None:
+        payload = {
+            "status": "failed",
+            "reason": reason,
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        }
+        payload.update(evidence_payload)
+        if recorded_snapshot is not None:
+            payload["recorded_fill_source"] = recorded_snapshot["source"]
+            payload["recorded_filled_qty"] = str(recorded_snapshot["filled_qty"])
+            payload["recorded_filled_notional"] = str(recorded_snapshot["filled_notional"])
+            payload["recorded_vwap"] = str(recorded_snapshot["vwap"])
+        payload = self._fill_failure_payload_with_identity(payload, fill_metadata)
+        self._create_direct_fill_unknown_preserving_pending(order_id, payload)
+        self._block_live_settlement_ledger(
+            f"refused terminal fill evidence for {order_id}: {reason}; "
+            "SETTLEMENT_UNKNOWN created for manual reconciliation"
+        )
+        raise SettlementLedgerError(f"{reason}: fill evidence requires reconciliation")
+
+    def _enforce_terminal_fill_metadata_matches_recorded(
+        self,
+        order_id: str,
+        fill_details: TerminalFillDetails,
+        fill_metadata: Dict[str, str],
+        recorded_snapshot: Dict[str, Any],
+    ) -> None:
+        tracked_meta = recorded_snapshot["meta"]
+        for key, value_str in fill_metadata.items():
+            existing_value = tracked_meta.get(key)
+            if existing_value not in (None, "") and str(existing_value) != value_str:
+                self._record_fill_metadata_conflict_unknown(
+                    order_id,
+                    fill_details.price,
+                    fill_details.quantity,
+                    key,
+                    existing_value,
+                    value_str,
+                    fill_metadata,
+                )
+
+    def _terminal_fill_tracking_meta(
+        self,
+        order_id: str,
+        recorded_snapshot: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if recorded_snapshot is not None:
+            return recorded_snapshot["meta"]
+        with self._settlement_lock:
+            for source_name, source in (
+                ("submitted position", self._submitted_positions.get(order_id)),
+                ("open live trade", self._open_live_trades.get(order_id)),
+            ):
+                if source is None:
+                    continue
+                if not isinstance(source, dict):
+                    reason = f"{source_name} for {order_id} is not a JSON object"
+                    self._block_live_settlement_ledger(reason)
+                    raise SettlementLedgerError(reason)
+                return copy.deepcopy(source)
+        return None
+
+    def _validate_terminal_fill_detail_candidates(
+        self,
+        order_id: str,
+        selected: TerminalFillDetails,
+        candidates: List[TerminalFillDetails],
+        fill_metadata: Dict[str, str],
+        recorded_snapshot: Optional[Dict[str, Any]],
+    ) -> None:
+        tracking_meta = self._terminal_fill_tracking_meta(order_id, recorded_snapshot)
+        if tracking_meta is None:
+            return
+        selected_delta_qty = None
+        selected_delta_notional = None
+        if selected.quantity_semantics == "cumulative" and selected.price_semantics == "average_price":
+            selected_notional = selected.quantity * selected.price
+            if recorded_snapshot is not None:
+                recorded_qty = recorded_snapshot["filled_qty"]
+                recorded_notional = recorded_snapshot["filled_notional"]
+                if selected.quantity >= recorded_qty:
+                    selected_delta_qty = selected.quantity - recorded_qty
+                    selected_delta_notional = selected_notional - recorded_notional
+            else:
+                selected_delta_qty = selected.quantity
+                selected_delta_notional = selected_notional
+        for candidate in candidates:
+            if candidate.field_source == selected.field_source:
+                continue
+            if (
+                selected.quantity_semantics == "incremental"
+                and candidate.quantity_semantics == "cumulative"
+                and candidate.price_semantics != "average_price"
+            ):
+                self._record_terminal_fill_evidence_unknown(
+                    order_id,
+                    fill_metadata,
+                    "terminal_cumulative_fill_requires_average_price",
+                    recorded_snapshot,
+                    {
+                        "selected_terminal_fill_field_source": selected.field_source,
+                        "selected_terminal_fill_qty": str(selected.quantity),
+                        "selected_terminal_fill_price": str(selected.price),
+                        "terminal_fill_field_source": candidate.field_source,
+                        "terminal_fill_quantity_semantics": candidate.quantity_semantics,
+                        "terminal_fill_price_semantics": candidate.price_semantics,
+                        "fill_qty": str(candidate.quantity),
+                        "fill_price": str(candidate.price),
+                    },
+                )
+            violation = self._limit_ioc_fill_envelope_violation(
+                tracking_meta,
+                candidate.quantity,
+                candidate.price,
+            )
+            if violation:
+                self._record_terminal_fill_evidence_unknown(
+                    order_id,
+                    fill_metadata,
+                    f"terminal_fill_conflicting_evidence:{violation}",
+                    recorded_snapshot,
+                    {
+                        "terminal_fill_field_source": candidate.field_source,
+                        "terminal_fill_quantity_semantics": candidate.quantity_semantics,
+                        "terminal_fill_price_semantics": candidate.price_semantics,
+                        "fill_qty": str(candidate.quantity),
+                        "fill_price": str(candidate.price),
+                    },
+                )
+            if (
+                selected.quantity_semantics == "cumulative"
+                and selected_delta_qty is not None
+                and selected_delta_notional is not None
+            ):
+                if candidate.quantity_semantics == "incremental":
+                    candidate_notional = candidate.quantity * candidate.price
+                    if (
+                        candidate.quantity - selected_delta_qty > SETTLEMENT_ACCOUNTING_COST_TOLERANCE
+                        or candidate_notional - selected_delta_notional > SETTLEMENT_ACCOUNTING_COST_TOLERANCE
+                    ):
+                        self._record_terminal_fill_evidence_unknown(
+                            order_id,
+                            fill_metadata,
+                            "terminal_fill_conflicting_evidence_exceeds_cumulative_delta",
+                            recorded_snapshot,
+                            {
+                                "selected_terminal_fill_field_source": selected.field_source,
+                                "selected_terminal_fill_qty": str(selected.quantity),
+                                "selected_terminal_fill_price": str(selected.price),
+                                "selected_terminal_delta_qty": str(selected_delta_qty),
+                                "selected_terminal_delta_notional": str(selected_delta_notional),
+                                "terminal_fill_field_source": candidate.field_source,
+                                "terminal_fill_quantity_semantics": candidate.quantity_semantics,
+                                "terminal_fill_price_semantics": candidate.price_semantics,
+                                "fill_qty": str(candidate.quantity),
+                                "fill_price": str(candidate.price),
+                            },
+                        )
+                elif (
+                    candidate.quantity_semantics == "cumulative"
+                    and candidate.price_semantics == "average_price"
+                ):
+                    candidate_notional = candidate.quantity * candidate.price
+                    selected_notional = selected.quantity * selected.price
+                    if (
+                        abs(candidate.quantity - selected.quantity) > SETTLEMENT_ACCOUNTING_COST_TOLERANCE
+                        or abs(candidate_notional - selected_notional) > SETTLEMENT_ACCOUNTING_COST_TOLERANCE
+                    ):
+                        self._record_terminal_fill_evidence_unknown(
+                            order_id,
+                            fill_metadata,
+                            "terminal_fill_conflicting_cumulative_evidence",
+                            recorded_snapshot,
+                            {
+                                "selected_terminal_fill_field_source": selected.field_source,
+                                "selected_terminal_fill_qty": str(selected.quantity),
+                                "selected_terminal_fill_price": str(selected.price),
+                                "terminal_fill_field_source": candidate.field_source,
+                                "terminal_fill_quantity_semantics": candidate.quantity_semantics,
+                                "terminal_fill_price_semantics": candidate.price_semantics,
+                                "fill_qty": str(candidate.quantity),
+                                "fill_price": str(candidate.price),
+                            },
+                        )
+
+    def _validate_terminal_quantity_consistency(
+        self,
+        order_id: str,
+        selected: TerminalFillDetails,
+        quantity_values: Dict[str, Decimal],
+        fill_metadata: Dict[str, str],
+        recorded_snapshot: Optional[Dict[str, Any]],
+    ) -> None:
+        selected_floor = selected.quantity
+        if (
+            recorded_snapshot is not None
+            and selected.quantity_semantics == "incremental"
+        ):
+            selected_floor += recorded_snapshot["filled_qty"]
+        for key in ("filled_qty", "filled"):
+            if key not in quantity_values:
+                continue
+            cumulative_qty = quantity_values[key]
+            if cumulative_qty + SETTLEMENT_ACCOUNTING_COST_TOLERANCE < selected_floor:
+                self._record_terminal_fill_evidence_unknown(
+                    order_id,
+                    fill_metadata,
+                    "terminal_cumulative_quantity_below_selected_fill_evidence",
+                    recorded_snapshot,
+                    {
+                        "terminal_quantity_field": key,
+                        "terminal_quantity_value": str(cumulative_qty),
+                        "selected_terminal_fill_field_source": selected.field_source,
+                        "selected_terminal_fill_qty": str(selected.quantity),
+                        "selected_terminal_fill_price": str(selected.price),
+                        "minimum_cumulative_qty_from_selected_evidence": str(selected_floor),
+                    },
+                )
+
+    def _handle_terminal_cumulative_fill(
+        self,
+        order_id: str,
+        terminal_intent_status: str,
+        terminal_event,
+        fill_details: TerminalFillDetails,
+        fill_metadata: Dict[str, str],
+        recorded_snapshot: Optional[Dict[str, Any]],
+    ) -> str:
+        if recorded_snapshot is None:
+            if fill_details.price_semantics != "average_price":
+                self._record_terminal_cumulative_fill_unknown(
+                    order_id,
+                    fill_details,
+                    fill_metadata,
+                    "terminal_cumulative_fill_requires_average_price",
+                    recorded_snapshot,
+                )
+            if self._record_live_order_fill(
+                order_id,
+                fill_details.price,
+                fill_details.quantity,
+                fill_metadata=fill_metadata,
+            ):
+                self._track_order_event("filled")
+            return "filled"
+
+        self._enforce_terminal_fill_metadata_matches_recorded(
+            order_id,
+            fill_details,
+            fill_metadata,
+            recorded_snapshot,
+        )
+        recorded_qty = recorded_snapshot["filled_qty"]
+        if fill_details.quantity < recorded_qty:
+            self._record_terminal_cumulative_fill_unknown(
+                order_id,
+                fill_details,
+                fill_metadata,
+                "terminal_cumulative_fill_below_recorded_fill",
+                recorded_snapshot,
+            )
+        if fill_details.quantity == recorded_qty:
+            if fill_details.price_semantics != "average_price":
+                self._record_terminal_cumulative_fill_unknown(
+                    order_id,
+                    fill_details,
+                    fill_metadata,
+                    "terminal_cumulative_fill_equal_requires_average_price",
+                    recorded_snapshot,
+                )
+            terminal_notional = fill_details.quantity * fill_details.price
+            recorded_notional = recorded_snapshot["filled_notional"]
+            if abs(terminal_notional - recorded_notional) > SETTLEMENT_ACCOUNTING_COST_TOLERANCE:
+                self._record_terminal_cumulative_fill_unknown(
+                    order_id,
+                    fill_details,
+                    fill_metadata,
+                    "terminal_cumulative_fill_conflicts_with_recorded_accounting",
+                    recorded_snapshot,
+                )
+            violation = self._limit_ioc_fill_envelope_violation(
+                recorded_snapshot["meta"],
+                fill_details.quantity,
+                fill_details.price,
+            )
+            if violation:
+                self._record_terminal_cumulative_fill_unknown(
+                    order_id,
+                    fill_details,
+                    fill_metadata,
+                    f"terminal_cumulative_fill_conflicts_with_envelope:{violation}",
+                    recorded_snapshot,
+                )
+            self._release_submitted_position(
+                order_id,
+                terminal_intent_status=terminal_intent_status,
+                terminal_event=terminal_event,
+            )
+            return "existing_fill_evidence"
+
+        if fill_details.price_semantics != "average_price":
+            self._record_terminal_cumulative_fill_unknown(
+                order_id,
+                fill_details,
+                fill_metadata,
+                "terminal_cumulative_fill_delta_requires_average_price",
+                recorded_snapshot,
+            )
+        if recorded_snapshot["source"] != "open_live_trades":
+            self._record_terminal_cumulative_fill_unknown(
+                order_id,
+                fill_details,
+                fill_metadata,
+                "terminal_cumulative_fill_delta_requires_recorded_open_trade",
+                recorded_snapshot,
+            )
+        terminal_notional = fill_details.quantity * fill_details.price
+        recorded_notional = recorded_snapshot["filled_notional"]
+        delta_qty = fill_details.quantity - recorded_qty
+        delta_notional = terminal_notional - recorded_notional
+        if delta_qty <= 0 or delta_notional <= 0:
+            self._record_terminal_cumulative_fill_unknown(
+                order_id,
+                fill_details,
+                fill_metadata,
+                "terminal_cumulative_fill_non_positive_delta",
+                recorded_snapshot,
+            )
+        delta_price = delta_notional / delta_qty
+        if not delta_price.is_finite() or delta_price <= 0 or delta_price > 1:
+            self._record_terminal_cumulative_fill_unknown(
+                order_id,
+                fill_details,
+                fill_metadata,
+                "terminal_cumulative_fill_invalid_delta_price",
+                recorded_snapshot,
+            )
+        if self._record_live_order_fill(
+            order_id,
+            delta_price,
+            delta_qty,
+            fill_metadata=fill_metadata,
+        ):
+            self._track_order_event("filled")
+        return "filled"
+
+    def _recorded_fill_evidence_source(self, order_id: str) -> Optional[str]:
+        with self._settlement_lock:
+            if order_id in self._open_live_trades:
+                return "open_live_trades"
+
+            submitted_meta = self._submitted_positions.get(order_id)
+            if submitted_meta is not None and not isinstance(submitted_meta, dict):
+                reason = f"submitted position for {order_id} is not a JSON object"
+                self._block_live_settlement_ledger(reason)
+                raise SettlementLedgerError(reason)
+            if isinstance(submitted_meta, dict):
+                actual_qty = submitted_meta.get("_actual_filled_qty")
+                if actual_qty not in (None, "") and self._positive_recorded_fill_qty(
+                    order_id,
+                    "_actual_filled_qty",
+                    actual_qty,
+                ):
+                    return "submitted_position_actual_fill_override"
+
+            pending_actual_fill = self._pending_actual_fills.get(order_id)
+            if pending_actual_fill is None:
+                return None
+            if not isinstance(pending_actual_fill, dict):
+                reason = f"pending actual fill for {order_id} is not a JSON object"
+                self._block_live_settlement_ledger(reason)
+                raise SettlementLedgerError(reason)
+            if pending_actual_fill.get("requires_external_fill_repair") is True:
+                return "pending_actual_fills_external_repair"
+            fills = pending_actual_fill.get("fills")
+            if fills is not None:
+                if not isinstance(fills, list):
+                    reason = f"pending actual fill for {order_id} has non-list fills"
+                    self._block_live_settlement_ledger(reason)
+                    raise SettlementLedgerError(reason)
+                if fills:
+                    try:
+                        self._aggregate_actual_fill_entries(order_id, fills)
+                    except SettlementLedgerError as exc:
+                        reason = f"pending actual fill for {order_id} has invalid fill evidence: {exc}"
+                        self._block_live_settlement_ledger(reason)
+                        raise SettlementLedgerError(reason) from exc
+                    return "pending_actual_fills"
+            total_filled_qty = pending_actual_fill.get("total_filled_qty")
+            if total_filled_qty not in (None, "") and self._positive_recorded_fill_qty(
+                order_id,
+                "pending actual fill total_filled_qty",
+                total_filled_qty,
+            ):
+                return "pending_actual_fills_total_qty"
+            reason = f"pending actual fill for {order_id} has no positive fill evidence"
+            self._block_live_settlement_ledger(reason)
+            raise SettlementLedgerError(reason)
+
+    def _handle_terminal_order_event(
+        self,
+        event,
+        terminal_intent_status: str,
+        *,
+        allow_no_fill: bool = True,
+    ) -> str:
+        if not hasattr(event, "client_order_id") or event.client_order_id in (None, ""):
+            reason = f"terminal order event missing client_order_id for {terminal_intent_status}"
+            self._block_live_settlement_ledger(reason)
+            raise SettlementLedgerError(reason)
+        order_id = str(event.client_order_id)
+        recorded_snapshot = self._recorded_fill_accounting_snapshot(order_id)
+        try:
+            fill_metadata = self._terminal_event_fill_metadata(event)
+        except SettlementLedgerError as exc:
+            self._record_terminal_fill_evidence_unknown(
+                order_id,
+                {},
+                "terminal_fill_metadata_identity_conflict",
+                recorded_snapshot,
+                {
+                    "terminal_metadata_error": str(exc),
+                    "terminal_event": self._terminal_event_audit_payload(event),
+                },
+            )
+        try:
+            fill_candidates = self._terminal_event_fill_detail_candidates(order_id, event)
+            quantity_values = self._terminal_event_quantity_values(order_id, event)
+            positive_quantities = self._terminal_event_positive_quantities(order_id, event)
+        except SettlementLedgerError as exc:
+            self._record_terminal_fill_evidence_unknown(
+                order_id,
+                fill_metadata,
+                "terminal_fill_evidence_parse_error",
+                recorded_snapshot,
+                {
+                    "terminal_parse_error": str(exc),
+                    "terminal_event": self._terminal_event_audit_payload(event),
+                },
+            )
+        fill_details = fill_candidates[0] if fill_candidates else None
+        if fill_details is not None:
+            logger.warning(
+                f"Terminal order event for {order_id} carries fill details "
+                f"({fill_details.field_source}); recording fill before terminal no-fill handling"
+            )
+            self._validate_terminal_fill_detail_candidates(
+                order_id,
+                fill_details,
+                fill_candidates,
+                fill_metadata,
+                recorded_snapshot,
+            )
+            self._validate_terminal_quantity_consistency(
+                order_id,
+                fill_details,
+                quantity_values,
+                fill_metadata,
+                recorded_snapshot,
+            )
+            if fill_details.quantity_semantics == "cumulative":
+                return self._handle_terminal_cumulative_fill(
+                    order_id,
+                    terminal_intent_status,
+                    event,
+                    fill_details,
+                    fill_metadata,
+                    recorded_snapshot,
+                )
+            if (
+                recorded_snapshot is not None
+                and fill_details.price_semantics == "average_price"
+            ):
+                self._record_terminal_fill_evidence_unknown(
+                    order_id,
+                    fill_metadata,
+                    "terminal_incremental_fill_uses_average_price_after_recorded_fill",
+                    recorded_snapshot,
+                    {
+                        "terminal_fill_field_source": fill_details.field_source,
+                        "terminal_fill_quantity_semantics": fill_details.quantity_semantics,
+                        "terminal_fill_price_semantics": fill_details.price_semantics,
+                        "fill_qty": str(fill_details.quantity),
+                        "fill_price": str(fill_details.price),
+                    },
+                )
+            if self._record_live_order_fill(
+                order_id,
+                fill_details.price,
+                fill_details.quantity,
+                fill_metadata=fill_metadata,
+            ):
+                self._track_order_event("filled")
+            return "filled"
+
+        if positive_quantities:
+            self._record_terminal_fill_evidence_unknown(
+                order_id,
+                fill_metadata,
+                "terminal_positive_fill_evidence_without_price",
+                recorded_snapshot,
+                {
+                    "terminal_positive_fill_quantities": {
+                        key: str(value) for key, value in positive_quantities.items()
+                    },
+                },
+            )
+
+        if recorded_snapshot is not None:
+            self._enforce_terminal_no_fill_metadata_matches_recorded(
+                order_id,
+                fill_metadata,
+                recorded_snapshot,
+                event,
+            )
+            self._release_submitted_position(
+                order_id,
+                terminal_intent_status=terminal_intent_status,
+                terminal_event=event,
+            )
+            return "existing_fill_evidence"
+
+        if not allow_no_fill:
+            return "unclassified"
+
+        self._release_submitted_position(
+            order_id,
+            terminal_intent_status=terminal_intent_status,
+            terminal_event=event,
+        )
+        return "no_fill"
+
     def _release_submitted_position(
         self,
         client_order_id,
@@ -5061,6 +6676,13 @@ class IntegratedBTCStrategy(Strategy):
             has_submitted_intent = order_id in self._submitted_order_intents
         zero_fill_evidence = None
         if terminal_intent_status is not None:
+            fill_evidence_source = self._recorded_fill_evidence_source(order_id)
+            if fill_evidence_source is not None:
+                logger.warning(
+                    f"Ignoring terminal no-fill classification for {order_id}: "
+                    f"recorded fill evidence exists in {fill_evidence_source}"
+                )
+                return meta
             zero_fill_evidence = self._verify_terminal_event_no_fill(
                 order_id,
                 terminal_intent_status,
@@ -5095,6 +6717,7 @@ class IntegratedBTCStrategy(Strategy):
         fill_price,
         fill_qty,
         reason: str,
+        fill_metadata: Dict[str, Any],
     ) -> bool:
         payload = {
             "status": "failed",
@@ -5103,6 +6726,7 @@ class IntegratedBTCStrategy(Strategy):
             "fill_qty": str(fill_qty),
             "received_at": datetime.now(timezone.utc).isoformat(),
         }
+        payload = self._fill_failure_payload_with_identity(payload, fill_metadata)
         self._create_direct_fill_unknown_preserving_pending(order_id, payload)
         self._block_live_settlement_ledger(
             f"refused fill for {order_id}: {reason}; "
@@ -5110,7 +6734,163 @@ class IntegratedBTCStrategy(Strategy):
         )
         return False
 
-    def _create_direct_fill_unknown_preserving_pending(self, order_id: str, payload: Dict[str, Any]) -> None:
+    def _fill_failure_payload_with_identity(
+        self,
+        payload: Dict[str, Any],
+        meta: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        enriched = dict(payload)
+        for key in FILL_METADATA_IDENTITY_KEYS:
+            value = meta.get(key)
+            if value not in (None, "") and key not in enriched:
+                enriched[key] = value
+        return enriched
+
+    def _normalize_fill_metadata(
+        self,
+        order_id: str,
+        fill_metadata: Dict[str, Any],
+    ) -> Dict[str, str]:
+        if fill_metadata is None:
+            reason = f"fill metadata for {order_id} is missing"
+            self._block_live_settlement_ledger(reason)
+            raise SettlementLedgerError(reason)
+        if not isinstance(fill_metadata, dict):
+            reason = f"fill metadata for {order_id} is not a JSON object"
+            self._block_live_settlement_ledger(reason)
+            raise SettlementLedgerError(reason)
+        normalized = {}
+        for key in FILL_METADATA_IDENTITY_KEYS:
+            if key not in fill_metadata:
+                continue
+            value = fill_metadata[key]
+            if value not in (None, ""):
+                normalized[key] = str(value)
+        return normalized
+
+    def _record_fill_metadata_conflict_unknown(
+        self,
+        order_id: str,
+        fill_price,
+        fill_qty,
+        key: str,
+        tracked_value,
+        terminal_value: str,
+        normalized_fill_metadata: Dict[str, str],
+    ) -> None:
+        reason = (
+            f"fill metadata for {order_id} conflicts on {key}: "
+            f"{tracked_value!r} != {terminal_value!r}"
+        )
+        payload = {
+            "status": "failed",
+            "reason": "fill_metadata_conflict",
+            "fill_price": str(fill_price),
+            "fill_qty": str(fill_qty),
+            "fill_metadata_conflict_key": key,
+            f"tracked_{key}": str(tracked_value),
+            f"terminal_{key}": terminal_value,
+            "venue_conflict_reason": reason,
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        }
+        payload = self._fill_failure_payload_with_identity(
+            payload,
+            normalized_fill_metadata,
+        )
+        self._create_direct_fill_unknown_preserving_pending(
+            order_id,
+            payload,
+            skip_venue_validation=True,
+        )
+        self._block_live_settlement_ledger(reason)
+        raise SettlementLedgerError(reason)
+
+    def _record_terminal_no_fill_metadata_conflict_unknown(
+        self,
+        order_id: str,
+        key: str,
+        tracked_value,
+        terminal_value: str,
+        normalized_fill_metadata: Dict[str, str],
+        recorded_snapshot: Dict[str, Any],
+        terminal_event,
+    ) -> None:
+        reason = (
+            f"terminal no-fill metadata for {order_id} conflicts on {key}: "
+            f"{tracked_value!r} != {terminal_value!r}"
+        )
+        payload = {
+            "status": "failed",
+            "reason": "terminal_no_fill_metadata_conflict",
+            "fill_metadata_conflict_key": key,
+            f"tracked_{key}": str(tracked_value),
+            f"terminal_{key}": terminal_value,
+            "venue_conflict_reason": reason,
+            "terminal_event": self._terminal_event_audit_payload(terminal_event),
+            "recorded_fill_source": recorded_snapshot["source"],
+            "recorded_filled_qty": str(recorded_snapshot["filled_qty"]),
+            "recorded_filled_notional": str(recorded_snapshot["filled_notional"]),
+            "recorded_vwap": str(recorded_snapshot["vwap"]),
+            "filled_qty": str(recorded_snapshot["filled_qty"]),
+            "vwap": str(recorded_snapshot["vwap"]),
+            "requires_external_fill_repair": True,
+            "external_fill_repair_reason": "terminal_no_fill_metadata_conflict",
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        }
+        recorded_meta = recorded_snapshot["meta"]
+        recorded_identity = {}
+        for identity_key in FILL_METADATA_IDENTITY_KEYS:
+            if identity_key in recorded_meta and recorded_meta[identity_key] not in (None, ""):
+                identity_value = str(recorded_meta[identity_key])
+                recorded_identity[identity_key] = identity_value
+                payload[f"tracked_{identity_key}"] = identity_value
+                if identity_key != "venue_order_id":
+                    payload[identity_key] = identity_value
+        if recorded_identity:
+            payload["recorded_fill_identity"] = recorded_identity
+        if "fills" in recorded_meta:
+            payload["recorded_fill_entries"] = copy.deepcopy(recorded_meta["fills"])
+        payload = self._fill_failure_payload_with_identity(
+            payload,
+            normalized_fill_metadata,
+        )
+        self._create_durable_settlement_unknown_from_actual_fill(
+            client_order_id=order_id,
+            payload=payload,
+            reason="terminal_no_fill_metadata_conflict",
+            skip_venue_validation=True,
+        )
+        self._block_live_settlement_ledger(reason)
+        raise SettlementLedgerError(reason)
+
+    def _enforce_terminal_no_fill_metadata_matches_recorded(
+        self,
+        order_id: str,
+        fill_metadata: Dict[str, str],
+        recorded_snapshot: Dict[str, Any],
+        terminal_event,
+    ) -> None:
+        tracked_meta = recorded_snapshot["meta"]
+        for key, value_str in fill_metadata.items():
+            existing_value = tracked_meta.get(key)
+            if existing_value not in (None, "") and str(existing_value) != value_str:
+                self._record_terminal_no_fill_metadata_conflict_unknown(
+                    order_id,
+                    key,
+                    existing_value,
+                    value_str,
+                    fill_metadata,
+                    recorded_snapshot,
+                    terminal_event,
+                )
+
+    def _create_direct_fill_unknown_preserving_pending(
+        self,
+        order_id: str,
+        payload: Dict[str, Any],
+        *,
+        skip_venue_validation: bool = False,
+    ) -> None:
         payload = dict(payload)
         reason = str(payload["reason"])
         payload["requires_external_fill_repair"] = True
@@ -5120,11 +6900,28 @@ class IntegratedBTCStrategy(Strategy):
             client_order_id=order_id,
             payload=payload,
             reason=reason,
+            skip_venue_validation=skip_venue_validation,
         )
 
-    def _record_live_order_fill(self, order_id: str, fill_price: Decimal, fill_qty: Decimal) -> bool:
+    def _record_live_order_fill(
+        self,
+        order_id: str,
+        fill_price: Decimal,
+        fill_qty: Decimal,
+        *,
+        fill_metadata: Dict[str, Any],
+    ) -> bool:
         """Track cumulative live fills until final market settlement."""
         with self._settlement_lock:
+            normalized_fill_metadata = self._normalize_fill_metadata(order_id, fill_metadata)
+            if not normalized_fill_metadata:
+                return self._record_invalid_live_fill_unknown(
+                    order_id,
+                    fill_price,
+                    fill_qty,
+                    "missing_fill_identity_metadata_from_nautilus",
+                    fill_metadata={},
+                )
             if self._settlement_ledger_blocked_reason:
                 blocked_reason = self._settlement_ledger_blocked_reason
                 pending_actual_fill = self._pending_actual_fills.get(order_id)
@@ -5149,6 +6946,10 @@ class IntegratedBTCStrategy(Strategy):
                 if order_id not in self._open_live_trades:
                     payload["filled_qty"] = str(fill_qty)
                     payload["vwap"] = str(fill_price)
+                payload = self._fill_failure_payload_with_identity(
+                    payload,
+                    normalized_fill_metadata,
+                )
                 self._create_direct_fill_unknown_preserving_pending(order_id, payload)
                 reason = (
                     f"live fill received while settlement ledger is blocked for {order_id}: "
@@ -5166,6 +6967,7 @@ class IntegratedBTCStrategy(Strategy):
                     fill_price,
                     fill_qty,
                     "invalid_fill_price_or_qty_from_nautilus",
+                    fill_metadata=normalized_fill_metadata,
                 )
             if not fill_price.is_finite() or not fill_qty.is_finite():
                 return self._record_invalid_live_fill_unknown(
@@ -5173,6 +6975,7 @@ class IntegratedBTCStrategy(Strategy):
                     fill_price,
                     fill_qty,
                     "non_finite_fill_price_or_qty_from_nautilus",
+                    fill_metadata=normalized_fill_metadata,
                 )
             if fill_price <= Decimal("0"):
                 return self._record_invalid_live_fill_unknown(
@@ -5180,6 +6983,7 @@ class IntegratedBTCStrategy(Strategy):
                     fill_price,
                     fill_qty,
                     "non_positive_fill_price_from_nautilus",
+                    fill_metadata=normalized_fill_metadata,
                 )
             if fill_qty <= Decimal("0"):
                 return self._record_invalid_live_fill_unknown(
@@ -5187,6 +6991,7 @@ class IntegratedBTCStrategy(Strategy):
                     fill_price,
                     fill_qty,
                     "non_positive_fill_qty_from_nautilus",
+                    fill_metadata=normalized_fill_metadata,
                 )
             if fill_price > Decimal("1"):
                 return self._record_invalid_live_fill_unknown(
@@ -5194,6 +6999,7 @@ class IntegratedBTCStrategy(Strategy):
                     fill_price,
                     fill_qty,
                     "fill_price_above_one_from_nautilus",
+                    fill_metadata=normalized_fill_metadata,
                 )
 
             source_kind = "submitted"
@@ -5211,6 +7017,10 @@ class IntegratedBTCStrategy(Strategy):
                     "fill_qty": str(fill_qty),
                     "received_at": datetime.now(timezone.utc).isoformat(),
                 }
+                payload = self._fill_failure_payload_with_identity(
+                    payload,
+                    normalized_fill_metadata,
+                )
                 self._create_direct_fill_unknown_preserving_pending(order_id, payload)
                 self._block_live_settlement_ledger(
                     f"received fill for untracked order {order_id}; "
@@ -5225,6 +7035,19 @@ class IntegratedBTCStrategy(Strategy):
                 else:
                     meta["submitted_order_intent_malformed"] = True
                     meta["submitted_order_intent_raw"] = copy.deepcopy(submitted_intent)
+            if normalized_fill_metadata:
+                for key, value_str in normalized_fill_metadata.items():
+                    existing_value = meta.get(key)
+                    if existing_value not in (None, "") and str(existing_value) != value_str:
+                        self._record_fill_metadata_conflict_unknown(
+                            order_id,
+                            fill_price,
+                            fill_qty,
+                            key,
+                            existing_value,
+                            value_str,
+                            normalized_fill_metadata,
+                        )
             direction_raw = str(meta.get("direction") or "").lower()
             if direction_raw not in {"long", "short"}:
                 payload = {
@@ -5238,6 +7061,10 @@ class IntegratedBTCStrategy(Strategy):
                 if source_kind != "open":
                     payload["filled_qty"] = str(fill_qty)
                     payload["vwap"] = str(fill_price)
+                payload = self._fill_failure_payload_with_identity(
+                    payload,
+                    normalized_fill_metadata,
+                )
                 self._create_direct_fill_unknown_preserving_pending(order_id, payload)
                 self._block_live_settlement_ledger(
                     f"refused fill for {order_id}: invalid direction metadata {meta.get('direction')!r}; "
@@ -5254,6 +7081,10 @@ class IntegratedBTCStrategy(Strategy):
                     "fill_qty": str(fill_qty),
                     "received_at": datetime.now(timezone.utc).isoformat(),
                 }
+                payload = self._fill_failure_payload_with_identity(
+                    payload,
+                    normalized_fill_metadata,
+                )
                 self._create_direct_fill_unknown_preserving_pending(order_id, payload)
                 self._block_live_settlement_ledger(
                     f"refused fill for {order_id}: incomplete actual-fill override; "
@@ -5272,6 +7103,10 @@ class IntegratedBTCStrategy(Strategy):
                         "fill_qty": str(actual_qty),
                         "received_at": datetime.now(timezone.utc).isoformat(),
                     }
+                    payload = self._fill_failure_payload_with_identity(
+                        payload,
+                        normalized_fill_metadata,
+                    )
                     self._create_direct_fill_unknown_preserving_pending(order_id, payload)
                     self._block_live_settlement_ledger(
                         f"refused fill for {order_id}: actual fill override decimal parsing failed; "
@@ -5286,6 +7121,10 @@ class IntegratedBTCStrategy(Strategy):
                         "fill_qty": str(fill_qty),
                         "received_at": datetime.now(timezone.utc).isoformat(),
                     }
+                    payload = self._fill_failure_payload_with_identity(
+                        payload,
+                        normalized_fill_metadata,
+                    )
                     self._create_direct_fill_unknown_preserving_pending(order_id, payload)
                     self._block_live_settlement_ledger(
                         f"refused fill for {order_id}: actual fill override has non-finite "
@@ -5301,6 +7140,10 @@ class IntegratedBTCStrategy(Strategy):
                         "fill_qty": str(fill_qty),
                         "received_at": datetime.now(timezone.utc).isoformat(),
                     }
+                    payload = self._fill_failure_payload_with_identity(
+                        payload,
+                        normalized_fill_metadata,
+                    )
                     self._create_direct_fill_unknown_preserving_pending(order_id, payload)
                     self._block_live_settlement_ledger(
                         f"refused fill for {order_id}: actual fill override has "
@@ -5316,6 +7159,10 @@ class IntegratedBTCStrategy(Strategy):
                         "fill_qty": str(fill_qty),
                         "received_at": datetime.now(timezone.utc).isoformat(),
                     }
+                    payload = self._fill_failure_payload_with_identity(
+                        payload,
+                        normalized_fill_metadata,
+                    )
                     self._create_direct_fill_unknown_preserving_pending(order_id, payload)
                     self._block_live_settlement_ledger(
                         f"refused fill for {order_id}: actual fill override has "
@@ -5330,12 +7177,48 @@ class IntegratedBTCStrategy(Strategy):
                     reason = f"pending actual fill for {order_id} already requires external repair"
                     self._block_live_settlement_ledger(reason)
                     raise SettlementLedgerError(reason)
-                for key in ("venue_order_id", "condition_id", "token_id", "slug"):
+                for key in FILL_METADATA_IDENTITY_KEYS:
                     value = pending_actual_fill.get(key)
                     if value not in (None, ""):
                         meta[key] = value
                 if pending_actual_fill.get("raw_callback_payload") not in (None, ""):
                     meta["raw_actual_fill_payload"] = copy.deepcopy(pending_actual_fill["raw_callback_payload"])
+
+            if normalized_fill_metadata:
+                for key, value_str in normalized_fill_metadata.items():
+                    existing_value = meta.get(key)
+                    if existing_value not in (None, "") and str(existing_value) != value_str:
+                        self._record_fill_metadata_conflict_unknown(
+                            order_id,
+                            fill_price,
+                            fill_qty,
+                            key,
+                            existing_value,
+                            value_str,
+                            normalized_fill_metadata,
+                        )
+                    meta[key] = value_str
+
+            incoming_limit_violation = self._limit_ioc_fill_envelope_violation(
+                meta,
+                fill_qty,
+                fill_price,
+            )
+            if incoming_limit_violation:
+                payload = {
+                    "status": "failed",
+                    "reason": incoming_limit_violation,
+                    "fill_price": str(fill_price),
+                    "fill_qty": str(fill_qty),
+                    "received_at": datetime.now(timezone.utc).isoformat(),
+                }
+                payload = self._fill_failure_payload_with_identity(payload, meta)
+                self._create_direct_fill_unknown_preserving_pending(order_id, payload)
+                self._block_live_settlement_ledger(
+                    f"refused fill for {order_id}: {incoming_limit_violation}; "
+                    "SETTLEMENT_UNKNOWN created for manual reconciliation"
+                )
+                return False
 
             if source_kind == "open":
                 try:
@@ -5362,6 +7245,7 @@ class IntegratedBTCStrategy(Strategy):
                         "fill_qty": str(fill_qty),
                         "received_at": datetime.now(timezone.utc).isoformat(),
                     }
+                    payload = self._fill_failure_payload_with_identity(payload, meta)
                     self._create_direct_fill_unknown_preserving_pending(order_id, payload)
                     self._block_live_settlement_ledger(
                         f"refused fill for {order_id}: invalid open fill accounting: {exc}; "
@@ -5384,6 +7268,7 @@ class IntegratedBTCStrategy(Strategy):
                         "previous_filled_notional": str(raw_previous_notional),
                         "received_at": datetime.now(timezone.utc).isoformat(),
                     }
+                    payload = self._fill_failure_payload_with_identity(payload, meta)
                     self._create_direct_fill_unknown_preserving_pending(order_id, payload)
                     self._block_live_settlement_ledger(
                         f"refused fill for {order_id}: missing previous fill accounting; "
@@ -5404,6 +7289,7 @@ class IntegratedBTCStrategy(Strategy):
                             "previous_filled_notional": str(raw_previous_notional),
                             "received_at": datetime.now(timezone.utc).isoformat(),
                         }
+                        payload = self._fill_failure_payload_with_identity(payload, meta)
                         self._create_direct_fill_unknown_preserving_pending(order_id, payload)
                         self._block_live_settlement_ledger(
                             f"refused fill for {order_id}: invalid previous fill accounting; "
@@ -5425,6 +7311,7 @@ class IntegratedBTCStrategy(Strategy):
                     "previous_filled_notional": str(previous_notional),
                     "received_at": datetime.now(timezone.utc).isoformat(),
                 }
+                payload = self._fill_failure_payload_with_identity(payload, meta)
                 self._create_direct_fill_unknown_preserving_pending(order_id, payload)
                 self._block_live_settlement_ledger(
                     f"refused fill for {order_id}: impossible previous fill accounting; "
@@ -5440,6 +7327,28 @@ class IntegratedBTCStrategy(Strategy):
                 return False
 
             average_price = total_notional / total_qty
+            limit_violation = self._limit_ioc_fill_envelope_violation(
+                meta,
+                total_qty,
+                average_price,
+            )
+            if limit_violation:
+                payload = {
+                    "status": "failed",
+                    "reason": limit_violation,
+                    "fill_price": str(fill_price),
+                    "fill_qty": str(fill_qty),
+                    "cumulative_filled_qty": str(total_qty),
+                    "cumulative_vwap": str(average_price),
+                    "received_at": datetime.now(timezone.utc).isoformat(),
+                }
+                payload = self._fill_failure_payload_with_identity(payload, meta)
+                self._create_direct_fill_unknown_preserving_pending(order_id, payload)
+                self._block_live_settlement_ledger(
+                    f"refused fill for {order_id}: {limit_violation}; "
+                    "SETTLEMENT_UNKNOWN created for manual reconciliation"
+                )
+                return False
             meta["entry_price"] = average_price
             meta["filled_qty"] = total_qty
             meta["filled_notional"] = total_notional
@@ -5494,13 +7403,36 @@ class IntegratedBTCStrategy(Strategy):
         order_id = str(event.client_order_id)
         fill_price = self._as_decimal(event.last_px)
         fill_qty = self._as_decimal(event.last_qty)
+        try:
+            fill_metadata = self._terminal_event_fill_metadata(event)
+        except SettlementLedgerError as exc:
+            payload = {
+                "status": "failed",
+                "reason": "fill_metadata_identity_conflict",
+                "fill_price": str(fill_price),
+                "fill_qty": str(fill_qty),
+                "terminal_metadata_error": str(exc),
+                "terminal_event": self._terminal_event_audit_payload(event),
+                "received_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._create_direct_fill_unknown_preserving_pending(order_id, payload)
+            self._block_live_settlement_ledger(
+                f"refused fill for {order_id}: fill metadata identity conflict; "
+                "SETTLEMENT_UNKNOWN created for manual reconciliation"
+            )
+            raise
         logger.info("=" * 80)
         logger.info(f"ORDER FILLED!")
         logger.info(f"  Order: {order_id}")
         logger.info(f"  Fill Price: ${float(fill_price):.4f}")
         logger.info(f"  Quantity: {float(fill_qty):.6f}")
         logger.info("=" * 80)
-        if self._record_live_order_fill(order_id, fill_price, fill_qty):
+        if self._record_live_order_fill(
+            order_id,
+            fill_price,
+            fill_qty,
+            fill_metadata=fill_metadata,
+        ):
             self._track_order_event("filled")
 
     def on_order_denied(self, event):
@@ -5509,11 +7441,12 @@ class IntegratedBTCStrategy(Strategy):
         logger.error(f"  Order: {event.client_order_id}")
         logger.error(f"  Reason: {event.reason}")
         logger.error("=" * 80)
-        self._release_submitted_position(
-            event.client_order_id,
-            terminal_intent_status="ORDER_DENIED_NO_FILL",
-            terminal_event=event,
+        terminal_result = self._handle_terminal_order_event(
+            event,
+            "ORDER_DENIED_NO_FILL",
         )
+        if terminal_result != "no_fill":
+            return
         reason_lower = str(event.reason).lower()
         if (
             "no-price-to-convert-quote-qty" in reason_lower
@@ -5528,7 +7461,24 @@ class IntegratedBTCStrategy(Strategy):
 
     def on_order_rejected(self, event):
         """Handle order rejection — reset trade timer so we can retry next tick."""
-        reason = str(getattr(event, 'reason', ''))
+        if not hasattr(event, "reason"):
+            terminal_result = self._handle_terminal_order_event(
+                event,
+                "ORDER_REJECTED_NO_FILL",
+                allow_no_fill=False,
+            )
+            if terminal_result != "unclassified":
+                return
+            reason = "OrderRejected event missing reason"
+            self._block_live_settlement_ledger(reason)
+            raise SettlementLedgerError(reason)
+        terminal_result = self._handle_terminal_order_event(
+            event,
+            "ORDER_REJECTED_NO_FILL",
+        )
+        if terminal_result != "no_fill":
+            return
+        reason = str(event.reason)
         reason_lower = reason.lower()
         if 'no orders found' in reason_lower or 'fak' in reason_lower or 'no match' in reason_lower:
             logger.warning(
@@ -5538,26 +7488,27 @@ class IntegratedBTCStrategy(Strategy):
             self.last_trade_time = -1  # Allow retry on next quote tick
         else:
             logger.warning(f"Order rejected: {reason}")
-        self._release_submitted_position(
-            getattr(event, "client_order_id", ""),
-            terminal_intent_status="ORDER_REJECTED_NO_FILL",
-            terminal_event=event,
-        )
 
     def on_order_canceled(self, event):
-        logger.warning(f"Order canceled: {getattr(event, 'client_order_id', '')}")
-        self._release_submitted_position(
-            getattr(event, "client_order_id", ""),
-            terminal_intent_status="ORDER_CANCELED_NO_FILL",
-            terminal_event=event,
+        if not hasattr(event, "client_order_id"):
+            order_id_for_log = "<missing>"
+        else:
+            order_id_for_log = event.client_order_id
+        logger.warning(f"Order canceled: {order_id_for_log}")
+        self._handle_terminal_order_event(
+            event,
+            "ORDER_CANCELED_NO_FILL",
         )
 
     def on_order_expired(self, event):
-        logger.warning(f"Order expired: {getattr(event, 'client_order_id', '')}")
-        self._release_submitted_position(
-            getattr(event, "client_order_id", ""),
-            terminal_intent_status="ORDER_EXPIRED_NO_FILL",
-            terminal_event=event,
+        if not hasattr(event, "client_order_id"):
+            order_id_for_log = "<missing>"
+        else:
+            order_id_for_log = event.client_order_id
+        logger.warning(f"Order expired: {order_id_for_log}")
+        self._handle_terminal_order_event(
+            event,
+            "ORDER_EXPIRED_NO_FILL",
         )
 
     # ------------------------------------------------------------------
@@ -5630,6 +7581,8 @@ def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, tes
     print("Nautilus + 7-Phase System + Redis Control")
     print("=" * 80)
 
+    order_config = validate_live_order_config()
+
     if not simulation:
         ensure_live_market_order_patch()
         if not v2_patch_applied:
@@ -5666,7 +7619,14 @@ def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, tes
     # legacy default applies (tracked in the AGENTS.md/CLAUDE.md no-fallback
     # audit as a pre-existing item, not introduced by Phase 0.3).
     print(f"  Max Trade Size: ${get_market_buy_usd()}")
-    print(f"  Quote stability gate: {QUOTE_STABILITY_REQUIRED} valid ticks")
+    print(f"  Order Type: {order_config['order_type']}")
+    print(
+        "  Quote stability gate: "
+        f"{order_config['quote_stability_required']} valid ticks"
+    )
+    if order_config["limit_ioc_fill_policy"] is not None:
+        print(f"  LIMIT_IOC fill policy: {order_config['limit_ioc_fill_policy']}")
+        print(f"  LIMIT_REQUIRED_EDGE: {order_config['limit_required_edge']}")
     print()
 
     now = datetime.now(timezone.utc)
@@ -5844,6 +7804,7 @@ def main():
     if not simulation:
         # Phase 0.3 gate (1): MARKET_BUY_USD > 5.50 strict before any node startup
         enforce_live_market_buy_usd_gate()
+        validate_live_order_config()
 
         # Phase 0.3 gate (2): interactive LIVE confirmation unless --confirm-live
         if args.confirm_live:

@@ -1,4 +1,6 @@
 import importlib.util
+import asyncio
+import types
 import unittest
 from pathlib import Path
 
@@ -72,6 +74,130 @@ class PatchMarketOrdersTests(unittest.TestCase):
         original_submit = PolymarketExecutionClient._submit_market_order
         self.assertTrue(module.apply_market_order_patch())
         self.assertIs(PolymarketExecutionClient._submit_market_order, original_submit)
+
+    def test_native_limit_ioc_maps_to_clob_limit_order_and_fak_post(self):
+        try:
+            import nautilus_trader.adapters.polymarket.execution as execution
+            from nautilus_trader.adapters.polymarket.execution import (
+                PolymarketExecutionClient,
+            )
+            from nautilus_trader.model.enums import OrderSide, TimeInForce
+        except ImportError:
+            self.skipTest("nautilus_trader is not installed in this environment")
+
+        captured = {"retry_calls": []}
+
+        class _RetryManager:
+            last_exception = None
+            message = "ok"
+
+            async def run(self, name, keys, runner, func, *args, **kwargs):
+                captured["retry_calls"].append(
+                    {
+                        "name": name,
+                        "keys": keys,
+                        "func": getattr(func, "__name__", repr(func)),
+                        "args": args,
+                        "kwargs": kwargs,
+                    }
+                )
+                return func(*args, **kwargs)
+
+        class _RetryPool:
+            async def acquire(self):
+                return _RetryManager()
+
+            async def release(self, _retry_manager):
+                return None
+
+        class _HttpClient:
+            def create_order(self, order_args, options=None):
+                captured["order_args"] = order_args
+                captured["create_options"] = options
+                return {"signed": "limit-order"}
+
+            def post_order(self, signed_order, order_type, post_only):
+                captured["post_order"] = {
+                    "signed_order": signed_order,
+                    "order_type": order_type,
+                    "post_only": post_only,
+                }
+                return {"success": True, "orderID": "0xLIMITIOC"}
+
+        class _Clock:
+            def timestamp(self):
+                return 1.0
+
+            def timestamp_ns(self):
+                return 1
+
+        class _Log:
+            def debug(self, *_args, **_kwargs):
+                return None
+
+            def info(self, *_args, **_kwargs):
+                return None
+
+            def error(self, *_args, **_kwargs):
+                return None
+
+        class _Cache:
+            def add_venue_order_id(self, client_order_id, venue_order_id):
+                captured["venue_order_id"] = (client_order_id, str(venue_order_id))
+
+        fake_client = types.SimpleNamespace(
+            _log=_Log(),
+            _clock=_Clock(),
+            _http_client=_HttpClient(),
+            _retry_manager_pool=_RetryPool(),
+            _cache=_Cache(),
+            _ack_events_order={},
+            _ack_events_trade={},
+            _get_neg_risk_for_instrument=lambda _instrument: False,
+            _expected_venue_order_id=lambda _signed_order, neg_risk: None,
+            generate_order_submitted=lambda **kwargs: captured.setdefault("submitted", kwargs),
+            generate_order_rejected=lambda **kwargs: captured.setdefault("rejected", kwargs),
+            _send_quote_to_base_update=lambda *_args, **_kwargs: None,
+            _register_fill_tracker=lambda *_args, **_kwargs: None,
+            _execute_deferred_cancel_if_pending=lambda *_args, **_kwargs: None,
+        )
+        fake_client._post_signed_order = types.MethodType(
+            PolymarketExecutionClient._post_signed_order,
+            fake_client,
+        )
+        fake_order = types.SimpleNamespace(
+            is_quote_quantity=False,
+            price="0.62",
+            instrument_id="condition-token.POLYMARKET",
+            quantity="8.887096",
+            side=OrderSide.BUY,
+            expire_time_ns=0,
+            strategy_id="strategy",
+            client_order_id="client-limit-ioc",
+            is_post_only=False,
+            time_in_force=TimeInForce.IOC,
+        )
+        command = types.SimpleNamespace(order=fake_order)
+
+        original_get_token = execution.get_polymarket_token_id
+        try:
+            execution.get_polymarket_token_id = lambda _instrument_id: "TOKEN-LIMIT-IOC"
+            asyncio.run(
+                PolymarketExecutionClient._submit_limit_order(
+                    fake_client,
+                    command,
+                    instrument=types.SimpleNamespace(),
+                )
+            )
+        finally:
+            execution.get_polymarket_token_id = original_get_token
+
+        self.assertEqual(captured["order_args"].token_id, "TOKEN-LIMIT-IOC")
+        self.assertEqual(captured["order_args"].price, 0.62)
+        self.assertEqual(captured["order_args"].size, 8.887096)
+        self.assertEqual(captured["post_order"]["signed_order"], {"signed": "limit-order"})
+        self.assertEqual(captured["post_order"]["order_type"], "FAK")
+        self.assertFalse(captured["post_order"]["post_only"])
 
     def test_actual_fill_handler_exception_is_not_swallowed(self):
         module = load_patch_module()

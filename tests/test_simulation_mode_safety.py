@@ -27,6 +27,18 @@ class _DummyConfig:
         self.args = args
         self.kwargs = kwargs
 
+    @classmethod
+    def from_str(cls, value):
+        return cls(value)
+
+
+class _DummyOrderSide:
+    BUY = "BUY"
+
+
+class _DummyTimeInForce:
+    IOC = "IOC"
+
 
 class _DummyStrategy:
     def __init__(self, *args, **kwargs):
@@ -190,10 +202,10 @@ def _install_bot_dependency_stubs():
     )
     _install_module(
         "nautilus_trader.model.enums",
-        OrderSide=_DummyConfig,
-        TimeInForce=_DummyConfig,
+        OrderSide=_DummyOrderSide,
+        TimeInForce=_DummyTimeInForce,
     )
-    _install_module("nautilus_trader.model.objects", Quantity=_DummyConfig)
+    _install_module("nautilus_trader.model.objects", Price=_DummyConfig, Quantity=_DummyConfig)
     _install_module("nautilus_trader.model.data", QuoteTick=_DummyConfig)
 
     _install_module(
@@ -261,8 +273,16 @@ class SimulationModeSafetyTests(unittest.TestCase):
     def setUp(self):
         self._original_ledger_path = self.bot.LIVE_TRADE_LEDGER_PATH
         self._original_require_token_hint = os.environ.get("REQUIRE_AUTO_REDEEM_TOKEN_HINT")
+        self._original_order_type = os.environ.get("ORDER_TYPE")
+        self._original_quote_stability_required = os.environ.get("QUOTE_STABILITY_REQUIRED")
+        self._original_ev_fee_buffer = os.environ.get("EV_FEE_BUFFER")
+        self._original_ev_spread_buffer = os.environ.get("EV_SPREAD_BUFFER")
         self._strategies = []
         os.environ["REQUIRE_AUTO_REDEEM_TOKEN_HINT"] = "true"
+        os.environ["ORDER_TYPE"] = "market_ioc"
+        os.environ["QUOTE_STABILITY_REQUIRED"] = "3"
+        os.environ["EV_FEE_BUFFER"] = "0.005"
+        os.environ["EV_SPREAD_BUFFER"] = "0.01"
         self._test_ledger_path = Path(f"/tmp/codex_live_trades_test_{os.getpid()}_{id(self)}.json")
         for path in (
             self._test_ledger_path,
@@ -284,6 +304,22 @@ class SimulationModeSafetyTests(unittest.TestCase):
             os.environ.pop("REQUIRE_AUTO_REDEEM_TOKEN_HINT", None)
         else:
             os.environ["REQUIRE_AUTO_REDEEM_TOKEN_HINT"] = self._original_require_token_hint
+        if self._original_order_type is None:
+            os.environ.pop("ORDER_TYPE", None)
+        else:
+            os.environ["ORDER_TYPE"] = self._original_order_type
+        if self._original_quote_stability_required is None:
+            os.environ.pop("QUOTE_STABILITY_REQUIRED", None)
+        else:
+            os.environ["QUOTE_STABILITY_REQUIRED"] = self._original_quote_stability_required
+        if self._original_ev_fee_buffer is None:
+            os.environ.pop("EV_FEE_BUFFER", None)
+        else:
+            os.environ["EV_FEE_BUFFER"] = self._original_ev_fee_buffer
+        if self._original_ev_spread_buffer is None:
+            os.environ.pop("EV_SPREAD_BUFFER", None)
+        else:
+            os.environ["EV_SPREAD_BUFFER"] = self._original_ev_spread_buffer
         for path in (
             self._test_ledger_path,
             Path(str(self._test_ledger_path) + ".tmp"),
@@ -588,10 +624,9 @@ class SimulationModeSafetyTests(unittest.TestCase):
             builtins.input = original_input
 
     def test_place_real_order_runtime_gate_rejects_invalid_market_buy_usd(self):
-        # Phase 0.3 acceptance criterion #5 — Redis sim->live transition with
-        # invalid MARKET_BUY_USD must reject the trade (fail-closed) before any
-        # order is submitted. Reviewer #1 finding #4 + reviewer #3 finding #2:
-        # the runtime gate had no direct test.
+        # Runtime validation rejects invalid MARKET_BUY_USD before any order is
+        # submitted, even if a live-enabled process reaches this call after
+        # startup env drift or through a nonstandard submit path.
         strategy = self._track_strategy(
             self.bot.IntegratedBTCStrategy(
                 redis_client=None,
@@ -612,6 +647,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
                     position_size=Decimal("5.50"),
                     current_price=0.5,
                     direction="long",
+                    order_type=self.bot.ORDER_TYPE_MARKET_IOC,
                 )
             )
             self.assertFalse(result)
@@ -632,33 +668,23 @@ class SimulationModeSafetyTests(unittest.TestCase):
             )
         )
         rec = self.bot.DecisionRecord(current_price=None)
-        # Mock orderbook_processor.fetch_order_book to return a healthy book.
-        original = getattr(strategy.orderbook_processor, "fetch_order_book", None)
-        strategy.orderbook_processor.fetch_order_book = lambda token_id: {
+        order_book = {
             "bids": [],
             "asks": [
                 {"price": "0.62", "size": "100"},
                 {"price": "0.70", "size": "100"},
             ],
         }
-        try:
-            vwap = asyncio.run(
-                strategy._compute_depth_aware_entry(
-                    side_token_id="TOKEN",
-                    entry_source="YES ask",
-                    position_size_usd=Decimal("10"),
-                    top_of_book_entry=Decimal("0.62"),
-                    rec=rec,
-                )
+        vwap = asyncio.run(
+            strategy._compute_depth_aware_entry(
+                side_token_id="TOKEN",
+                entry_source="YES ask",
+                position_size_usd=Decimal("10"),
+                top_of_book_entry=Decimal("0.62"),
+                rec=rec,
+                order_book=order_book,
             )
-        finally:
-            if original is None:
-                try:
-                    del strategy.orderbook_processor.fetch_order_book
-                except AttributeError:
-                    pass
-            else:
-                strategy.orderbook_processor.fetch_order_book = original
+        )
         # Budget $10 against 100 tokens at $0.62 ($62 capacity) → fully filled
         # at top level; VWAP ≈ $0.62 (Decimal division may carry trailing
         # digits — compare with a tight tolerance).
@@ -687,7 +713,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(rec.fields["rejected_at_gate"], "depth_aware_missing_token_id")
 
-    def test_compute_depth_aware_entry_fails_closed_on_book_fetch_error(self):
+    def test_compute_depth_aware_entry_requires_order_book_snapshot(self):
         strategy = self._track_strategy(
             self.bot.IntegratedBTCStrategy(
                 redis_client=None,
@@ -697,12 +723,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
         )
         rec = self.bot.DecisionRecord(current_price=None)
 
-        def _raise(_token_id):
-            raise RuntimeError("simulated network error")
-
-        original = getattr(strategy.orderbook_processor, "fetch_order_book", None)
-        strategy.orderbook_processor.fetch_order_book = _raise
-        try:
+        with self.assertRaisesRegex(RuntimeError, "caller-provided order_book snapshot"):
             result = asyncio.run(
                 strategy._compute_depth_aware_entry(
                     side_token_id="TOKEN",
@@ -712,16 +733,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
                     rec=rec,
                 )
             )
-        finally:
-            if original is None:
-                try:
-                    del strategy.orderbook_processor.fetch_order_book
-                except AttributeError:
-                    pass
-            else:
-                strategy.orderbook_processor.fetch_order_book = original
-        self.assertIsNone(result)
-        self.assertEqual(rec.fields["rejected_at_gate"], "depth_aware_book_fetch_error")
+        self.assertIsNone(rec.fields["rejected_at_gate"])
 
     def test_compute_depth_aware_entry_fails_closed_on_thin_book(self):
         strategy = self._track_strategy(
@@ -732,30 +744,21 @@ class SimulationModeSafetyTests(unittest.TestCase):
             )
         )
         rec = self.bot.DecisionRecord(current_price=None)
-        original = getattr(strategy.orderbook_processor, "fetch_order_book", None)
-        strategy.orderbook_processor.fetch_order_book = lambda token_id: {
+        order_book = {
             "bids": [],
             # Only 2 tokens at $0.50 = $1.00 of liquidity for a $10 budget
             "asks": [{"price": "0.50", "size": "2"}],
         }
-        try:
-            result = asyncio.run(
-                strategy._compute_depth_aware_entry(
-                    side_token_id="TOKEN",
-                    entry_source="YES ask",
-                    position_size_usd=Decimal("10"),
-                    top_of_book_entry=Decimal("0.50"),
-                    rec=rec,
-                )
+        result = asyncio.run(
+            strategy._compute_depth_aware_entry(
+                side_token_id="TOKEN",
+                entry_source="YES ask",
+                position_size_usd=Decimal("10"),
+                top_of_book_entry=Decimal("0.50"),
+                rec=rec,
+                order_book=order_book,
             )
-        finally:
-            if original is None:
-                try:
-                    del strategy.orderbook_processor.fetch_order_book
-                except AttributeError:
-                    pass
-            else:
-                strategy.orderbook_processor.fetch_order_book = original
+        )
         self.assertIsNone(result)
         self.assertEqual(rec.fields["rejected_at_gate"], "depth_aware_book_too_thin")
 
@@ -768,31 +771,151 @@ class SimulationModeSafetyTests(unittest.TestCase):
             )
         )
         rec = self.bot.DecisionRecord(current_price=None)
-        original = getattr(strategy.orderbook_processor, "fetch_order_book", None)
-        strategy.orderbook_processor.fetch_order_book = lambda token_id: {
+        order_book = {
             "bids": [],
             "asks": [{"price": "1.5", "size": "10"}],  # price > 1.0 — invalid
         }
-        try:
-            result = asyncio.run(
-                strategy._compute_depth_aware_entry(
+        result = asyncio.run(
+            strategy._compute_depth_aware_entry(
+                side_token_id="TOKEN",
+                entry_source="YES ask",
+                position_size_usd=Decimal("10"),
+                top_of_book_entry=Decimal("0.5"),
+                rec=rec,
+                order_book=order_book,
+            )
+        )
+        self.assertIsNone(result)
+        self.assertEqual(rec.fields["rejected_at_gate"], "depth_aware_invalid_book_level")
+
+    def test_compute_depth_aware_entry_limit_ioc_partial_ok_proceeds_on_partial_depth(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=True,
+            )
+        )
+        rec = self.bot.DecisionRecord(current_price=None)
+        order_book = {
+            "bids": [],
+            "asks": [{"price": "0.62", "size": "10"}, {"price": "0.70", "size": "15"}],
+        }
+        details = asyncio.run(
+            strategy._compute_depth_aware_entry_details(
+                side_token_id="TOKEN",
+                entry_source="YES ask",
+                position_size_usd=Decimal("12.40"),
+                top_of_book_entry=Decimal("0.62"),
+                rec=rec,
+                order_type=self.bot.ORDER_TYPE_LIMIT_IOC,
+                submitted_limit_price=Decimal("0.62"),
+                limit_order_token_qty=Decimal("20"),
+                limit_ioc_fill_policy=self.bot.LIMIT_IOC_FILL_POLICY_PARTIAL_OK,
+                order_book=order_book,
+            )
+        )
+        self.assertIsNotNone(details)
+        self.assertEqual(details.executable_entry, Decimal("0.62"))
+        self.assertEqual(details.tokens_filled, Decimal("10"))
+        self.assertEqual(details.actual_cost, Decimal("6.20"))
+        self.assertFalse(details.fully_filled)
+        self.assertIsNone(rec.fields["rejected_at_gate"])
+
+    def test_compute_depth_aware_entry_uses_provided_order_book_snapshot(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=True,
+            )
+        )
+        rec = self.bot.DecisionRecord(current_price=None)
+
+        def _unexpected_fetch(_token_id):
+            raise AssertionError("depth helper must use the provided order-book snapshot")
+
+        strategy.orderbook_processor.fetch_order_book = _unexpected_fetch
+        details = asyncio.run(
+            strategy._compute_depth_aware_entry_details(
+                side_token_id="TOKEN",
+                entry_source="YES ask",
+                position_size_usd=Decimal("12.40"),
+                top_of_book_entry=Decimal("0.62"),
+                rec=rec,
+                order_type=self.bot.ORDER_TYPE_LIMIT_IOC,
+                submitted_limit_price=Decimal("0.62"),
+                limit_order_token_qty=Decimal("20"),
+                limit_ioc_fill_policy=self.bot.LIMIT_IOC_FILL_POLICY_PARTIAL_OK,
+                order_book={
+                    "bids": [],
+                    "asks": [{"price": "0.62", "size": "10"}, {"price": "0.70", "size": "15"}],
+                },
+            )
+        )
+
+        self.assertIsNotNone(details)
+        self.assertEqual(details.tokens_filled, Decimal("10"))
+        self.assertIsNone(rec.fields["rejected_at_gate"])
+
+    def test_compute_depth_aware_entry_limit_ioc_rejects_no_liquidity_at_cap(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=True,
+            )
+        )
+        rec = self.bot.DecisionRecord(current_price=None)
+        order_book = {
+            "bids": [],
+            "asks": [{"price": "0.70", "size": "10"}],
+        }
+        details = asyncio.run(
+            strategy._compute_depth_aware_entry_details(
+                side_token_id="TOKEN",
+                entry_source="YES ask",
+                position_size_usd=Decimal("10"),
+                top_of_book_entry=Decimal("0.70"),
+                rec=rec,
+                order_type=self.bot.ORDER_TYPE_LIMIT_IOC,
+                submitted_limit_price=Decimal("0.62"),
+                limit_order_token_qty=Decimal("10"),
+                limit_ioc_fill_policy=self.bot.LIMIT_IOC_FILL_POLICY_PARTIAL_OK,
+                order_book=order_book,
+            )
+        )
+        self.assertIsNone(details)
+        self.assertEqual(rec.fields["rejected_at_gate"], "depth_aware_limit_ioc_no_liquidity")
+
+    def test_compute_depth_aware_entry_limit_ioc_all_or_nothing_blocks_fak_path(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=True,
+            )
+        )
+        rec = self.bot.DecisionRecord(current_price=None)
+        order_book = {
+            "bids": [],
+            "asks": [{"price": "0.62", "size": "10"}],
+        }
+        with self.assertRaisesRegex(RuntimeError, "requires verified FOK"):
+            asyncio.run(
+                strategy._compute_depth_aware_entry_details(
                     side_token_id="TOKEN",
                     entry_source="YES ask",
                     position_size_usd=Decimal("10"),
-                    top_of_book_entry=Decimal("0.5"),
+                    top_of_book_entry=Decimal("0.62"),
                     rec=rec,
+                    order_type=self.bot.ORDER_TYPE_LIMIT_IOC,
+                    submitted_limit_price=Decimal("0.62"),
+                    limit_order_token_qty=Decimal("10"),
+                    limit_ioc_fill_policy=self.bot.LIMIT_IOC_FILL_POLICY_ALL_OR_NOTHING,
+                    order_book=order_book,
                 )
             )
-        finally:
-            if original is None:
-                try:
-                    del strategy.orderbook_processor.fetch_order_book
-                except AttributeError:
-                    pass
-            else:
-                strategy.orderbook_processor.fetch_order_book = original
-        self.assertIsNone(result)
-        self.assertEqual(rec.fields["rejected_at_gate"], "depth_aware_invalid_book_level")
 
     # --- Phase 3 LIMIT_IOC helpers ------------------------------------------
 
@@ -851,6 +974,16 @@ class SimulationModeSafetyTests(unittest.TestCase):
             self.bot.compute_limit_order_token_qty(
                 Decimal("10"), Decimal("1"), size_precision=6
             )
+
+    def test_derive_submitted_limit_price_rounds_buy_cap_down(self):
+        self.assertEqual(
+            self.bot.derive_submitted_limit_price(Decimal("0.626"), 2),
+            Decimal("0.62"),
+        )
+
+    def test_derive_submitted_limit_price_rejects_unrepresentable_positive_cap(self):
+        with self.assertRaisesRegex(RuntimeError, "safe submitted limit price"):
+            self.bot.derive_submitted_limit_price(Decimal("0.0001"), 2)
 
     # --- Phase 4.5 timing/price-band helpers --------------------------------
 
@@ -1024,6 +1157,123 @@ class SimulationModeSafetyTests(unittest.TestCase):
             else:
                 os.environ["ORDER_TYPE"] = original
 
+    def test_quote_stability_required_missing_raises(self):
+        original = os.environ.get("QUOTE_STABILITY_REQUIRED")
+        try:
+            os.environ.pop("QUOTE_STABILITY_REQUIRED", None)
+            with self.assertRaisesRegex(RuntimeError, "QUOTE_STABILITY_REQUIRED must be set"):
+                self.bot.get_quote_stability_required_for_live()
+        finally:
+            if original is not None:
+                os.environ["QUOTE_STABILITY_REQUIRED"] = original
+
+    def test_quote_stability_required_invalid_values_raise(self):
+        original = os.environ.get("QUOTE_STABILITY_REQUIRED")
+        try:
+            for bad in ("0", "-1", "three"):
+                os.environ["QUOTE_STABILITY_REQUIRED"] = bad
+                with self.assertRaisesRegex(RuntimeError, "QUOTE_STABILITY_REQUIRED"):
+                    self.bot.get_quote_stability_required_for_live()
+        finally:
+            if original is None:
+                os.environ.pop("QUOTE_STABILITY_REQUIRED", None)
+            else:
+                os.environ["QUOTE_STABILITY_REQUIRED"] = original
+
+    def test_quote_stability_required_valid(self):
+        original = os.environ.get("QUOTE_STABILITY_REQUIRED")
+        try:
+            os.environ["QUOTE_STABILITY_REQUIRED"] = "4"
+            self.assertEqual(self.bot.get_quote_stability_required_for_live(), 4)
+        finally:
+            if original is None:
+                os.environ.pop("QUOTE_STABILITY_REQUIRED", None)
+            else:
+                os.environ["QUOTE_STABILITY_REQUIRED"] = original
+
+    def test_quote_stability_gate_supports_configured_thresholds_and_reset(self):
+        class _Price:
+            def __init__(self, value):
+                self.value = Decimal(value)
+
+            def as_decimal(self):
+                return self.value
+
+        class _Tick:
+            instrument_id = "yes-instrument"
+            bid_price = _Price("0.60")
+            ask_price = _Price("0.62")
+
+        original = os.environ.get("QUOTE_STABILITY_REQUIRED")
+        try:
+            for threshold in (1, 2, 3, 4):
+                os.environ["QUOTE_STABILITY_REQUIRED"] = str(threshold)
+                strategy = self._track_strategy(
+                    self.bot.IntegratedBTCStrategy(
+                        redis_client=None,
+                        enable_grafana=False,
+                        simulation_mode=True,
+                    )
+                )
+                strategy.instrument_id = "yes-instrument"
+                for _ in range(threshold - 1):
+                    strategy.on_quote_tick(_Tick())
+                    self.assertFalse(strategy._market_stable)
+                strategy.on_quote_tick(_Tick())
+                self.assertTrue(strategy._market_stable)
+                self.assertEqual(strategy._stable_tick_count, threshold)
+
+                strategy._reset_stability("unit test")
+                self.assertFalse(strategy._market_stable)
+                self.assertEqual(strategy._stable_tick_count, 0)
+                for _ in range(threshold):
+                    strategy.on_quote_tick(_Tick())
+                self.assertTrue(strategy._market_stable)
+                self.assertEqual(strategy._stable_tick_count, threshold)
+                strategy._release_live_trade_ledger_lock()
+                self._strategies.remove(strategy)
+        finally:
+            if original is None:
+                os.environ.pop("QUOTE_STABILITY_REQUIRED", None)
+            else:
+                os.environ["QUOTE_STABILITY_REQUIRED"] = original
+
+    def test_limit_ioc_fill_policy_required_for_limit_ioc(self):
+        original = os.environ.get("LIMIT_IOC_FILL_POLICY")
+        try:
+            os.environ.pop("LIMIT_IOC_FILL_POLICY", None)
+            with self.assertRaisesRegex(RuntimeError, "LIMIT_IOC_FILL_POLICY must be set"):
+                self.bot.get_limit_ioc_fill_policy_for_live(self.bot.ORDER_TYPE_LIMIT_IOC)
+        finally:
+            if original is not None:
+                os.environ["LIMIT_IOC_FILL_POLICY"] = original
+
+    def test_limit_ioc_fill_policy_partial_ok_accepted(self):
+        original = os.environ.get("LIMIT_IOC_FILL_POLICY")
+        try:
+            os.environ["LIMIT_IOC_FILL_POLICY"] = "partial_ok"
+            self.assertEqual(
+                self.bot.get_limit_ioc_fill_policy_for_live(self.bot.ORDER_TYPE_LIMIT_IOC),
+                "partial_ok",
+            )
+        finally:
+            if original is None:
+                os.environ.pop("LIMIT_IOC_FILL_POLICY", None)
+            else:
+                os.environ["LIMIT_IOC_FILL_POLICY"] = original
+
+    def test_limit_ioc_fill_policy_all_or_nothing_blocks_fak_path(self):
+        original = os.environ.get("LIMIT_IOC_FILL_POLICY")
+        try:
+            os.environ["LIMIT_IOC_FILL_POLICY"] = "all_or_nothing"
+            with self.assertRaisesRegex(RuntimeError, "requires verified FOK"):
+                self.bot.get_limit_ioc_fill_policy_for_live(self.bot.ORDER_TYPE_LIMIT_IOC)
+        finally:
+            if original is None:
+                os.environ.pop("LIMIT_IOC_FILL_POLICY", None)
+            else:
+                os.environ["LIMIT_IOC_FILL_POLICY"] = original
+
     def test_limit_required_edge_missing_raises(self):
         original = os.environ.get("LIMIT_REQUIRED_EDGE")
         try:
@@ -1061,6 +1311,44 @@ class SimulationModeSafetyTests(unittest.TestCase):
             else:
                 os.environ["LIMIT_REQUIRED_EDGE"] = original
 
+    def test_limit_required_edge_must_cover_ev_buffers(self):
+        original_values = {
+            key: os.environ.get(key)
+            for key in (
+                "ORDER_TYPE",
+                "QUOTE_STABILITY_REQUIRED",
+                "LIMIT_IOC_FILL_POLICY",
+                "LIMIT_REQUIRED_EDGE",
+                "EV_FEE_BUFFER",
+                "EV_SPREAD_BUFFER",
+            )
+        }
+        try:
+            os.environ["ORDER_TYPE"] = "limit_ioc"
+            os.environ["QUOTE_STABILITY_REQUIRED"] = "3"
+            os.environ["LIMIT_IOC_FILL_POLICY"] = "partial_ok"
+            os.environ["LIMIT_REQUIRED_EDGE"] = "0.01"
+            os.environ["EV_FEE_BUFFER"] = "0.005"
+            os.environ["EV_SPREAD_BUFFER"] = "0.01"
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "LIMIT_REQUIRED_EDGE must be >= EV_FEE_BUFFER \\+ EV_SPREAD_BUFFER",
+            ):
+                self.bot.validate_live_order_config()
+
+            os.environ["LIMIT_REQUIRED_EDGE"] = "0.015"
+            config = self.bot.validate_live_order_config()
+            self.assertEqual(config["limit_required_edge"], Decimal("0.015"))
+            self.assertEqual(config["ev_fee_buffer"], Decimal("0.005"))
+            self.assertEqual(config["ev_spread_buffer"], Decimal("0.01"))
+        finally:
+            for key, value in original_values.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
     def test_place_real_order_rejects_position_size_mismatch_with_gate(self):
         # Reviewer #2 cycle-2 finding: caller-supplied position_size MUST match
         # the gate-validated amount to prevent rounding-mode divergence between
@@ -1085,6 +1373,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
                     position_size=Decimal("5.52"),
                     current_price=0.5,
                     direction="long",
+                    order_type=self.bot.ORDER_TYPE_MARKET_IOC,
                 )
             )
             self.assertFalse(result)
@@ -1107,6 +1396,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
             )
         )
         strategy.instrument_id = "dummy-instrument-id"
+        strategy._stable_tick_count = 3
 
         original = os.environ.get("MARKET_BUY_USD")
         try:
@@ -1120,6 +1410,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
                     position_size=Decimal("5.51"),
                     current_price=0.5,
                     direction="short",  # forces the no_id is None branch
+                    order_type=self.bot.ORDER_TYPE_MARKET_IOC,
                 )
             )
             self.assertFalse(result)
@@ -1128,6 +1419,606 @@ class SimulationModeSafetyTests(unittest.TestCase):
                 os.environ.pop("MARKET_BUY_USD", None)
             else:
                 os.environ["MARKET_BUY_USD"] = original
+
+    def test_place_real_order_limit_ioc_uses_limit_order_factory(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+        condition_id = "conditionlivelimit"
+        yes_token_id = "yestoken"
+        no_token_id = "notoken"
+        yes_instrument_id = f"{condition_id}-{yes_token_id}.POLYMARKET"
+        strategy.instrument_id = yes_instrument_id
+        strategy._yes_instrument_id = yes_instrument_id
+        strategy._stable_tick_count = 3
+        strategy._last_bid_ask = (Decimal("0.60"), Decimal("0.62"))
+        submitted = {}
+
+        class _Instrument:
+            size_precision = 6
+            price_precision = 2
+            info = {}
+
+        class _Cache:
+            def instrument(self, instrument_id):
+                submitted["cache_instrument_id"] = instrument_id
+                return _Instrument()
+
+        class _OrderFactory:
+            def limit(self, **kwargs):
+                submitted["limit_kwargs"] = kwargs
+                return {"kind": "limit", **kwargs}
+
+        strategy.cache = _Cache()
+        strategy.order_factory = _OrderFactory()
+        strategy.submit_order = lambda order: submitted.setdefault("order", order)
+        now = datetime.now(timezone.utc)
+        strategy._current_market_metadata = lambda: {
+            "slug": "slug-live-limit",
+            "condition_id": condition_id,
+            "yes_token_id": yes_token_id,
+            "no_token_id": no_token_id,
+            "start_time": (now - timedelta(minutes=15)).isoformat(),
+            "end_time": (now + timedelta(minutes=15)).isoformat(),
+        }
+
+        original_values = {
+            key: os.environ.get(key)
+            for key in (
+                "MARKET_BUY_USD",
+                "ORDER_TYPE",
+                "QUOTE_STABILITY_REQUIRED",
+                "LIMIT_REQUIRED_EDGE",
+                "LIMIT_IOC_FILL_POLICY",
+            )
+        }
+        try:
+            os.environ["MARKET_BUY_USD"] = "5.51"
+            os.environ["ORDER_TYPE"] = "limit_ioc"
+            os.environ["QUOTE_STABILITY_REQUIRED"] = "3"
+            os.environ["LIMIT_REQUIRED_EDGE"] = "0.05"
+            os.environ["LIMIT_IOC_FILL_POLICY"] = "partial_ok"
+            result = asyncio.run(
+                strategy._place_real_order(
+                    signal=types.SimpleNamespace(score=77, confidence=0.67),
+                    position_size=Decimal("5.51"),
+                    current_price=Decimal("0.62"),
+                    direction="long",
+                    order_type=self.bot.ORDER_TYPE_LIMIT_IOC,
+                    accepted_limit_price=Decimal("0.62"),
+                    submitted_limit_price=Decimal("0.62"),
+                    limit_order_token_qty=Decimal("8.887096"),
+                )
+            )
+        finally:
+            for key, value in original_values.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.assertTrue(result)
+        kwargs = submitted["limit_kwargs"]
+        self.assertEqual(kwargs["instrument_id"], yes_instrument_id)
+        self.assertFalse(kwargs["quote_quantity"])
+        self.assertEqual(kwargs["time_in_force"], self.bot.TimeInForce.IOC)
+        intent = next(iter(strategy._submitted_order_intents.values()))
+        self.assertEqual(intent["order_type"], "limit_ioc")
+        self.assertFalse(intent["quote_quantity"])
+        self.assertEqual(intent["quantity_mode"], "base_quantity")
+        self.assertEqual(intent["submitted_limit_price"], Decimal("0.62"))
+
+    def test_place_real_order_rejects_yes_instrument_token_mismatch(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+        condition_id = "conditionliveyesmismatch"
+        strategy.instrument_id = f"{condition_id}-wrongyestoken.POLYMARKET"
+        strategy._yes_instrument_id = strategy.instrument_id
+        strategy._stable_tick_count = 3
+        strategy._last_bid_ask = (Decimal("0.60"), Decimal("0.62"))
+
+        class _Instrument:
+            size_precision = 6
+            price_precision = 2
+            info = {}
+
+        class _Cache:
+            def instrument(self, _instrument_id):
+                return _Instrument()
+
+        class _OrderFactory:
+            def market(self, **_kwargs):
+                raise AssertionError("market order factory should not be called")
+
+        strategy.cache = _Cache()
+        strategy.order_factory = _OrderFactory()
+        strategy.submit_order = lambda _order: None
+        now = datetime.now(timezone.utc)
+        strategy._current_market_metadata = lambda: {
+            "slug": "slug-live-yes-mismatch",
+            "condition_id": condition_id,
+            "yes_token_id": "yestoken",
+            "no_token_id": "notoken",
+            "start_time": (now - timedelta(minutes=15)).isoformat(),
+            "end_time": (now + timedelta(minutes=15)).isoformat(),
+        }
+
+        original_values = {
+            key: os.environ.get(key)
+            for key in ("MARKET_BUY_USD", "ORDER_TYPE", "QUOTE_STABILITY_REQUIRED")
+        }
+        try:
+            os.environ["MARKET_BUY_USD"] = "5.51"
+            os.environ["ORDER_TYPE"] = "market_ioc"
+            os.environ["QUOTE_STABILITY_REQUIRED"] = "3"
+            result = asyncio.run(
+                strategy._place_real_order(
+                    signal=types.SimpleNamespace(score=77, confidence=0.67),
+                    position_size=Decimal("5.51"),
+                    current_price=Decimal("0.62"),
+                    direction="long",
+                    order_type=self.bot.ORDER_TYPE_MARKET_IOC,
+                )
+            )
+        finally:
+            for key, value in original_values.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.assertFalse(result)
+        self.assertEqual(strategy._submitted_order_intents, {})
+
+    def test_place_real_order_rejects_no_instrument_token_mismatch(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+        condition_id = "conditionlivenomismatch"
+        strategy.instrument_id = f"{condition_id}-yestoken.POLYMARKET"
+        strategy._yes_instrument_id = strategy.instrument_id
+        strategy._no_instrument_id = f"{condition_id}-wrongnotoken.POLYMARKET"
+        strategy._stable_tick_count = 3
+        strategy._last_bid_ask = (Decimal("0.60"), Decimal("0.62"))
+        strategy._last_no_bid_ask = (Decimal("0.38"), Decimal("0.40"))
+
+        class _Instrument:
+            size_precision = 6
+            price_precision = 2
+            info = {}
+
+        class _Cache:
+            def instrument(self, _instrument_id):
+                return _Instrument()
+
+        class _OrderFactory:
+            def market(self, **_kwargs):
+                raise AssertionError("market order factory should not be called")
+
+        strategy.cache = _Cache()
+        strategy.order_factory = _OrderFactory()
+        strategy.submit_order = lambda _order: None
+        now = datetime.now(timezone.utc)
+        strategy._current_market_metadata = lambda: {
+            "slug": "slug-live-no-mismatch",
+            "condition_id": condition_id,
+            "yes_token_id": "yestoken",
+            "no_token_id": "notoken",
+            "start_time": (now - timedelta(minutes=15)).isoformat(),
+            "end_time": (now + timedelta(minutes=15)).isoformat(),
+        }
+
+        original_values = {
+            key: os.environ.get(key)
+            for key in ("MARKET_BUY_USD", "ORDER_TYPE", "QUOTE_STABILITY_REQUIRED")
+        }
+        try:
+            os.environ["MARKET_BUY_USD"] = "5.51"
+            os.environ["ORDER_TYPE"] = "market_ioc"
+            os.environ["QUOTE_STABILITY_REQUIRED"] = "3"
+            result = asyncio.run(
+                strategy._place_real_order(
+                    signal=types.SimpleNamespace(score=77, confidence=0.67),
+                    position_size=Decimal("5.51"),
+                    current_price=Decimal("0.62"),
+                    direction="short",
+                    order_type=self.bot.ORDER_TYPE_MARKET_IOC,
+                )
+            )
+        finally:
+            for key, value in original_values.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.assertFalse(result)
+        self.assertEqual(strategy._submitted_order_intents, {})
+
+    def test_place_real_order_limit_ioc_rejects_price_above_accepted_cap(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+        condition_id = "conditionlivelimitmismatch"
+        yes_token_id = "yestoken"
+        no_token_id = "notoken"
+        yes_instrument_id = f"{condition_id}-{yes_token_id}.POLYMARKET"
+        strategy.instrument_id = yes_instrument_id
+        strategy._yes_instrument_id = yes_instrument_id
+        strategy._stable_tick_count = 3
+        strategy._last_bid_ask = (Decimal("0.60"), Decimal("0.62"))
+
+        class _Instrument:
+            size_precision = 6
+            price_precision = 2
+            info = {}
+
+        class _Cache:
+            def instrument(self, _instrument_id):
+                return _Instrument()
+
+        class _OrderFactory:
+            def limit(self, **_kwargs):
+                raise AssertionError("limit order factory should not be called")
+
+        strategy.cache = _Cache()
+        strategy.order_factory = _OrderFactory()
+        strategy.submit_order = lambda _order: None
+        now = datetime.now(timezone.utc)
+        strategy._current_market_metadata = lambda: {
+            "slug": "slug-live-limit-mismatch",
+            "condition_id": condition_id,
+            "yes_token_id": yes_token_id,
+            "no_token_id": no_token_id,
+            "start_time": (now - timedelta(minutes=15)).isoformat(),
+            "end_time": (now + timedelta(minutes=15)).isoformat(),
+        }
+
+        original_values = {
+            key: os.environ.get(key)
+            for key in (
+                "MARKET_BUY_USD",
+                "ORDER_TYPE",
+                "QUOTE_STABILITY_REQUIRED",
+                "LIMIT_REQUIRED_EDGE",
+                "LIMIT_IOC_FILL_POLICY",
+            )
+        }
+        try:
+            os.environ["MARKET_BUY_USD"] = "5.51"
+            os.environ["ORDER_TYPE"] = "limit_ioc"
+            os.environ["QUOTE_STABILITY_REQUIRED"] = "3"
+            os.environ["LIMIT_REQUIRED_EDGE"] = "0.05"
+            os.environ["LIMIT_IOC_FILL_POLICY"] = "partial_ok"
+            result = asyncio.run(
+                strategy._place_real_order(
+                    signal=types.SimpleNamespace(score=77, confidence=0.67),
+                    position_size=Decimal("5.51"),
+                    current_price=Decimal("0.62"),
+                    direction="long",
+                    order_type=self.bot.ORDER_TYPE_LIMIT_IOC,
+                    accepted_limit_price=Decimal("0.62"),
+                    submitted_limit_price=Decimal("0.63"),
+                    limit_order_token_qty=Decimal("8.887096"),
+                )
+            )
+        finally:
+            for key, value in original_values.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.assertFalse(result)
+        self.assertEqual(strategy._submitted_order_intents, {})
+
+    def test_place_real_order_limit_ioc_rejects_worst_case_notional_above_budget(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+        condition_id = "conditionlivelimitbudget"
+        yes_token_id = "yestoken"
+        no_token_id = "notoken"
+        yes_instrument_id = f"{condition_id}-{yes_token_id}.POLYMARKET"
+        strategy.instrument_id = yes_instrument_id
+        strategy._yes_instrument_id = yes_instrument_id
+        strategy._stable_tick_count = 3
+        strategy._last_bid_ask = (Decimal("0.60"), Decimal("0.62"))
+
+        class _Instrument:
+            size_precision = 6
+            price_precision = 2
+            info = {}
+
+        class _Cache:
+            def instrument(self, _instrument_id):
+                return _Instrument()
+
+        class _OrderFactory:
+            def limit(self, **_kwargs):
+                raise AssertionError("limit order factory should not be called")
+
+        strategy.cache = _Cache()
+        strategy.order_factory = _OrderFactory()
+        strategy.submit_order = lambda _order: None
+        now = datetime.now(timezone.utc)
+        strategy._current_market_metadata = lambda: {
+            "slug": "slug-live-limit-budget",
+            "condition_id": condition_id,
+            "yes_token_id": yes_token_id,
+            "no_token_id": no_token_id,
+            "start_time": (now - timedelta(minutes=15)).isoformat(),
+            "end_time": (now + timedelta(minutes=15)).isoformat(),
+        }
+
+        original_values = {
+            key: os.environ.get(key)
+            for key in (
+                "MARKET_BUY_USD",
+                "ORDER_TYPE",
+                "QUOTE_STABILITY_REQUIRED",
+                "LIMIT_REQUIRED_EDGE",
+                "LIMIT_IOC_FILL_POLICY",
+            )
+        }
+        try:
+            os.environ["MARKET_BUY_USD"] = "5.51"
+            os.environ["ORDER_TYPE"] = "limit_ioc"
+            os.environ["QUOTE_STABILITY_REQUIRED"] = "3"
+            os.environ["LIMIT_REQUIRED_EDGE"] = "0.05"
+            os.environ["LIMIT_IOC_FILL_POLICY"] = "partial_ok"
+            result = asyncio.run(
+                strategy._place_real_order(
+                    signal=types.SimpleNamespace(score=77, confidence=0.67),
+                    position_size=Decimal("5.51"),
+                    current_price=Decimal("0.62"),
+                    direction="long",
+                    order_type=self.bot.ORDER_TYPE_LIMIT_IOC,
+                    accepted_limit_price=Decimal("0.62"),
+                    submitted_limit_price=Decimal("0.62"),
+                    limit_order_token_qty=Decimal("8.887097"),
+                )
+            )
+        finally:
+            for key, value in original_values.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.assertFalse(result)
+        self.assertEqual(strategy._submitted_order_intents, {})
+
+    def test_decision_path_limit_ioc_derives_cap_and_quantity_from_config(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+        strategy._stable_tick_count = 3
+        strategy.price_history = [Decimal("0.70")] * 20
+        strategy.instrument_id = "yes-instrument"
+        strategy._yes_instrument_id = "yes-instrument"
+        strategy._yes_token_id = "yes-token"
+        strategy._last_bid_ask = (Decimal("0.60"), Decimal("0.62"))
+
+        class _Instrument:
+            size_precision = 6
+            price_precision = 2
+            info = {}
+
+        class _Cache:
+            def instrument(self, _instrument_id):
+                return _Instrument()
+
+        strategy.cache = _Cache()
+        fused = types.SimpleNamespace(
+            source="Fusion",
+            direction=types.SimpleNamespace(value="bullish"),
+            score=77,
+            confidence=0.67,
+        )
+        strategy._process_signals = lambda _current_price, _metadata: [fused]
+        strategy.fusion_engine = types.SimpleNamespace(
+            fuse_signals=lambda _signals, min_signals, min_score: fused
+        )
+
+        async def _market_context(_current_price):
+            return {
+                "deviation": 0.0,
+                "momentum": 0.0,
+                "volatility": 0.0,
+                "tick_buffer": [],
+                "yes_token_id": "yes-token",
+                "yes_order_book": {
+                    "bids": [],
+                    "asks": [{"price": "0.62", "size": "20"}],
+                },
+            }
+
+        strategy._fetch_market_context = _market_context
+        now = datetime.now(timezone.utc)
+        strategy._current_market_metadata = lambda: {
+            "slug": "slug-decision-limit",
+            "condition_id": "condition-decision-limit",
+            "yes_token_id": "yes-token",
+            "no_token_id": "no-token",
+            "start_time": (now - timedelta(minutes=15)).isoformat(),
+            "end_time": (now + timedelta(minutes=15)).isoformat(),
+        }
+        captured = {}
+
+        async def _capture_place(signal, position_size, current_price, direction, **kwargs):
+            captured["signal"] = signal
+            captured["position_size"] = position_size
+            captured["current_price"] = current_price
+            captured["direction"] = direction
+            captured.update(kwargs)
+            return True
+
+        strategy._place_real_order = _capture_place
+
+        original_values = {
+            key: os.environ.get(key)
+            for key in (
+                "MARKET_BUY_USD",
+                "ORDER_TYPE",
+                "QUOTE_STABILITY_REQUIRED",
+                "LIMIT_REQUIRED_EDGE",
+                "LIMIT_IOC_FILL_POLICY",
+                "MIN_SIGNAL_CONFIDENCE",
+                "EV_FEE_BUFFER",
+                "EV_SPREAD_BUFFER",
+            )
+        }
+        try:
+            os.environ["MARKET_BUY_USD"] = "5.51"
+            os.environ["ORDER_TYPE"] = "limit_ioc"
+            os.environ["QUOTE_STABILITY_REQUIRED"] = "3"
+            os.environ["LIMIT_REQUIRED_EDGE"] = "0.05"
+            os.environ["LIMIT_IOC_FILL_POLICY"] = "partial_ok"
+            os.environ["MIN_SIGNAL_CONFIDENCE"] = "0.60"
+            os.environ["EV_FEE_BUFFER"] = "0.005"
+            os.environ["EV_SPREAD_BUFFER"] = "0.01"
+            rec = self.bot.DecisionRecord(current_price=Decimal("0.70"))
+            result = asyncio.run(
+                strategy._make_trading_decision_body(
+                    Decimal("0.70"),
+                    trade_key=("unit", 1),
+                    is_simulation=False,
+                    rec=rec,
+                )
+            )
+        finally:
+            for key, value in original_values.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.assertTrue(result)
+        self.assertEqual(captured["order_type"], self.bot.ORDER_TYPE_LIMIT_IOC)
+        self.assertEqual(captured["accepted_limit_price"], Decimal("0.62"))
+        self.assertEqual(captured["submitted_limit_price"], Decimal("0.62"))
+        self.assertEqual(captured["limit_order_token_qty"], Decimal("8.887096"))
+        self.assertEqual(captured["direction"], "long")
+        self.assertEqual(rec.fields["submitted_limit_price"], "0.62")
+        self.assertEqual(rec.fields["limit_order_token_qty"], "8.887096")
+
+    def test_fetch_market_context_uses_market_metadata_yes_token_for_order_book(self):
+        strategy = self._new_strategy()
+        strategy.price_history = [Decimal("0.60")] * 20
+        strategy._yes_token_id = None
+        now = datetime.now(timezone.utc)
+        strategy.all_btc_instruments = [
+            {
+                "slug": "btc-updown-15m-context",
+                "condition_id": "condition-context",
+                "yes_token_id": "market-yes-token",
+                "no_token_id": "market-no-token",
+                "start_time": (now - timedelta(minutes=15)).isoformat(),
+                "end_time": (now + timedelta(minutes=15)).isoformat(),
+            }
+        ]
+        strategy.current_instrument_index = 0
+        calls = []
+
+        class _OrderBookProcessor:
+            def fetch_order_book(self, token_id):
+                calls.append(token_id)
+                return {"token_id": token_id, "bids": [], "asks": []}
+
+        class _NewsSocialDataSource:
+            async def connect(self):
+                return None
+
+            async def get_fear_greed_index(self):
+                return {"value": "42", "classification": "Neutral"}
+
+            async def disconnect(self):
+                return None
+
+        class _CoinbaseDataSource:
+            async def connect(self):
+                return None
+
+            async def get_current_price(self):
+                return Decimal("100000")
+
+            async def disconnect(self):
+                return None
+
+        news_module_name = "data_sources.news_social.adapter"
+        coinbase_module_name = "data_sources.coinbase.adapter"
+        original_news_module = sys.modules.get(news_module_name)
+        original_coinbase_module = sys.modules.get(coinbase_module_name)
+        news_module = types.ModuleType(news_module_name)
+        news_module.NewsSocialDataSource = _NewsSocialDataSource
+        coinbase_module = types.ModuleType(coinbase_module_name)
+        coinbase_module.CoinbaseDataSource = _CoinbaseDataSource
+        strategy.orderbook_processor = _OrderBookProcessor()
+
+        try:
+            sys.modules[news_module_name] = news_module
+            sys.modules[coinbase_module_name] = coinbase_module
+            metadata = asyncio.run(strategy._fetch_market_context(Decimal("0.60")))
+        finally:
+            if original_news_module is None:
+                sys.modules.pop(news_module_name, None)
+            else:
+                sys.modules[news_module_name] = original_news_module
+            if original_coinbase_module is None:
+                sys.modules.pop(coinbase_module_name, None)
+            else:
+                sys.modules[coinbase_module_name] = original_coinbase_module
+
+        self.assertEqual(metadata["yes_token_id"], "market-yes-token")
+        self.assertEqual(metadata["yes_order_book"]["token_id"], "market-yes-token")
+        self.assertEqual(metadata["no_order_book"]["token_id"], "market-no-token")
+        self.assertEqual(calls, ["market-yes-token", "market-no-token"])
+
+    def test_fetch_market_context_fails_closed_on_cached_yes_token_mismatch(self):
+        strategy = self._new_strategy()
+        strategy.price_history = [Decimal("0.60")] * 20
+        strategy._yes_token_id = "cached-yes-token"
+        now = datetime.now(timezone.utc)
+        strategy.all_btc_instruments = [
+            {
+                "slug": "btc-updown-15m-context-mismatch",
+                "condition_id": "condition-context-mismatch",
+                "yes_token_id": "market-yes-token",
+                "no_token_id": "market-no-token",
+                "start_time": (now - timedelta(minutes=15)).isoformat(),
+                "end_time": (now + timedelta(minutes=15)).isoformat(),
+            }
+        ]
+        strategy.current_instrument_index = 0
+
+        with self.assertRaisesRegex(RuntimeError, "cached YES token_id does not match"):
+            asyncio.run(strategy._fetch_market_context(Decimal("0.60")))
 
     def test_live_redis_read_error_aborts_mode_check(self):
         class _BrokenRedis:
@@ -1281,6 +2172,9 @@ class SimulationModeSafetyTests(unittest.TestCase):
             "direction": "long",
             "trade_label": "YES (UP)",
             "estimated_tokens": Decimal("4"),
+            "order_type": "market_ioc",
+            "quote_quantity": True,
+            "quantity_mode": "quote_quantity",
             "filled_qty": Decimal("4"),
             "filled_notional": Decimal("2.00"),
             "instrument_id": f"{condition_id}-{token_id}.POLYMARKET",
@@ -1294,6 +2188,36 @@ class SimulationModeSafetyTests(unittest.TestCase):
             "signal_score": 75,
             "signal_confidence": 0.82,
         }
+
+    def _fill_metadata_for_meta(self, meta):
+        return {
+            key: meta[key]
+            for key in self.bot.FILL_METADATA_IDENTITY_KEYS
+            if meta.get(key) not in (None, "")
+        }
+
+    def _limit_ioc_trade_meta(
+        self,
+        order_id="limit-order-1",
+        token_id="token-yes",
+        submitted_limit_price=Decimal("0.62"),
+        estimated_tokens=Decimal("8"),
+    ):
+        meta = self._live_trade_meta(order_id=order_id, token_id=token_id)
+        meta.update(
+            {
+                "entry_price": submitted_limit_price,
+                "size": submitted_limit_price * Decimal("4"),
+                "estimated_tokens": estimated_tokens,
+                "order_type": "limit_ioc",
+                "quote_quantity": False,
+                "quantity_mode": "base_quantity",
+                "submitted_limit_price": submitted_limit_price,
+                "limit_ioc_fill_policy": "partial_ok",
+                "filled_notional": submitted_limit_price * Decimal("4"),
+            }
+        )
+        return meta
 
     def _pending_actual_fill(
         self,
@@ -1340,8 +2264,18 @@ class SimulationModeSafetyTests(unittest.TestCase):
         strategy._submitted_positions[order_id] = meta
         strategy.risk_engine.add_position(order_id, Decimal("5.50"), Decimal("0.55"), "buy_yes")
 
-        strategy._record_live_order_fill(order_id, Decimal("0.50"), Decimal("4"))
-        strategy._record_live_order_fill(order_id, Decimal("0.60"), Decimal("5"))
+        strategy._record_live_order_fill(
+            order_id,
+            Decimal("0.50"),
+            Decimal("4"),
+            fill_metadata=self._fill_metadata_for_meta(meta),
+        )
+        strategy._record_live_order_fill(
+            order_id,
+            Decimal("0.60"),
+            Decimal("5"),
+            fill_metadata=self._fill_metadata_for_meta(meta),
+        )
 
         meta = strategy._open_live_trades[order_id]
         self.assertEqual(meta["filled_qty"], Decimal("9"))
@@ -1379,7 +2313,14 @@ class SimulationModeSafetyTests(unittest.TestCase):
         self.assertEqual(data["pending_actual_fills"][order_id]["total_filled_notional"], "2.2100")
         self.assertEqual(data["pending_actual_fills"][order_id]["vwap"], "0.52")
 
-        self.assertTrue(strategy._record_live_order_fill(order_id, Decimal("0.01"), Decimal("0.01")))
+        self.assertTrue(
+            strategy._record_live_order_fill(
+                order_id,
+                Decimal("0.01"),
+                Decimal("0.01"),
+                fill_metadata=self._fill_metadata_for_meta(meta),
+            )
+        )
         recorded = strategy._open_live_trades[order_id]
         self.assertEqual(recorded["filled_qty"], Decimal("4.25"))
         self.assertEqual(recorded["entry_price"], Decimal("0.52"))
@@ -1390,6 +2331,200 @@ class SimulationModeSafetyTests(unittest.TestCase):
         self.assertEqual(data["open"][order_id]["venue_order_id"], "0xactual")
         self.assertNotIn("_actual_filled_qty", recorded)
         self.assertNotIn("_actual_fill_vwap", recorded)
+
+    def test_actual_fill_ok_blocks_limit_ioc_vwap_above_submitted_limit(self):
+        strategy = self._new_strategy()
+        order_id = "actual-fill-limit-price-violation"
+        meta = self._limit_ioc_trade_meta(
+            order_id=order_id,
+            token_id="token-limit-price",
+            submitted_limit_price=Decimal("0.62"),
+            estimated_tokens=Decimal("8"),
+        )
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = meta
+        strategy.risk_engine.add_position(order_id, Decimal("4.96"), Decimal("0.62"), "buy_yes")
+
+        strategy._handle_actual_fill(
+            order_id,
+            {
+                "status": "ok",
+                "trade_id": "trade-limit-price-violation",
+                "filled_qty": Decimal("4"),
+                "vwap": Decimal("0.63"),
+                "venue_order_id": "0xlimitprice",
+                "condition_id": "cond-a",
+                "token_id": "token-limit-price",
+            },
+        )
+
+        self.assertEqual(
+            strategy._settled_live_trades[-1]["unknown_reason"],
+            "limit_ioc_fill_price_above_submitted_limit:vwap=0.63,submitted_limit_price=0.62",
+        )
+        self.assertEqual(strategy._settled_live_trades[-1]["settlement_source"], "SETTLEMENT_UNKNOWN")
+        self.assertIsNotNone(strategy._settlement_ledger_blocked_reason)
+        self.assertNotIn(order_id, strategy._pending_actual_fills)
+
+    def test_direct_fill_blocks_missing_order_type_metadata(self):
+        strategy = self._new_strategy()
+        order_id = "direct-fill-missing-order-type"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-missing-order-type")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        meta.pop("order_type")
+        strategy._submitted_positions[order_id] = meta
+
+        result = strategy._record_live_order_fill(
+            order_id,
+            Decimal("0.60"),
+            Decimal("4"),
+            fill_metadata=self._fill_metadata_for_meta(meta),
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(
+            strategy._settled_live_trades[-1]["unknown_reason"],
+            "missing_order_type_for_fill_envelope",
+        )
+        self.assertIsNotNone(strategy._settlement_ledger_blocked_reason)
+        self.assertNotIn(order_id, strategy._open_live_trades)
+
+    def test_direct_fill_blocks_invalid_order_type_metadata(self):
+        strategy = self._new_strategy()
+        order_id = "direct-fill-invalid-order-type"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-invalid-order-type")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        meta["order_type"] = "limit"
+        strategy._submitted_positions[order_id] = meta
+
+        result = strategy._record_live_order_fill(
+            order_id,
+            Decimal("0.60"),
+            Decimal("4"),
+            fill_metadata=self._fill_metadata_for_meta(meta),
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(
+            strategy._settled_live_trades[-1]["unknown_reason"],
+            "invalid_order_type_for_fill_envelope:'limit'",
+        )
+        self.assertIsNotNone(strategy._settlement_ledger_blocked_reason)
+        self.assertNotIn(order_id, strategy._open_live_trades)
+
+    def test_direct_fill_blocks_limit_ioc_cumulative_quantity_above_submitted_quantity(self):
+        strategy = self._new_strategy()
+        order_id = "direct-fill-limit-qty-violation"
+        meta = self._limit_ioc_trade_meta(
+            order_id=order_id,
+            token_id="token-limit-qty",
+            submitted_limit_price=Decimal("0.62"),
+            estimated_tokens=Decimal("8"),
+        )
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = meta
+
+        result = strategy._record_live_order_fill(
+            order_id,
+            Decimal("0.60"),
+            Decimal("8.1"),
+            fill_metadata=self._fill_metadata_for_meta(meta),
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(
+            strategy._settled_live_trades[-1]["unknown_reason"],
+            "limit_ioc_fill_qty_above_submitted_quantity:filled_qty=8.1,submitted_qty=8",
+        )
+        self.assertEqual(strategy._settled_live_trades[-1]["settlement_source"], "SETTLEMENT_UNKNOWN")
+        self.assertIsNotNone(strategy._settlement_ledger_blocked_reason)
+        self.assertNotIn(order_id, strategy._open_live_trades)
+
+    def test_direct_fill_blocks_later_limit_ioc_fill_above_cap_even_when_average_is_safe(self):
+        strategy = self._new_strategy()
+        order_id = "direct-fill-limit-later-price-violation"
+        meta = self._limit_ioc_trade_meta(
+            order_id=order_id,
+            token_id="token-limit-later-price",
+            submitted_limit_price=Decimal("0.62"),
+            estimated_tokens=Decimal("8"),
+        )
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = meta
+
+        self.assertTrue(
+            strategy._record_live_order_fill(
+                order_id,
+                Decimal("0.60"),
+                Decimal("4"),
+                fill_metadata=self._fill_metadata_for_meta(meta),
+            )
+        )
+        result = strategy._record_live_order_fill(
+            order_id,
+            Decimal("0.63"),
+            Decimal("4"),
+            fill_metadata=self._fill_metadata_for_meta(meta),
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(
+            strategy._settled_live_trades[-1]["unknown_reason"],
+            "limit_ioc_fill_price_above_submitted_limit:vwap=0.63,submitted_limit_price=0.62",
+        )
+        self.assertEqual(strategy._settled_live_trades[-1]["settlement_source"], "SETTLEMENT_UNKNOWN")
+        self.assertIsNotNone(strategy._settlement_ledger_blocked_reason)
+
+    def test_pending_actual_fill_blocks_later_limit_ioc_fill_above_cap_even_when_average_is_safe(self):
+        strategy = self._new_strategy()
+        order_id = "actual-fill-limit-later-price-violation"
+        meta = self._limit_ioc_trade_meta(
+            order_id=order_id,
+            token_id="token-actual-limit-later",
+            submitted_limit_price=Decimal("0.62"),
+            estimated_tokens=Decimal("8"),
+        )
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = meta
+
+        strategy._handle_actual_fill(
+            order_id,
+            {
+                "status": "ok",
+                "trade_id": "trade-limit-safe-first",
+                "filled_qty": Decimal("4"),
+                "vwap": Decimal("0.60"),
+                "venue_order_id": "0xlimitlater",
+                "condition_id": "cond-a",
+                "token_id": "token-actual-limit-later",
+            },
+        )
+        with self.assertRaisesRegex(self.bot.SettlementLedgerError, "above_submitted_limit"):
+            strategy._handle_actual_fill(
+                order_id,
+                {
+                    "status": "ok",
+                    "trade_id": "trade-limit-unsafe-second",
+                    "filled_qty": Decimal("4"),
+                    "vwap": Decimal("0.63"),
+                    "venue_order_id": "0xlimitlater",
+                    "condition_id": "cond-a",
+                    "token_id": "token-actual-limit-later",
+                },
+            )
+
+        self.assertTrue(strategy._pending_actual_fills[order_id]["requires_external_fill_repair"])
+        self.assertEqual(
+            strategy._pending_actual_fills[order_id]["external_fill_repair_reason"],
+            "limit_ioc_fill_price_above_submitted_limit:vwap=0.63,submitted_limit_price=0.62",
+        )
+        self.assertIsNotNone(strategy._settlement_ledger_blocked_reason)
 
     def test_actual_fill_ok_rejects_payload_venue_matching_other_open_trade(self):
         strategy = self._new_strategy()
@@ -1676,7 +2811,12 @@ class SimulationModeSafetyTests(unittest.TestCase):
         ][order_id]
 
         with self.assertRaisesRegex(self.bot.SettlementLedgerError, "pending actual fill requires external repair"):
-            strategy._record_live_order_fill(order_id, Decimal("0.62"), Decimal("5.25"))
+            strategy._record_live_order_fill(
+                order_id,
+                Decimal("0.62"),
+                Decimal("5.25"),
+                fill_metadata=self._fill_metadata_for_meta(meta),
+            )
 
         self.assertEqual(strategy._pending_actual_fills[order_id], pending_before_direct_fill)
         self.assertEqual(strategy._settled_live_trades, [])
@@ -1977,8 +3117,22 @@ class SimulationModeSafetyTests(unittest.TestCase):
             },
         )
 
-        self.assertTrue(strategy._record_live_order_fill(order_id, Decimal("0.01"), Decimal("0.01")))
-        self.assertTrue(strategy._record_live_order_fill(order_id, Decimal("0.60"), Decimal("1.00")))
+        self.assertTrue(
+            strategy._record_live_order_fill(
+                order_id,
+                Decimal("0.01"),
+                Decimal("0.01"),
+                fill_metadata=self._fill_metadata_for_meta(meta),
+            )
+        )
+        self.assertTrue(
+            strategy._record_live_order_fill(
+                order_id,
+                Decimal("0.60"),
+                Decimal("1.00"),
+                fill_metadata=self._fill_metadata_for_meta(meta),
+            )
+        )
 
         recorded = strategy._open_live_trades[order_id]
         self.assertEqual(recorded["filled_qty"], Decimal("5.25"))
@@ -2357,7 +3511,12 @@ class SimulationModeSafetyTests(unittest.TestCase):
         meta.pop("filled_notional")
         strategy._submitted_positions[order_id] = meta
 
-        result = strategy._record_live_order_fill(order_id, Decimal("0"), Decimal("4"))
+        result = strategy._record_live_order_fill(
+            order_id,
+            Decimal("0"),
+            Decimal("4"),
+            fill_metadata=self._fill_metadata_for_meta(meta),
+        )
 
         self.assertFalse(result)
         self.assertEqual(strategy._settled_live_trades[-1]["order_id"], order_id)
@@ -2367,6 +3526,50 @@ class SimulationModeSafetyTests(unittest.TestCase):
         self.assertIsNotNone(strategy._settlement_ledger_blocked_reason)
         self.assertNotIn(order_id, strategy._open_live_trades)
 
+    def test_missing_fill_metadata_object_blocks_before_recording_fill(self):
+        strategy = self._new_strategy()
+        order_id = "missing-fill-metadata-object"
+        meta = self._live_trade_meta(order_id=order_id, token_id="token-missing-fill-meta-object")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = dict(meta)
+
+        with self.assertRaisesRegex(self.bot.SettlementLedgerError, "fill metadata .* is missing"):
+            strategy._record_live_order_fill(
+                order_id,
+                Decimal("0.50"),
+                Decimal("4"),
+                fill_metadata=None,
+            )
+
+        self.assertIsNotNone(strategy._settlement_ledger_blocked_reason)
+        self.assertEqual(strategy._settled_live_trades, [])
+        self.assertIn(order_id, strategy._submitted_positions)
+        self.assertNotIn(order_id, strategy._open_live_trades)
+
+    def test_empty_fill_metadata_creates_durable_unknown_and_blocks(self):
+        strategy = self._new_strategy()
+        order_id = "empty-fill-metadata"
+        meta = self._live_trade_meta(order_id=order_id, token_id="token-empty-fill-meta")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = dict(meta)
+
+        result = strategy._record_live_order_fill(
+            order_id,
+            Decimal("0.50"),
+            Decimal("4"),
+            fill_metadata={},
+        )
+
+        self.assertFalse(result)
+        self.assertIsNotNone(strategy._settlement_ledger_blocked_reason)
+        unknown = strategy._settled_live_trades[-1]
+        self.assertEqual(unknown["order_id"], order_id)
+        self.assertEqual(unknown["unknown_reason"], "missing_fill_identity_metadata_from_nautilus")
+        self.assertEqual(unknown["settlement_source"], "SETTLEMENT_UNKNOWN")
+        self.assertNotIn(order_id, strategy._open_live_trades)
+
     def test_invalid_direct_fill_preserves_pending_actual_fill(self):
         strategy = self._new_strategy()
         order_id = "invalid-direct-fill-pending"
@@ -2374,7 +3577,12 @@ class SimulationModeSafetyTests(unittest.TestCase):
         pending_before_fills = copy.deepcopy(strategy._pending_actual_fills[order_id]["fills"])
 
         with self.assertRaisesRegex(self.bot.SettlementLedgerError, "requires external repair"):
-            strategy._record_live_order_fill(order_id, Decimal("0"), Decimal("4"))
+            strategy._record_live_order_fill(
+                order_id,
+                Decimal("0"),
+                Decimal("4"),
+                fill_metadata=self._fill_metadata_for_meta(strategy._pending_actual_fills[order_id]),
+            )
 
         self.assertEqual(strategy._pending_actual_fills[order_id]["fills"], pending_before_fills)
         self.assertTrue(strategy._pending_actual_fills[order_id]["requires_external_fill_repair"])
@@ -2393,7 +3601,12 @@ class SimulationModeSafetyTests(unittest.TestCase):
         pending_before = copy.deepcopy(strategy._pending_actual_fills[order_id])
 
         with self.assertRaisesRegex(self.bot.SettlementLedgerError, "already requires external repair"):
-            strategy._record_live_order_fill(order_id, Decimal("0.50"), Decimal("4"))
+            strategy._record_live_order_fill(
+                order_id,
+                Decimal("0.50"),
+                Decimal("4"),
+                fill_metadata=self._fill_metadata_for_meta(meta),
+            )
 
         self.assertEqual(strategy._pending_actual_fills[order_id], pending_before)
         self.assertEqual(strategy._settled_live_trades, [])
@@ -2410,7 +3623,12 @@ class SimulationModeSafetyTests(unittest.TestCase):
         pending_before_fills = copy.deepcopy(strategy._pending_actual_fills[order_id]["fills"])
 
         with self.assertRaisesRegex(self.bot.SettlementLedgerError, "requires external repair"):
-            strategy._record_live_order_fill(order_id, Decimal("0.50"), Decimal("4"))
+            strategy._record_live_order_fill(
+                order_id,
+                Decimal("0.50"),
+                Decimal("4"),
+                fill_metadata=self._fill_metadata_for_meta(meta),
+            )
 
         self.assertEqual(strategy._pending_actual_fills[order_id]["fills"], pending_before_fills)
         self.assertTrue(strategy._pending_actual_fills[order_id]["requires_external_fill_repair"])
@@ -2424,7 +3642,12 @@ class SimulationModeSafetyTests(unittest.TestCase):
         meta.pop("filled_notional")
         strategy._submitted_positions[order_id] = meta
 
-        result = strategy._record_live_order_fill(order_id, Decimal("NaN"), Decimal("4"))
+        result = strategy._record_live_order_fill(
+            order_id,
+            Decimal("NaN"),
+            Decimal("4"),
+            fill_metadata=self._fill_metadata_for_meta(meta),
+        )
 
         self.assertFalse(result)
         self.assertEqual(
@@ -2441,7 +3664,12 @@ class SimulationModeSafetyTests(unittest.TestCase):
         meta.pop("filled_notional")
         strategy._submitted_positions[order_id] = meta
 
-        result = strategy._record_live_order_fill(order_id, Decimal("0.50"), Decimal("0"))
+        result = strategy._record_live_order_fill(
+            order_id,
+            Decimal("0.50"),
+            Decimal("0"),
+            fill_metadata=self._fill_metadata_for_meta(meta),
+        )
 
         self.assertFalse(result)
         self.assertEqual(
@@ -2458,7 +3686,12 @@ class SimulationModeSafetyTests(unittest.TestCase):
         meta.pop("filled_notional")
         strategy._submitted_positions[order_id] = meta
 
-        result = strategy._record_live_order_fill(order_id, Decimal("1.01"), Decimal("4"))
+        result = strategy._record_live_order_fill(
+            order_id,
+            Decimal("1.01"),
+            Decimal("4"),
+            fill_metadata=self._fill_metadata_for_meta(meta),
+        )
 
         self.assertFalse(result)
         self.assertEqual(
@@ -2471,7 +3704,16 @@ class SimulationModeSafetyTests(unittest.TestCase):
         strategy = self._new_strategy()
         order_id = "untracked-fill-order"
 
-        result = strategy._record_live_order_fill(order_id, Decimal("0.50"), Decimal("4"))
+        result = strategy._record_live_order_fill(
+            order_id,
+            Decimal("0.50"),
+            Decimal("4"),
+            fill_metadata={
+                "instrument_id": "cond-untracked-token-untracked.POLYMARKET",
+                "condition_id": "cond-untracked",
+                "token_id": "token-untracked",
+            },
+        )
 
         self.assertFalse(result)
         self.assertEqual(strategy._settled_live_trades[-1]["order_id"], order_id)
@@ -2489,7 +3731,12 @@ class SimulationModeSafetyTests(unittest.TestCase):
         meta.pop("filled_qty")
         strategy._open_live_trades[order_id] = meta
 
-        result = strategy._record_live_order_fill(order_id, Decimal("0.50"), Decimal("1"))
+        result = strategy._record_live_order_fill(
+            order_id,
+            Decimal("0.50"),
+            Decimal("1"),
+            fill_metadata=self._fill_metadata_for_meta(meta),
+        )
 
         self.assertFalse(result)
         self.assertNotIn(order_id, strategy._open_live_trades)
@@ -2503,7 +3750,12 @@ class SimulationModeSafetyTests(unittest.TestCase):
         meta = self._live_trade_meta(order_id=order_id, token_id="token-zero-open")
         strategy._open_live_trades[order_id] = meta
 
-        result = strategy._record_live_order_fill(order_id, Decimal("0"), Decimal("1"))
+        result = strategy._record_live_order_fill(
+            order_id,
+            Decimal("0"),
+            Decimal("1"),
+            fill_metadata=self._fill_metadata_for_meta(meta),
+        )
 
         self.assertFalse(result)
         self.assertNotIn(order_id, strategy._open_live_trades)
@@ -2710,6 +3962,14 @@ class SimulationModeSafetyTests(unittest.TestCase):
             strategy._submitted_order_intents[f"intent-{status}"] = {
                 "status": status,
                 "needs_reconciliation": False,
+                "terminal_no_fill_event": {
+                    "event_type": "_TerminalNoFillEvent",
+                    "raw_event": {
+                        "event_type": "_TerminalNoFillEvent",
+                        "repr": "<_TerminalNoFillEvent>",
+                        "fields": {"filled_qty": "0"},
+                    },
+                },
                 "terminal_no_fill_zero_quantity_evidence": {"filled_qty": "0"},
             }
 
@@ -2718,6 +3978,175 @@ class SimulationModeSafetyTests(unittest.TestCase):
         self.assertFalse(
             any(record["order_id"].startswith("intent-ORDER_") for record in unresolved)
         )
+
+    def test_terminal_no_fill_status_without_raw_event_is_unresolved(self):
+        strategy = self._new_strategy()
+        strategy._submitted_order_intents["intent-denied-no-raw-event"] = {
+            "status": "ORDER_DENIED_NO_FILL",
+            "needs_reconciliation": False,
+            "terminal_no_fill_zero_quantity_evidence": {"filled_qty": "0"},
+        }
+
+        unresolved = strategy._unresolved_settlement_unknowns()
+
+        self.assertTrue(any(record["order_id"] == "intent-denied-no-raw-event" for record in unresolved))
+
+    def test_terminal_no_fill_status_without_raw_zero_field_is_unresolved(self):
+        strategy = self._new_strategy()
+        strategy._submitted_order_intents["intent-denied-empty-raw-fields"] = {
+            "status": "ORDER_DENIED_NO_FILL",
+            "needs_reconciliation": False,
+            "terminal_no_fill_event": {
+                "event_type": "_TerminalNoFillEvent",
+                "raw_event": {
+                    "event_type": "_TerminalNoFillEvent",
+                    "repr": "<_TerminalNoFillEvent>",
+                    "fields": {},
+                },
+            },
+            "terminal_no_fill_zero_quantity_evidence": {"filled_qty": "0"},
+        }
+
+        unresolved = strategy._unresolved_settlement_unknowns()
+
+        self.assertTrue(any(record["order_id"] == "intent-denied-empty-raw-fields" for record in unresolved))
+
+    def test_terminal_no_fill_status_with_mismatched_raw_zero_field_is_unresolved(self):
+        strategy = self._new_strategy()
+        strategy._submitted_order_intents["intent-denied-mismatch-raw-field"] = {
+            "status": "ORDER_DENIED_NO_FILL",
+            "needs_reconciliation": False,
+            "terminal_no_fill_event": {
+                "event_type": "_TerminalNoFillEvent",
+                "raw_event": {
+                    "event_type": "_TerminalNoFillEvent",
+                    "repr": "<_TerminalNoFillEvent>",
+                    "fields": {"filled_qty": "1"},
+                },
+            },
+            "terminal_no_fill_zero_quantity_evidence": {"filled_qty": "0"},
+        }
+
+        unresolved = strategy._unresolved_settlement_unknowns()
+
+        self.assertTrue(any(record["order_id"] == "intent-denied-mismatch-raw-field" for record in unresolved))
+
+    def test_terminal_no_fill_status_with_extra_raw_fill_evidence_is_unresolved(self):
+        strategy = self._new_strategy()
+        strategy._submitted_order_intents["intent-denied-extra-raw-fill"] = {
+            "status": "ORDER_DENIED_NO_FILL",
+            "needs_reconciliation": False,
+            "terminal_no_fill_event": {
+                "event_type": "_TerminalNoFillEvent",
+                "raw_event": {
+                    "event_type": "_TerminalNoFillEvent",
+                    "repr": "<_TerminalNoFillEvent>",
+                    "fields": {
+                        "filled_qty": "0",
+                        "last_qty": "1",
+                        "last_px": "0.60",
+                    },
+                },
+            },
+            "terminal_no_fill_zero_quantity_evidence": {"filled_qty": "0"},
+        }
+
+        unresolved = strategy._unresolved_settlement_unknowns()
+
+        self.assertTrue(any(record["order_id"] == "intent-denied-extra-raw-fill" for record in unresolved))
+
+    def test_terminal_no_fill_status_with_zero_raw_price_fields_is_resolved(self):
+        strategy = self._new_strategy()
+        strategy._submitted_order_intents["intent-denied-zero-raw-price"] = {
+            "status": "ORDER_DENIED_NO_FILL",
+            "needs_reconciliation": False,
+            "terminal_no_fill_event": {
+                "event_type": "_TerminalNoFillEvent",
+                "raw_event": {
+                    "event_type": "_TerminalNoFillEvent",
+                    "repr": "<_TerminalNoFillEvent>",
+                    "fields": {
+                        "filled_qty": "0",
+                        "last_px": "0",
+                        "avg_px": "0",
+                    },
+                },
+            },
+            "terminal_no_fill_zero_quantity_evidence": {"filled_qty": "0"},
+        }
+
+        unresolved = strategy._unresolved_settlement_unknowns()
+
+        self.assertFalse(any(record["order_id"] == "intent-denied-zero-raw-price" for record in unresolved))
+
+    def test_terminal_no_fill_status_with_top_level_fill_evidence_is_unresolved(self):
+        strategy = self._new_strategy()
+        strategy._submitted_order_intents["intent-denied-top-level-fill"] = {
+            "status": "ORDER_DENIED_NO_FILL",
+            "needs_reconciliation": False,
+            "terminal_no_fill_event": {
+                "event_type": "_TerminalNoFillEvent",
+                "last_qty": "1",
+                "raw_event": {
+                    "event_type": "_TerminalNoFillEvent",
+                    "repr": "<_TerminalNoFillEvent>",
+                    "fields": {"filled_qty": "0"},
+                },
+            },
+            "terminal_no_fill_zero_quantity_evidence": {"filled_qty": "0"},
+        }
+
+        unresolved = strategy._unresolved_settlement_unknowns()
+
+        self.assertTrue(any(record["order_id"] == "intent-denied-top-level-fill" for record in unresolved))
+
+    def test_terminal_no_fill_status_with_top_level_fill_identifier_is_unresolved(self):
+        strategy = self._new_strategy()
+        for key in self.bot.ACTUAL_FILL_UNIQUE_KEY_FIELDS:
+            with self.subTest(key=key):
+                order_id = f"intent-denied-top-level-{key}"
+                strategy._submitted_order_intents[order_id] = {
+                    "status": "ORDER_DENIED_NO_FILL",
+                    "needs_reconciliation": False,
+                    "terminal_no_fill_event": {
+                        "event_type": "_TerminalNoFillEvent",
+                        key: f"{key}-hidden",
+                        "raw_event": {
+                            "event_type": "_TerminalNoFillEvent",
+                            "repr": "<_TerminalNoFillEvent>",
+                            "fields": {"filled_qty": "0"},
+                        },
+                    },
+                    "terminal_no_fill_zero_quantity_evidence": {"filled_qty": "0"},
+                }
+
+                unresolved = strategy._unresolved_settlement_unknowns()
+
+                self.assertTrue(any(record["order_id"] == order_id for record in unresolved))
+
+    def test_terminal_no_fill_status_with_instance_attr_fill_evidence_is_unresolved(self):
+        strategy = self._new_strategy()
+        for key in self.bot.ACTUAL_FILL_UNIQUE_KEY_FIELDS:
+            with self.subTest(key=key):
+                order_id = f"intent-denied-instance-{key}"
+                strategy._submitted_order_intents[order_id] = {
+                    "status": "ORDER_DENIED_NO_FILL",
+                    "needs_reconciliation": False,
+                    "terminal_no_fill_event": {
+                        "event_type": "_TerminalNoFillEvent",
+                        "raw_event": {
+                            "event_type": "_TerminalNoFillEvent",
+                            "repr": "<_TerminalNoFillEvent>",
+                            "fields": {"filled_qty": "0"},
+                            "instance_attrs": {key: f"{key}-hidden"},
+                        },
+                    },
+                    "terminal_no_fill_zero_quantity_evidence": {"filled_qty": "0"},
+                }
+
+                unresolved = strategy._unresolved_settlement_unknowns()
+
+                self.assertTrue(any(record["order_id"] == order_id for record in unresolved))
 
     def test_terminal_no_fill_status_without_zero_evidence_is_unresolved(self):
         strategy = self._new_strategy()
@@ -2776,6 +4205,10 @@ class SimulationModeSafetyTests(unittest.TestCase):
         self.assertEqual(intent["status"], "ORDER_DENIED_NO_FILL")
         self.assertFalse(intent["needs_reconciliation"])
         self.assertEqual(intent["terminal_no_fill_event"]["venue_order_id"], "0xdenied")
+        raw_event = intent["terminal_no_fill_event"]["raw_event"]
+        self.assertEqual(raw_event["event_type"], "_DeniedEvent")
+        self.assertEqual(raw_event["fields"]["venue_order_id"], "0xdenied")
+        self.assertEqual(raw_event["fields"]["filled_qty"], "0")
         unresolved = strategy._unresolved_settlement_unknowns()
         self.assertFalse(any(record["order_id"] == order_id for record in unresolved))
         data = json.loads(self._test_ledger_path.read_text(encoding="utf-8"))
@@ -2799,8 +4232,974 @@ class SimulationModeSafetyTests(unittest.TestCase):
             strategy.on_order_denied(_DeniedEvent())
 
         self.assertIsNotNone(strategy._settlement_ledger_blocked_reason)
+        self.assertNotIn(order_id, strategy._submitted_order_intents)
+        self.assertIn(order_id, strategy._submitted_positions)
+        unknown = strategy._settled_live_trades[-1]
+        self.assertEqual(unknown["unknown_reason"], "terminal_positive_fill_evidence_without_price")
+        self.assertEqual(unknown["venue_order_id"], "0xdenied-fill")
+
+    def test_terminal_no_fill_with_fill_identifier_blocks(self):
+        for key in self.bot.ACTUAL_FILL_UNIQUE_KEY_FIELDS:
+            with self.subTest(key=key):
+                strategy = self._new_strategy()
+                try:
+                    order_id = f"intent-denied-{key}"
+                    meta = self._live_trade_meta(order_id=order_id, token_id=f"token-{key}")
+                    strategy._submitted_positions[order_id] = dict(meta)
+                    strategy.risk_engine.add_position(order_id, Decimal("2.00"), Decimal("0.50"), "buy_yes")
+                    strategy._persist_submitted_order_intent_locked(order_id, meta, "ask")
+
+                    class _DeniedEvent:
+                        client_order_id = order_id
+                        venue_order_id = f"0xdenied{key}"
+                        reason = "identifier evidence"
+                        filled_qty = Decimal("0")
+
+                    setattr(_DeniedEvent, key, f"{key}-value")
+
+                    with self.assertRaisesRegex(self.bot.SettlementLedgerError, "fill evidence"):
+                        strategy.on_order_denied(_DeniedEvent())
+
+                    self.assertIsNotNone(strategy._settlement_ledger_blocked_reason)
+                    self.assertEqual(strategy._submitted_order_intents[order_id]["status"], "INTENT_PERSISTED")
+                finally:
+                    strategy._release_live_trade_ledger_lock()
+
+    def test_cancel_with_terminal_fill_details_records_fill_not_no_fill(self):
+        strategy = self._new_strategy()
+        order_id = "limit-cancel-terminal-fill"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-terminal-fill")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("4.96"), Decimal("0.62"), "buy_yes")
+        strategy._persist_submitted_order_intent_locked(order_id, meta, "ask")
+
+        class _CanceledEvent:
+            client_order_id = order_id
+            venue_order_id = "0xterminalfill"
+            reason = "FAK partially filled before cancel"
+            last_qty = Decimal("4")
+            last_px = Decimal("0.60")
+
+        strategy.on_order_canceled(_CanceledEvent())
+
+        self.assertIn(order_id, strategy._open_live_trades)
+        recorded = strategy._open_live_trades[order_id]
+        self.assertEqual(recorded["filled_qty"], Decimal("4"))
+        self.assertEqual(recorded["entry_price"], Decimal("0.60"))
+        self.assertEqual(recorded["venue_order_id"], "0xterminalfill")
+        self.assertNotIn(order_id, strategy._submitted_positions)
+        self.assertNotIn(order_id, strategy._submitted_order_intents)
+        self.assertIsNone(strategy._settlement_ledger_blocked_reason)
+        data = json.loads(self._test_ledger_path.read_text(encoding="utf-8"))
+        self.assertEqual(data["open"][order_id]["venue_order_id"], "0xterminalfill")
+
+    def test_rejected_with_terminal_fill_details_does_not_reopen_trade_window(self):
+        strategy = self._new_strategy()
+        order_id = "limit-rejected-terminal-fill"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-rejected-fill")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("4.96"), Decimal("0.62"), "buy_yes")
+        strategy._persist_submitted_order_intent_locked(order_id, meta, "ask")
+        strategy.last_trade_time = ("market", 123)
+
+        class _RejectedEvent:
+            client_order_id = order_id
+            venue_order_id = "0xterminalrejectfill"
+            reason = "FAK partially filled"
+            last_qty = Decimal("4")
+            last_px = Decimal("0.60")
+
+        strategy.on_order_rejected(_RejectedEvent())
+
+        self.assertIn(order_id, strategy._open_live_trades)
+        self.assertEqual(
+            strategy._open_live_trades[order_id]["venue_order_id"],
+            "0xterminalrejectfill",
+        )
+        self.assertEqual(strategy.last_trade_time, ("market", 123))
+        self.assertNotIn(order_id, strategy._submitted_order_intents)
+        self.assertIsNone(strategy._settlement_ledger_blocked_reason)
+        data = json.loads(self._test_ledger_path.read_text(encoding="utf-8"))
+        self.assertEqual(data["open"][order_id]["venue_order_id"], "0xterminalrejectfill")
+
+    def test_terminal_fill_limit_violation_unknown_preserves_venue_order_id(self):
+        strategy = self._new_strategy()
+        order_id = "limit-terminal-fill-violation"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-terminal-violation")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("4.96"), Decimal("0.62"), "buy_yes")
+        strategy._persist_submitted_order_intent_locked(order_id, meta, "ask")
+
+        class _CanceledEvent:
+            client_order_id = order_id
+            venue_order_id = "0xterminalviolation"
+            reason = "FAK fill above local cap"
+            last_qty = Decimal("4")
+            last_px = Decimal("0.63")
+
+        strategy.on_order_canceled(_CanceledEvent())
+
+        self.assertNotIn(order_id, strategy._open_live_trades)
+        unknown = strategy._settled_live_trades[-1]
+        self.assertEqual(unknown["venue_order_id"], "0xterminalviolation")
+        self.assertEqual(unknown["raw_callback_payload"]["venue_order_id"], "0xterminalviolation")
+        self.assertEqual(
+            unknown["unknown_reason"],
+            "limit_ioc_fill_price_above_submitted_limit:vwap=0.63,submitted_limit_price=0.62",
+        )
+        self.assertIsNotNone(strategy._settlement_ledger_blocked_reason)
+        data = json.loads(self._test_ledger_path.read_text(encoding="utf-8"))
+        self.assertEqual(data["settled"][-1]["venue_order_id"], "0xterminalviolation")
+
+    def test_terminal_fill_invalid_direction_unknown_preserves_venue_order_id(self):
+        strategy = self._new_strategy()
+        order_id = "terminal-fill-invalid-direction"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-invalid-direction")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        meta["direction"] = "sideways"
+        strategy._submitted_positions[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("4.96"), Decimal("0.62"), "buy_yes")
+
+        class _CanceledEvent:
+            client_order_id = order_id
+            venue_order_id = "0xterminalbaddir"
+            reason = "terminal fill with malformed local direction"
+            last_qty = Decimal("4")
+            last_px = Decimal("0.60")
+
+        strategy.on_order_canceled(_CanceledEvent())
+
+        unknown = strategy._settled_live_trades[-1]
+        self.assertEqual(unknown["venue_order_id"], "0xterminalbaddir")
+        self.assertEqual(unknown["raw_callback_payload"]["venue_order_id"], "0xterminalbaddir")
+        self.assertEqual(unknown["unknown_reason"], "invalid_fill_direction_metadata")
+        self.assertIsNotNone(strategy._settlement_ledger_blocked_reason)
+
+    def test_terminal_fill_blocked_ledger_unknown_preserves_venue_order_id(self):
+        strategy = self._new_strategy()
+        order_id = "terminal-fill-blocked-ledger"
+        strategy._settlement_ledger_blocked_reason = "unit test pre-existing block"
+
+        class _CanceledEvent:
+            client_order_id = order_id
+            venue_order_id = "0xterminalblocked"
+            reason = "terminal fill while ledger blocked"
+            last_qty = Decimal("4")
+            last_px = Decimal("0.60")
+
+        with self.assertRaisesRegex(self.bot.SettlementLedgerError, "ledger is blocked"):
+            strategy.on_order_canceled(_CanceledEvent())
+
+        unknown = strategy._settled_live_trades[-1]
+        self.assertEqual(unknown["venue_order_id"], "0xterminalblocked")
+        self.assertEqual(unknown["raw_callback_payload"]["venue_order_id"], "0xterminalblocked")
+        self.assertEqual(
+            unknown["unknown_reason"],
+            "live_fill_received_while_settlement_ledger_blocked",
+        )
+
+    def test_terminal_fill_impossible_price_unknown_preserves_venue_order_id(self):
+        strategy = self._new_strategy()
+        order_id = "terminal-fill-price-above-one"
+
+        class _CanceledEvent:
+            client_order_id = order_id
+            venue_order_id = "0xterminalpriceaboveone"
+            reason = "terminal fill price above one"
+            last_qty = Decimal("4")
+            last_px = Decimal("1.01")
+
+        strategy.on_order_canceled(_CanceledEvent())
+
+        unknown = strategy._settled_live_trades[-1]
+        self.assertEqual(unknown["venue_order_id"], "0xterminalpriceaboveone")
+        self.assertEqual(unknown["raw_callback_payload"]["venue_order_id"], "0xterminalpriceaboveone")
+        self.assertEqual(unknown["unknown_reason"], "fill_price_above_one_from_nautilus")
+        self.assertIsNotNone(strategy._settlement_ledger_blocked_reason)
+
+    def test_terminal_fill_submitted_venue_conflict_creates_durable_unknown(self):
+        strategy = self._new_strategy()
+        order_id = "terminal-fill-submitted-venue-conflict"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-submitted-conflict")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        meta["venue_order_id"] = "0xtrackedvenue"
+        strategy._submitted_positions[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("4.96"), Decimal("0.62"), "buy_yes")
+
+        class _CanceledEvent:
+            client_order_id = order_id
+            venue_order_id = "0xterminalvenue"
+            reason = "terminal venue conflict"
+            last_qty = Decimal("4")
+            last_px = Decimal("0.60")
+
+        with self.assertRaisesRegex(self.bot.SettlementLedgerError, "conflicts on venue_order_id"):
+            strategy.on_order_canceled(_CanceledEvent())
+
+        unknown = strategy._settled_live_trades[-1]
+        self.assertEqual(unknown["unknown_reason"], "fill_metadata_conflict")
+        self.assertEqual(unknown["venue_conflict_payload_venue_order_id"], "0xterminalvenue")
+        self.assertEqual(unknown["venue_conflict_tracked_venue_order_id"], "0xtrackedvenue")
+        self.assertEqual(unknown["raw_callback_payload"]["venue_order_id"], "0xterminalvenue")
+        self.assertEqual(unknown["raw_callback_payload"]["tracked_venue_order_id"], "0xtrackedvenue")
+
+    def test_terminal_fill_open_venue_conflict_creates_durable_unknown(self):
+        strategy = self._new_strategy()
+        order_id = "terminal-fill-open-venue-conflict"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-open-conflict")
+        meta["venue_order_id"] = "0xopenvenue"
+        strategy._open_live_trades[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("2.48"), Decimal("0.62"), "buy_yes")
+
+        class _ExpiredEvent:
+            client_order_id = order_id
+            venue_order_id = "0xterminalopenvenue"
+            reason = "terminal open venue conflict"
+            last_qty = Decimal("1")
+            last_px = Decimal("0.60")
+
+        with self.assertRaisesRegex(self.bot.SettlementLedgerError, "conflicts on venue_order_id"):
+            strategy.on_order_expired(_ExpiredEvent())
+
+        unknown = strategy._settled_live_trades[-1]
+        self.assertEqual(unknown["unknown_reason"], "fill_metadata_conflict")
+        self.assertEqual(unknown["venue_conflict_payload_venue_order_id"], "0xterminalopenvenue")
+        self.assertEqual(unknown["venue_conflict_tracked_venue_order_id"], "0xopenvenue")
+        self.assertEqual(unknown["raw_callback_payload"]["venue_order_id"], "0xterminalopenvenue")
+        self.assertEqual(unknown["raw_callback_payload"]["tracked_venue_order_id"], "0xopenvenue")
+
+    def test_terminal_no_fill_open_venue_conflict_creates_durable_unknown(self):
+        strategy = self._new_strategy()
+        order_id = "terminal-no-fill-open-venue-conflict"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-no-fill-open-conflict")
+        meta["venue_order_id"] = "0xopenvenue"
+        strategy._open_live_trades[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("2.48"), Decimal("0.62"), "buy_yes")
+
+        class _ExpiredEvent:
+            client_order_id = order_id
+            venue_order_id = "0xterminalother"
+            reason = "terminal zero-fill venue conflict"
+            filled_qty = Decimal("0")
+
+        with self.assertRaisesRegex(self.bot.SettlementLedgerError, "conflicts on venue_order_id"):
+            strategy.on_order_expired(_ExpiredEvent())
+
+        unknown = strategy._settled_live_trades[-1]
+        self.assertEqual(unknown["unknown_reason"], "terminal_no_fill_metadata_conflict")
+        self.assertEqual(unknown["venue_conflict_payload_venue_order_id"], "0xterminalother")
+        self.assertEqual(unknown["venue_conflict_tracked_venue_order_id"], "0xopenvenue")
+        self.assertEqual(unknown["raw_callback_payload"]["fill_metadata_conflict_key"], "venue_order_id")
+        self.assertEqual(unknown["raw_callback_payload"]["terminal_venue_order_id"], "0xterminalother")
+        self.assertEqual(unknown["raw_callback_payload"]["tracked_venue_order_id"], "0xopenvenue")
+        self.assertEqual(unknown["raw_callback_payload"]["venue_order_id"], "0xterminalother")
+        self.assertIsNotNone(strategy._settlement_ledger_blocked_reason)
+
+    def test_terminal_no_fill_pending_actual_venue_conflict_creates_durable_unknown(self):
+        strategy = self._new_strategy()
+        order_id = "terminal-no-fill-pending-venue-conflict"
+        pending_fill = self._pending_actual_fill(
+            venue_order_id="0xopenvenue",
+        )
+        pending_fill["slug"] = "slug-pending"
+        pending_fill["instrument_id"] = "cond-pending-token-pending.POLYMARKET"
+        expected_fill_entries = copy.deepcopy(pending_fill["fills"])
+        strategy._pending_actual_fills[order_id] = pending_fill
+
+        class _ExpiredEvent:
+            client_order_id = order_id
+            venue_order_id = "0xterminalother"
+            reason = "terminal zero-fill venue conflict"
+            filled_qty = Decimal("0")
+
+        with self.assertRaisesRegex(self.bot.SettlementLedgerError, "conflicts on venue_order_id"):
+            strategy.on_order_expired(_ExpiredEvent())
+
+        self.assertNotIn(order_id, strategy._pending_actual_fills)
+        unknown = strategy._settled_live_trades[-1]
+        self.assertEqual(unknown["unknown_reason"], "terminal_no_fill_metadata_conflict")
+        self.assertEqual(unknown["venue_conflict_payload_venue_order_id"], "0xterminalother")
+        self.assertEqual(unknown["venue_conflict_tracked_venue_order_id"], "0xopenvenue")
+        self.assertEqual(unknown["condition_id"], "cond-pending")
+        self.assertEqual(unknown["token_id"], "token-pending")
+        self.assertEqual(unknown["slug"], "slug-pending")
+        self.assertEqual(unknown["instrument_id"], "cond-pending-token-pending.POLYMARKET")
+        self.assertEqual(unknown["raw_callback_payload"]["recorded_fill_source"], "pending_actual_fills")
+        self.assertEqual(unknown["raw_callback_payload"]["recorded_filled_qty"], "4")
+        self.assertEqual(unknown["raw_callback_payload"]["recorded_filled_notional"], "2.00")
+        self.assertEqual(unknown["raw_callback_payload"]["recorded_vwap"], "0.50")
+        self.assertEqual(
+            unknown["raw_callback_payload"]["recorded_fill_identity"],
+            {
+                "venue_order_id": "0xopenvenue",
+                "condition_id": "cond-pending",
+                "token_id": "token-pending",
+                "slug": "slug-pending",
+                "instrument_id": "cond-pending-token-pending.POLYMARKET",
+            },
+        )
+        self.assertEqual(unknown["raw_callback_payload"]["recorded_fill_entries"], expected_fill_entries)
+        self.assertTrue(unknown["raw_callback_payload"]["requires_external_fill_repair"])
+        self.assertIsNotNone(strategy._settlement_ledger_blocked_reason)
+
+    def test_order_filled_submitted_venue_conflict_creates_durable_unknown(self):
+        strategy = self._new_strategy()
+        order_id = "normal-fill-submitted-venue-conflict"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-normal-conflict")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        meta["venue_order_id"] = "0xtrackednormalvenue"
+        strategy._submitted_positions[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("4.96"), Decimal("0.62"), "buy_yes")
+
+        class _FillEvent:
+            client_order_id = order_id
+            venue_order_id = "0xnormalfillvenue"
+            last_qty = Decimal("4")
+            last_px = Decimal("0.60")
+
+        with self.assertRaisesRegex(self.bot.SettlementLedgerError, "conflicts on venue_order_id"):
+            strategy.on_order_filled(_FillEvent())
+
+        unknown = strategy._settled_live_trades[-1]
+        self.assertEqual(unknown["unknown_reason"], "fill_metadata_conflict")
+        self.assertEqual(unknown["venue_conflict_payload_venue_order_id"], "0xnormalfillvenue")
+        self.assertEqual(unknown["venue_conflict_tracked_venue_order_id"], "0xtrackednormalvenue")
+        self.assertEqual(unknown["raw_callback_payload"]["venue_order_id"], "0xnormalfillvenue")
+        self.assertEqual(unknown["raw_callback_payload"]["tracked_venue_order_id"], "0xtrackednormalvenue")
+
+    def test_order_filled_instrument_token_conflict_creates_durable_unknown(self):
+        strategy = self._new_strategy()
+        order_id = "normal-fill-instrument-token-conflict"
+        meta = self._limit_ioc_trade_meta(
+            order_id=order_id,
+            token_id="tokennormalinstrument",
+        )
+        meta["condition_id"] = "conda"
+        meta["instrument_id"] = "conda-tokennormalinstrument.POLYMARKET"
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("4.96"), Decimal("0.62"), "buy_yes")
+
+        class _FillEvent:
+            client_order_id = order_id
+            instrument_id = "conda-tokenfromevent.POLYMARKET"
+            last_qty = Decimal("4")
+            last_px = Decimal("0.60")
+
+        with self.assertRaisesRegex(self.bot.SettlementLedgerError, "conflicts on token_id"):
+            strategy.on_order_filled(_FillEvent())
+
+        unknown = strategy._settled_live_trades[-1]
+        self.assertEqual(unknown["unknown_reason"], "fill_metadata_conflict")
+        self.assertEqual(unknown["instrument_id"], "conda-tokenfromevent.POLYMARKET")
+        self.assertEqual(unknown["raw_callback_payload"]["fill_metadata_conflict_key"], "token_id")
+        self.assertEqual(unknown["raw_callback_payload"]["tracked_token_id"], "tokennormalinstrument")
+        self.assertEqual(unknown["raw_callback_payload"]["terminal_token_id"], "tokenfromevent")
+        self.assertEqual(unknown["raw_callback_payload"]["instrument_id"], "conda-tokenfromevent.POLYMARKET")
+
+    def test_order_filled_event_identity_source_conflict_creates_durable_unknown(self):
+        strategy = self._new_strategy()
+        order_id = "normal-fill-event-identity-conflict"
+        meta = self._limit_ioc_trade_meta(
+            order_id=order_id,
+            token_id="tokena",
+        )
+        meta["condition_id"] = "conda"
+        meta["instrument_id"] = "conda-tokena.POLYMARKET"
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("4.96"), Decimal("0.62"), "buy_yes")
+
+        class _FillEvent:
+            client_order_id = order_id
+            instrument_id = "conda-tokena.POLYMARKET"
+            info = {"asset_id": "tokenb", "market": "conda"}
+            last_qty = Decimal("4")
+            last_px = Decimal("0.60")
+
+        with self.assertRaisesRegex(self.bot.SettlementLedgerError, "conflicts on token_id"):
+            strategy.on_order_filled(_FillEvent())
+
+        unknown = strategy._settled_live_trades[-1]
+        self.assertEqual(unknown["unknown_reason"], "fill_metadata_identity_conflict")
+        self.assertEqual(unknown["order_id"], order_id)
+        self.assertEqual(unknown["instrument_id"], "conda-tokena.POLYMARKET")
+        self.assertIn("conflicts on token_id", unknown["raw_callback_payload"]["terminal_metadata_error"])
+        terminal_fields = unknown["raw_callback_payload"]["terminal_event"]["raw_event"]["fields"]
+        self.assertEqual(terminal_fields["info"]["asset_id"], "tokenb")
+        self.assertEqual(terminal_fields["instrument_id"], "conda-tokena.POLYMARKET")
+
+    def test_rejected_missing_reason_zero_fill_does_not_persist_no_fill_audit(self):
+        strategy = self._new_strategy()
+        order_id = "rejected-missing-reason-zero-fill"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-rejected-no-reason")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("4.96"), Decimal("0.62"), "buy_yes")
+        strategy._persist_submitted_order_intent_locked(order_id, meta, "ask")
+
+        class _RejectedEvent:
+            client_order_id = order_id
+            venue_order_id = "0xrejectednoreason"
+            filled_qty = Decimal("0")
+
+        with self.assertRaisesRegex(self.bot.SettlementLedgerError, "missing reason"):
+            strategy.on_order_rejected(_RejectedEvent())
+
         self.assertEqual(strategy._submitted_order_intents[order_id]["status"], "INTENT_PERSISTED")
         self.assertIn(order_id, strategy._submitted_positions)
+        self.assertIn(order_id, strategy.risk_engine._positions)
+        self.assertIsNotNone(strategy._settlement_ledger_blocked_reason)
+
+    def test_cancel_after_pending_actual_fill_does_not_mark_no_fill(self):
+        strategy = self._new_strategy()
+        order_id = "limit-cancel-after-pending-fill"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-partial-cancel")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("4.96"), Decimal("0.62"), "buy_yes")
+        strategy._persist_submitted_order_intent_locked(order_id, meta, "ask")
+
+        strategy._handle_actual_fill(
+            order_id,
+            {
+                "status": "ok",
+                "trade_id": "trade-partial-before-cancel",
+                "filled_qty": Decimal("4"),
+                "vwap": Decimal("0.60"),
+                "venue_order_id": "0xpartialcancel",
+                "condition_id": "cond-a",
+                "token_id": "token-partial-cancel",
+            },
+        )
+
+        class _CanceledEvent:
+            client_order_id = order_id
+            venue_order_id = "0xpartialcancel"
+            reason = "FAK unfilled remainder canceled"
+            filled_qty = Decimal("0")
+
+        strategy.on_order_canceled(_CanceledEvent())
+
+        self.assertIn(order_id, strategy._submitted_positions)
+        self.assertIn(order_id, strategy._pending_actual_fills)
+        self.assertEqual(strategy._submitted_order_intents[order_id]["status"], "INTENT_PERSISTED")
+        self.assertIn(order_id, strategy.risk_engine._positions)
+        self.assertIsNone(strategy._settlement_ledger_blocked_reason)
+
+    def test_expire_after_recorded_fill_does_not_mark_no_fill(self):
+        strategy = self._new_strategy()
+        order_id = "limit-expire-after-recorded-fill"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-partial-expire")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("4.96"), Decimal("0.62"), "buy_yes")
+        strategy._persist_submitted_order_intent_locked(order_id, meta, "ask")
+
+        class _FillEvent:
+            client_order_id = order_id
+            condition_id = meta["condition_id"]
+            token_id = meta["token_id"]
+            last_px = Decimal("0.60")
+            last_qty = Decimal("4")
+
+        strategy.on_order_filled(_FillEvent())
+        self.assertIn(order_id, strategy._open_live_trades)
+        self.assertNotIn(order_id, strategy._submitted_order_intents)
+
+        class _ExpiredEvent:
+            client_order_id = order_id
+            venue_order_id = "0xpartialexpire"
+            reason = "FAK remainder expired"
+            filled_qty = Decimal("0")
+
+        strategy.on_order_expired(_ExpiredEvent())
+
+        self.assertIn(order_id, strategy._open_live_trades)
+        self.assertNotIn(order_id, strategy._submitted_order_intents)
+        self.assertIsNone(strategy._settlement_ledger_blocked_reason)
+
+    def test_cancel_cumulative_filled_qty_after_recorded_fill_does_not_double_count(self):
+        strategy = self._new_strategy()
+        order_id = "limit-cancel-cumulative-after-fill"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-cumulative-confirm")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("4.96"), Decimal("0.62"), "buy_yes")
+        strategy._persist_submitted_order_intent_locked(order_id, meta, "ask")
+
+        class _FillEvent:
+            client_order_id = order_id
+            condition_id = meta["condition_id"]
+            token_id = meta["token_id"]
+            last_px = Decimal("0.60")
+            last_qty = Decimal("4")
+
+        strategy.on_order_filled(_FillEvent())
+
+        class _CanceledEvent:
+            client_order_id = order_id
+            venue_order_id = "0xcumulativeconfirm"
+            reason = "FAK terminal cumulative fill confirmation"
+            filled_qty = Decimal("4")
+            avg_px = Decimal("0.60")
+
+        strategy.on_order_canceled(_CanceledEvent())
+
+        recorded = strategy._open_live_trades[order_id]
+        self.assertEqual(recorded["filled_qty"], Decimal("4"))
+        self.assertEqual(recorded["filled_notional"], Decimal("2.40"))
+        self.assertEqual(recorded["entry_price"], Decimal("0.60"))
+        self.assertIsNone(strategy._settlement_ledger_blocked_reason)
+
+    def test_terminal_mixed_incremental_exceeding_cumulative_delta_blocks_unknown(self):
+        strategy = self._new_strategy()
+        order_id = "limit-mixed-terminal-delta-conflict"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-mixed-delta-conflict")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("4.96"), Decimal("0.62"), "buy_yes")
+
+        class _FillEvent:
+            client_order_id = order_id
+            condition_id = meta["condition_id"]
+            token_id = meta["token_id"]
+            last_px = Decimal("0.60")
+            last_qty = Decimal("4")
+
+        strategy.on_order_filled(_FillEvent())
+
+        class _CanceledEvent:
+            client_order_id = order_id
+            venue_order_id = "0xmixeddeltaconflict"
+            reason = "terminal mixed fields exceed cumulative delta"
+            filled_qty = Decimal("5")
+            avg_px = Decimal("0.604")
+            last_qty = Decimal("3")
+            last_px = Decimal("0.60")
+
+        with self.assertRaisesRegex(
+            self.bot.SettlementLedgerError,
+            "terminal_fill_conflicting_evidence_exceeds_cumulative_delta",
+        ):
+            strategy.on_order_canceled(_CanceledEvent())
+
+        unknown = strategy._settled_live_trades[-1]
+        self.assertEqual(
+            unknown["unknown_reason"],
+            "terminal_fill_conflicting_evidence_exceeds_cumulative_delta",
+        )
+        self.assertEqual(unknown["raw_callback_payload"]["selected_terminal_delta_qty"], "1")
+        self.assertEqual(unknown["raw_callback_payload"]["terminal_fill_field_source"], "last_qty/last_px")
+
+    def test_terminal_incremental_last_qty_with_avg_price_after_recorded_fill_blocks_unknown(self):
+        strategy = self._new_strategy()
+        order_id = "limit-last-qty-avg-after-fill"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-last-avg")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("4.96"), Decimal("0.62"), "buy_yes")
+
+        class _FillEvent:
+            client_order_id = order_id
+            condition_id = meta["condition_id"]
+            token_id = meta["token_id"]
+            last_px = Decimal("0.60")
+            last_qty = Decimal("4")
+
+        strategy.on_order_filled(_FillEvent())
+
+        class _CanceledEvent:
+            client_order_id = order_id
+            venue_order_id = "0xlastavg"
+            reason = "terminal last quantity with average price"
+            last_qty = Decimal("1")
+            avg_px = Decimal("0.604")
+
+        with self.assertRaisesRegex(
+            self.bot.SettlementLedgerError,
+            "terminal_incremental_fill_uses_average_price_after_recorded_fill",
+        ):
+            strategy.on_order_canceled(_CanceledEvent())
+
+        unknown = strategy._settled_live_trades[-1]
+        self.assertEqual(
+            unknown["unknown_reason"],
+            "terminal_incremental_fill_uses_average_price_after_recorded_fill",
+        )
+        self.assertEqual(unknown["raw_callback_payload"]["terminal_fill_field_source"], "last_qty/avg_px")
+
+    def test_terminal_incremental_selection_with_cumulative_last_price_blocks_unknown(self):
+        strategy = self._new_strategy()
+        order_id = "limit-incremental-with-cumulative-last-price"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-cumulative-last-price")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("4.96"), Decimal("0.62"), "buy_yes")
+
+        class _CanceledEvent:
+            client_order_id = order_id
+            venue_order_id = "0xcumulativelastprice"
+            reason = "terminal incremental plus cumulative last price"
+            last_qty = Decimal("1")
+            last_px = Decimal("0.60")
+            filled_qty = Decimal("5")
+
+        with self.assertRaisesRegex(
+            self.bot.SettlementLedgerError,
+            "terminal_cumulative_fill_requires_average_price",
+        ):
+            strategy.on_order_canceled(_CanceledEvent())
+
+        unknown = strategy._settled_live_trades[-1]
+        self.assertEqual(unknown["unknown_reason"], "terminal_cumulative_fill_requires_average_price")
+        self.assertEqual(unknown["raw_callback_payload"]["selected_terminal_fill_field_source"], "last_qty/last_px")
+        self.assertEqual(unknown["raw_callback_payload"]["terminal_fill_field_source"], "filled_qty/last_px")
+
+    def test_terminal_positive_last_qty_with_zero_cumulative_qty_blocks_unknown(self):
+        strategy = self._new_strategy()
+        order_id = "limit-positive-last-zero-cumulative"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-zero-cumulative")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("4.96"), Decimal("0.62"), "buy_yes")
+
+        class _CanceledEvent:
+            client_order_id = order_id
+            venue_order_id = "0xzerocumulative"
+            reason = "terminal positive last fill but zero cumulative"
+            last_qty = Decimal("1")
+            last_px = Decimal("0.60")
+            filled_qty = Decimal("0")
+
+        with self.assertRaisesRegex(
+            self.bot.SettlementLedgerError,
+            "terminal_cumulative_quantity_below_selected_fill_evidence",
+        ):
+            strategy.on_order_canceled(_CanceledEvent())
+
+        unknown = strategy._settled_live_trades[-1]
+        self.assertEqual(
+            unknown["unknown_reason"],
+            "terminal_cumulative_quantity_below_selected_fill_evidence",
+        )
+        self.assertEqual(unknown["raw_callback_payload"]["terminal_quantity_field"], "filled_qty")
+        self.assertEqual(unknown["raw_callback_payload"]["terminal_quantity_value"], "0")
+
+    def test_terminal_malformed_fill_field_after_recorded_fill_blocks_unknown(self):
+        strategy = self._new_strategy()
+        order_id = "limit-terminal-malformed-fill-field"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-malformed-terminal")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("4.96"), Decimal("0.62"), "buy_yes")
+
+        class _FillEvent:
+            client_order_id = order_id
+            condition_id = meta["condition_id"]
+            token_id = meta["token_id"]
+            last_px = Decimal("0.60")
+            last_qty = Decimal("4")
+
+        strategy.on_order_filled(_FillEvent())
+
+        class _CanceledEvent:
+            client_order_id = order_id
+            venue_order_id = "0xmalformedterminal"
+            reason = "terminal malformed fill field"
+            last_qty = "not-a-decimal"
+            last_px = Decimal("0.60")
+
+        with self.assertRaisesRegex(
+            self.bot.SettlementLedgerError,
+            "terminal_fill_evidence_parse_error",
+        ):
+            strategy.on_order_canceled(_CanceledEvent())
+
+        self.assertIsNotNone(strategy._settlement_ledger_blocked_reason)
+        unknown = strategy._settled_live_trades[-1]
+        self.assertEqual(unknown["unknown_reason"], "terminal_fill_evidence_parse_error")
+        self.assertIn("not-a-decimal", unknown["raw_callback_payload"]["terminal_parse_error"])
+        self.assertEqual(
+            unknown["raw_callback_payload"]["terminal_event"]["raw_event"]["fields"]["last_qty"],
+            "not-a-decimal",
+        )
+
+    def test_cancel_cumulative_filled_qty_after_recorded_fill_records_only_delta(self):
+        strategy = self._new_strategy()
+        order_id = "limit-cancel-cumulative-delta"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-cumulative-delta")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("4.96"), Decimal("0.62"), "buy_yes")
+        strategy._persist_submitted_order_intent_locked(order_id, meta, "ask")
+
+        class _FillEvent:
+            client_order_id = order_id
+            condition_id = meta["condition_id"]
+            token_id = meta["token_id"]
+            last_px = Decimal("0.60")
+            last_qty = Decimal("4")
+
+        strategy.on_order_filled(_FillEvent())
+
+        class _CanceledEvent:
+            client_order_id = order_id
+            venue_order_id = "0xcumulativedelta"
+            reason = "FAK terminal cumulative fill delta"
+            last_qty = Decimal("1")
+            filled_qty = Decimal("5")
+            avg_px = Decimal("0.604")
+
+        strategy.on_order_canceled(_CanceledEvent())
+
+        recorded = strategy._open_live_trades[order_id]
+        self.assertEqual(recorded["filled_qty"], Decimal("5"))
+        self.assertEqual(recorded["filled_notional"], Decimal("3.020"))
+        self.assertEqual(recorded["entry_price"], Decimal("0.604"))
+        self.assertIsNone(strategy._settlement_ledger_blocked_reason)
+
+    def test_terminal_cumulative_fill_without_avg_price_blocks_unknown(self):
+        strategy = self._new_strategy()
+        order_id = "limit-cumulative-without-avg"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-cumulative-no-avg")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("4.96"), Decimal("0.62"), "buy_yes")
+
+        class _CanceledEvent:
+            client_order_id = order_id
+            venue_order_id = "0xcumulativenoavg"
+            reason = "terminal cumulative quantity without VWAP"
+            filled_qty = Decimal("4")
+            last_px = Decimal("0.60")
+
+        with self.assertRaisesRegex(
+            self.bot.SettlementLedgerError,
+            "terminal_cumulative_fill_requires_average_price",
+        ):
+            strategy.on_order_canceled(_CanceledEvent())
+
+        unknown = strategy._settled_live_trades[-1]
+        self.assertEqual(unknown["unknown_reason"], "terminal_cumulative_fill_requires_average_price")
+        self.assertEqual(unknown["venue_order_id"], "0xcumulativenoavg")
+        self.assertIsNotNone(strategy._settlement_ledger_blocked_reason)
+
+    def test_terminal_mixed_cumulative_and_unsafe_last_price_blocks_unknown(self):
+        strategy = self._new_strategy()
+        order_id = "limit-mixed-terminal-unsafe-last"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-mixed-unsafe-last")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("4.96"), Decimal("0.62"), "buy_yes")
+
+        class _FillEvent:
+            client_order_id = order_id
+            condition_id = meta["condition_id"]
+            token_id = meta["token_id"]
+            last_px = Decimal("0.60")
+            last_qty = Decimal("4")
+
+        strategy.on_order_filled(_FillEvent())
+
+        class _CanceledEvent:
+            client_order_id = order_id
+            venue_order_id = "0xmixedunsafe"
+            reason = "terminal mixed fields with unsafe last price"
+            filled_qty = Decimal("4")
+            avg_px = Decimal("0.60")
+            last_qty = Decimal("1")
+            last_px = Decimal("0.63")
+
+        with self.assertRaisesRegex(
+            self.bot.SettlementLedgerError,
+            "terminal_fill_conflicting_evidence",
+        ):
+            strategy.on_order_canceled(_CanceledEvent())
+
+        unknown = strategy._settled_live_trades[-1]
+        self.assertTrue(unknown["unknown_reason"].startswith("terminal_fill_conflicting_evidence"))
+        self.assertEqual(unknown["raw_callback_payload"]["terminal_fill_field_source"], "last_qty/last_px")
+        self.assertIsNotNone(strategy._settlement_ledger_blocked_reason)
+
+    def test_terminal_equal_cumulative_conflicting_vwap_blocks_unknown(self):
+        strategy = self._new_strategy()
+        order_id = "limit-equal-cumulative-vwap-conflict"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-vwap-conflict")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("4.96"), Decimal("0.62"), "buy_yes")
+
+        class _FillEvent:
+            client_order_id = order_id
+            condition_id = meta["condition_id"]
+            token_id = meta["token_id"]
+            last_px = Decimal("0.60")
+            last_qty = Decimal("4")
+
+        strategy.on_order_filled(_FillEvent())
+
+        class _CanceledEvent:
+            client_order_id = order_id
+            venue_order_id = "0xvwapconflict"
+            reason = "terminal cumulative VWAP conflicts with recorded fill"
+            filled_qty = Decimal("4")
+            avg_px = Decimal("0.61")
+
+        with self.assertRaisesRegex(
+            self.bot.SettlementLedgerError,
+            "terminal_cumulative_fill_conflicts_with_recorded_accounting",
+        ):
+            strategy.on_order_canceled(_CanceledEvent())
+
+        unknown = strategy._settled_live_trades[-1]
+        self.assertEqual(
+            unknown["unknown_reason"],
+            "terminal_cumulative_fill_conflicts_with_recorded_accounting",
+        )
+
+    def test_terminal_equal_cumulative_last_price_only_blocks_unknown(self):
+        strategy = self._new_strategy()
+        order_id = "limit-equal-cumulative-last-only"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-last-only")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("4.96"), Decimal("0.62"), "buy_yes")
+
+        class _FillEvent:
+            client_order_id = order_id
+            condition_id = meta["condition_id"]
+            token_id = meta["token_id"]
+            last_px = Decimal("0.60")
+            last_qty = Decimal("4")
+
+        strategy.on_order_filled(_FillEvent())
+
+        class _CanceledEvent:
+            client_order_id = order_id
+            venue_order_id = "0xlastonly"
+            reason = "terminal cumulative last price only"
+            filled_qty = Decimal("4")
+            last_px = Decimal("0.63")
+
+        with self.assertRaisesRegex(
+            self.bot.SettlementLedgerError,
+            "terminal_cumulative_fill_equal_requires_average_price",
+        ):
+            strategy.on_order_canceled(_CanceledEvent())
+
+        unknown = strategy._settled_live_trades[-1]
+        self.assertEqual(
+            unknown["unknown_reason"],
+            "terminal_cumulative_fill_equal_requires_average_price",
+        )
+
+    def test_terminal_positive_cumulative_quantity_without_price_blocks_unknown(self):
+        strategy = self._new_strategy()
+        order_id = "limit-positive-cumulative-no-price"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-no-price")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("4.96"), Decimal("0.62"), "buy_yes")
+
+        class _FillEvent:
+            client_order_id = order_id
+            condition_id = meta["condition_id"]
+            token_id = meta["token_id"]
+            last_px = Decimal("0.60")
+            last_qty = Decimal("4")
+
+        strategy.on_order_filled(_FillEvent())
+
+        class _CanceledEvent:
+            client_order_id = order_id
+            venue_order_id = "0xnoprice"
+            reason = "terminal positive quantity without price"
+            filled_qty = Decimal("5")
+
+        with self.assertRaisesRegex(
+            self.bot.SettlementLedgerError,
+            "terminal_positive_fill_evidence_without_price",
+        ):
+            strategy.on_order_canceled(_CanceledEvent())
+
+        unknown = strategy._settled_live_trades[-1]
+        self.assertEqual(unknown["unknown_reason"], "terminal_positive_fill_evidence_without_price")
+        self.assertEqual(
+            unknown["raw_callback_payload"]["terminal_positive_fill_quantities"]["filled_qty"],
+            "5",
+        )
+
+    def test_cancel_cumulative_delta_after_pending_actual_fill_requires_repair(self):
+        strategy = self._new_strategy()
+        order_id = "limit-cumulative-delta-after-pending-actual"
+        meta = self._limit_ioc_trade_meta(order_id=order_id, token_id="token-pending-cumulative")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("4.96"), Decimal("0.62"), "buy_yes")
+        strategy._persist_submitted_order_intent_locked(order_id, meta, "ask")
+
+        strategy._handle_actual_fill(
+            order_id,
+            {
+                "status": "ok",
+                "trade_id": "trade-pending-cumulative",
+                "filled_qty": Decimal("4"),
+                "vwap": Decimal("0.60"),
+                "venue_order_id": "0xpendingcumulative",
+                "condition_id": "cond-a",
+                "token_id": "token-pending-cumulative",
+            },
+        )
+
+        class _CanceledEvent:
+            client_order_id = order_id
+            venue_order_id = "0xpendingcumulative"
+            reason = "FAK terminal cumulative fill delta after actual-fill callback"
+            filled_qty = Decimal("5")
+            avg_px = Decimal("0.604")
+
+        with self.assertRaisesRegex(
+            self.bot.SettlementLedgerError,
+            "terminal_cumulative_fill_delta_requires_recorded_open_trade",
+        ):
+            strategy.on_order_canceled(_CanceledEvent())
+
+        self.assertIn(order_id, strategy._pending_actual_fills)
+        self.assertTrue(strategy._pending_actual_fills[order_id]["requires_external_fill_repair"])
+        self.assertEqual(
+            strategy._pending_actual_fills[order_id]["external_fill_repair_reason"],
+            "terminal_cumulative_fill_delta_requires_recorded_open_trade",
+        )
+        self.assertEqual(strategy._settled_live_trades, [])
+        self.assertIsNotNone(strategy._settlement_ledger_blocked_reason)
 
     def test_terminal_event_without_zero_fill_evidence_blocks(self):
         strategy = self._new_strategy()
@@ -2904,7 +5303,14 @@ class SimulationModeSafetyTests(unittest.TestCase):
         strategy.risk_engine.add_position(order_id, Decimal("2.00"), Decimal("0.50"), "buy_yes")
         strategy._persist_submitted_order_intent_locked(order_id, meta, "ask")
 
-        self.assertTrue(strategy._record_live_order_fill(order_id, Decimal("0.50"), Decimal("4")))
+        self.assertTrue(
+            strategy._record_live_order_fill(
+                order_id,
+                Decimal("0.50"),
+                Decimal("4"),
+                fill_metadata=self._fill_metadata_for_meta(meta),
+            )
+        )
 
         recorded = strategy._open_live_trades[order_id]
         self.assertNotIn(order_id, strategy._submitted_order_intents)
@@ -2923,7 +5329,14 @@ class SimulationModeSafetyTests(unittest.TestCase):
         strategy.risk_engine.add_position(order_id, Decimal("2.00"), Decimal("0.50"), "buy_yes")
         strategy._submitted_order_intents[order_id] = "not-an-object"
 
-        self.assertTrue(strategy._record_live_order_fill(order_id, Decimal("0.50"), Decimal("4")))
+        self.assertTrue(
+            strategy._record_live_order_fill(
+                order_id,
+                Decimal("0.50"),
+                Decimal("4"),
+                fill_metadata=self._fill_metadata_for_meta(meta),
+            )
+        )
 
         recorded = strategy._open_live_trades[order_id]
         self.assertNotIn(order_id, strategy._submitted_order_intents)
@@ -4222,7 +6635,12 @@ class SimulationModeSafetyTests(unittest.TestCase):
         self.bot.LIVE_TRADE_LEDGER_PATH = bad_path
         try:
             with self.assertRaisesRegex(self.bot.SettlementLedgerError, "failed to persist live order fill"):
-                strategy._record_live_order_fill(order_id, Decimal("0.50"), Decimal("4"))
+                strategy._record_live_order_fill(
+                    order_id,
+                    Decimal("0.50"),
+                    Decimal("4"),
+                    fill_metadata=self._fill_metadata_for_meta(meta),
+                )
             unresolved = strategy._unresolved_settlement_unknowns()
         finally:
             self.bot.LIVE_TRADE_LEDGER_PATH = original_path
@@ -4236,7 +6654,12 @@ class SimulationModeSafetyTests(unittest.TestCase):
         self.assertEqual(strategy.risk_engine._positions[order_id]["entry_price"], Decimal("0.55"))
 
         with self.assertRaisesRegex(self.bot.SettlementLedgerError, "live fill received while settlement ledger is blocked"):
-            strategy._record_live_order_fill(order_id, Decimal("0.50"), Decimal("4"))
+            strategy._record_live_order_fill(
+                order_id,
+                Decimal("0.50"),
+                Decimal("4"),
+                fill_metadata=self._fill_metadata_for_meta(meta),
+            )
         self.assertIn(order_id, strategy._submitted_positions)
         self.assertNotIn(order_id, strategy._open_live_trades)
         self.assertEqual(strategy.risk_engine._positions[order_id]["size"], Decimal("5.50"))
@@ -4261,7 +6684,12 @@ class SimulationModeSafetyTests(unittest.TestCase):
         strategy.risk_engine.add_position(order_id, Decimal("5.50"), Decimal("0.55"), "buy_yes")
 
         with self.assertRaisesRegex(self.bot.SettlementLedgerError, "failed to adjust risk position"):
-            strategy._record_live_order_fill(order_id, Decimal("0.50"), Decimal("4"))
+            strategy._record_live_order_fill(
+                order_id,
+                Decimal("0.50"),
+                Decimal("4"),
+                fill_metadata=self._fill_metadata_for_meta(meta),
+            )
 
         data = json.loads(self._test_ledger_path.read_text(encoding="utf-8"))
         self.assertIn(order_id, data["open"])
@@ -4275,6 +6703,8 @@ class SimulationModeSafetyTests(unittest.TestCase):
 
         class _FillEvent:
             client_order_id = "blocked-fill"
+            condition_id = "cond-blocked"
+            token_id = "token-blocked"
             last_px = Decimal("0.50")
             last_qty = Decimal("4")
 
@@ -4293,12 +6723,18 @@ class SimulationModeSafetyTests(unittest.TestCase):
     def test_blocked_fill_does_not_promote_existing_open_cumulative_accounting(self):
         strategy = self._new_strategy()
         order_id = "blocked-open-fill"
-        strategy._open_live_trades[order_id] = self._live_trade_meta(order_id=order_id, token_id="token-blocked-open")
+        meta = self._live_trade_meta(order_id=order_id, token_id="token-blocked-open")
+        strategy._open_live_trades[order_id] = meta
         strategy.risk_engine.add_position(order_id, Decimal("2.00"), Decimal("0.50"), "buy_yes")
         strategy._settlement_ledger_blocked_reason = "unit test ledger block"
 
         with self.assertRaisesRegex(self.bot.SettlementLedgerError, "live fill received while settlement ledger is blocked"):
-            strategy._record_live_order_fill(order_id, Decimal("0.60"), Decimal("1"))
+            strategy._record_live_order_fill(
+                order_id,
+                Decimal("0.60"),
+                Decimal("1"),
+                fill_metadata=self._fill_metadata_for_meta(meta),
+            )
 
         unknown = strategy._settled_live_trades[-1]
         self.assertEqual(unknown["order_id"], order_id)
@@ -4321,7 +6757,14 @@ class SimulationModeSafetyTests(unittest.TestCase):
         strategy._submitted_positions[order_id] = meta
         strategy.risk_engine.add_position(order_id, Decimal("2.00"), Decimal("0.50"), "buy_yes")
 
-        self.assertFalse(strategy._record_live_order_fill(order_id, Decimal("0.50"), Decimal("4")))
+        self.assertFalse(
+            strategy._record_live_order_fill(
+                order_id,
+                Decimal("0.50"),
+                Decimal("4"),
+                fill_metadata=self._fill_metadata_for_meta(meta),
+            )
+        )
 
         self.assertIsNotNone(strategy._settlement_ledger_blocked_reason)
         self.assertNotIn(order_id, strategy._open_live_trades)

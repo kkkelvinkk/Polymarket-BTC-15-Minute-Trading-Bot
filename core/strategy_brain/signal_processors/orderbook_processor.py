@@ -143,7 +143,7 @@ class OrderBookImbalanceProcessor(BaseSignalProcessor):
         historical_prices: list,
         metadata: Dict[str, Any] = None,
     ) -> Optional[TradingSignal]:
-        """Fetch order book synchronously and generate signal."""
+        """Generate a signal from the caller-provided decision-cycle book snapshot."""
         if not self.is_enabled or not metadata:
             return None
 
@@ -151,8 +151,13 @@ class OrderBookImbalanceProcessor(BaseSignalProcessor):
         if not token_id:
             return None
 
+        if "yes_order_book" not in metadata:
+            raise RuntimeError(
+                "OrderBookImbalanceProcessor requires caller-provided yes_order_book snapshot"
+            )
+        book = metadata["yes_order_book"]
+
         try:
-            book = self.fetch_order_book(token_id)
             if not book:
                 return None
 
