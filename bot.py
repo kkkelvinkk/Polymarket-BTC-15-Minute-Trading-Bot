@@ -21,6 +21,10 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
 
+from sops_plaintext_env_guard import is_live_invocation, refuse_plaintext_env_in_live_mode
+refuse_plaintext_env_in_live_mode(repo_root=project_root)
+
+
 try:
     from patch_gamma_markets import apply_gamma_markets_patch, verify_patch
     patch_applied = apply_gamma_markets_patch()
@@ -81,13 +85,19 @@ from execution.risk_engine import get_risk_engine
 from monitoring.performance_tracker import get_performance_tracker
 from monitoring.grafana_exporter import get_grafana_exporter
 from feedback.learning_engine import get_learning_engine
-load_dotenv()
+if not is_live_invocation():
+    load_dotenv(dotenv_path=project_root / ".env")
 from patch_market_orders import (
     apply_market_order_patch,
     register_actual_fill_handler,
     register_auto_redeem_handler,
     unregister_actual_fill_handler,
     unregister_auto_redeem_handler,
+)
+from account_state_collateral import (
+    ACCOUNT_BALANCE_STALE_AFTER_ORDER,
+    ACCOUNT_BALANCE_STALE_AFTER_REDEEM,
+    AccountBalanceTracker,
 )
 from decision_log import DecisionRecord
 from depth_estimator import (
@@ -360,6 +370,7 @@ NAUTILUS_SHUTDOWN_TIMEOUT_SECONDS = 2.0
 SIZING_MODE_FIXED = "fixed"
 SIZING_MODE_PERCENT = "percent"
 _ALLOWED_SIZING_MODES = frozenset({SIZING_MODE_FIXED, SIZING_MODE_PERCENT})
+SHADOW_POLICY_WINDOW_LABELS = frozenset({"06_09", "09_11", "11_13", "14_15_late"})
 
 
 def get_sizing_mode_for_live() -> str:
@@ -378,6 +389,48 @@ def get_sizing_mode_for_live() -> str:
             f"SIZING_MODE must be 'fixed' or 'percent', got {raw!r}"
         )
     return raw
+
+
+def get_max_account_state_age_seconds_for_live() -> Decimal:
+    """Required live balance-freshness threshold."""
+    raw = os.getenv("MAX_ACCOUNT_STATE_AGE_SECONDS")
+    if raw is None or raw == "":
+        raise RuntimeError("MAX_ACCOUNT_STATE_AGE_SECONDS must be set for live trading")
+    try:
+        value = Decimal(raw)
+    except InvalidOperation as exc:
+        raise RuntimeError(
+            f"MAX_ACCOUNT_STATE_AGE_SECONDS must be a decimal, got {raw!r}"
+        ) from exc
+    if not value.is_finite() or value <= Decimal("0"):
+        raise RuntimeError(
+            f"MAX_ACCOUNT_STATE_AGE_SECONDS must be finite and > 0, got {raw!r}"
+        )
+    return value
+
+
+def get_balance_safety_buffer_usd_for_live() -> Decimal:
+    """Required extra free-collateral buffer before live order submission."""
+    raw = os.getenv("BALANCE_SAFETY_BUFFER_USD")
+    if raw is None or raw == "":
+        raise RuntimeError("BALANCE_SAFETY_BUFFER_USD must be set for live trading")
+    try:
+        value = Decimal(raw)
+    except InvalidOperation as exc:
+        raise RuntimeError(
+            f"BALANCE_SAFETY_BUFFER_USD must be a decimal, got {raw!r}"
+        ) from exc
+    if not value.is_finite() or value < Decimal("0"):
+        raise RuntimeError(
+            f"BALANCE_SAFETY_BUFFER_USD must be finite and >= 0, got {raw!r}"
+        )
+    cent_value = value.quantize(Decimal("0.01"))
+    if value != cent_value:
+        raise RuntimeError(
+            "BALANCE_SAFETY_BUFFER_USD must be specified in whole cents; "
+            f"got {raw!r}"
+        )
+    return cent_value
 
 
 # --- Order-type validation ------------------------------------------------
@@ -471,6 +524,31 @@ def validate_live_order_config() -> Dict[str, Any]:
     }
 
 
+def validate_shadow_policy_observation_config() -> Dict[str, Any]:
+    """Validate decision-observation inputs without live execution gates."""
+    order_type = get_order_type_for_live()
+    quote_stability_required = get_quote_stability_required_for_live()
+    fill_policy = get_limit_ioc_fill_policy_for_live(order_type)
+    limit_required_edge = None
+    ev_fee_buffer, ev_spread_buffer = get_validated_ev_buffers()
+    if order_type == ORDER_TYPE_LIMIT_IOC:
+        limit_required_edge = get_validated_limit_required_edge()
+        if limit_required_edge < ev_fee_buffer + ev_spread_buffer:
+            raise RuntimeError(
+                "LIMIT_REQUIRED_EDGE must be >= EV_FEE_BUFFER + EV_SPREAD_BUFFER "
+                f"when ORDER_TYPE=limit_ioc ({limit_required_edge} < "
+                f"{ev_fee_buffer + ev_spread_buffer})"
+            )
+    return {
+        "order_type": order_type,
+        "quote_stability_required": quote_stability_required,
+        "limit_ioc_fill_policy": fill_policy,
+        "limit_required_edge": limit_required_edge,
+        "ev_fee_buffer": ev_fee_buffer,
+        "ev_spread_buffer": ev_spread_buffer,
+    }
+
+
 def trade_window_label_for_seconds_into_sub_interval(seconds: float) -> str:
     """Classify elapsed seconds into one of the candidate trade windows:
 
@@ -511,9 +589,10 @@ def trend_price_band_for(yes_price: float) -> str:
         return "yes_extreme_ge_0.70"
     if yes_price >= 0.60:
         return "yes_strong_0.60_0.70"
+    if yes_price >= 0.52:
+        return "yes_moderate_0.52_0.60"
     if yes_price > 0.48:
-        # 0.48 < yes < 0.60 — moderate YES side
-        return "yes_moderate_0.48_0.60"
+        return "neutral_0.48_0.52"
     if yes_price > 0.40:
         # 0.40 < yes <= 0.48 — moderate NO side
         return "no_moderate_0.40_0.48"
@@ -691,6 +770,34 @@ def get_pct_of_free_collateral_per_trade() -> Decimal:
     return value
 
 
+def validate_live_sizing_config() -> Dict[str, Any]:
+    """Validate the live sizing and balance-freshness contract."""
+    sizing_mode = get_sizing_mode_for_live()
+    pct_of_free_collateral = None
+    fixed_market_buy_usd = None
+    if sizing_mode == SIZING_MODE_FIXED:
+        fixed_market_buy_usd = enforce_live_market_buy_usd_gate()
+    elif sizing_mode == SIZING_MODE_PERCENT:
+        pct_of_free_collateral = get_pct_of_free_collateral_per_trade()
+    else:
+        raise RuntimeError(f"unexpected SIZING_MODE after validation: {sizing_mode!r}")
+    return {
+        "sizing_mode": sizing_mode,
+        "fixed_market_buy_usd": fixed_market_buy_usd,
+        "pct_of_free_collateral_per_trade": pct_of_free_collateral,
+        "max_account_state_age_seconds": get_max_account_state_age_seconds_for_live(),
+        "balance_safety_buffer_usd": get_balance_safety_buffer_usd_for_live(),
+    }
+
+
+def get_nautilus_log_dir() -> str:
+    """Required Nautilus log directory for explicit deploy wiring."""
+    raw = os.getenv("NAUTILUS_LOG_DIR")
+    if raw is None or raw == "":
+        raise RuntimeError("NAUTILUS_LOG_DIR must be set")
+    return raw
+
+
 def _live_market_buy_usd_blocked_message(raw_value) -> str:
     formatted_current = raw_value if raw_value is not None else "<unset>"
     return (
@@ -824,10 +931,16 @@ class IntegratedBTCStrategy(Strategy):
         self._settlement_lock = threading.RLock()
         self._settlement_ledger_blocked_reason: Optional[str] = None
         self._ledger_lock_file = None
+        self._account_balance_tracker = AccountBalanceTracker()
+        self._shadow_policy_observed_keys = set()
+        self._shadow_decision_in_progress = False
         self._auto_redeem_registered = False
         self._auto_redeem_handler = self._handle_auto_redeem_event
         self._actual_fill_registered = False
         self._actual_fill_handler = self._handle_actual_fill
+        live_sizing_config = None
+        if self.live_execution_enabled:
+            live_sizing_config = validate_live_sizing_config()
         self._acquire_live_trade_ledger_lock()
         try:
             self._load_live_trade_ledger()
@@ -920,7 +1033,23 @@ class IntegratedBTCStrategy(Strategy):
         logger.info("  Risk engine ready")
         logger.info("  Performance tracking ready")
         logger.info("  Learning engine ready")
-        logger.info(f"  ${float(get_market_buy_usd()):.2f} per trade maximum")
+        if live_sizing_config is None:
+            logger.info(f"  ${float(get_market_buy_usd()):.2f} per trade maximum")
+        elif live_sizing_config["sizing_mode"] == SIZING_MODE_FIXED:
+            logger.info(
+                f"  ${float(live_sizing_config['fixed_market_buy_usd']):.2f} "
+                "per trade maximum"
+            )
+        elif live_sizing_config["sizing_mode"] == SIZING_MODE_PERCENT:
+            pct = live_sizing_config["pct_of_free_collateral_per_trade"]
+            logger.info(
+                f"  {pct * Decimal('100')}% of fresh pUSD free collateral "
+                "per trade target"
+            )
+        else:
+            raise RuntimeError(
+                f"unexpected SIZING_MODE after validation: {live_sizing_config['sizing_mode']!r}"
+            )
         logger.info(
             "  Signal confirmation: "
             f"{'enabled' if get_env_bool('REQUIRE_SIGNAL_CONFIRMATION', True) else 'disabled'} "
@@ -960,6 +1089,96 @@ class IntegratedBTCStrategy(Strategy):
         self._market_stable = False
         self._stable_tick_count = 0
         self._quote_stability_missing_logged = False
+
+    @property
+    def _latest_free_collateral(self) -> Optional[Decimal]:
+        return self._account_balance_tracker.latest_free_collateral
+
+    def _record_account_state(self, account_state) -> None:
+        self._account_balance_tracker.record(account_state)
+
+    def _mark_balance_stale(self, reason: str, order_id: Optional[str] = None) -> None:
+        self._account_balance_tracker.mark_stale(reason, order_id=order_id)
+
+    def _clear_balance_stale_after_verified_no_fill(self, order_id: str) -> None:
+        self._account_balance_tracker.clear_after_verified_no_fill(order_id)
+
+    @property
+    def _account_state_sequence(self) -> int:
+        return self._account_balance_tracker.account_state_sequence
+
+    @property
+    def _balance_stale_reason(self) -> Optional[str]:
+        return self._account_balance_tracker.balance_stale_reason
+
+    def _live_balance_snapshot_for_decision(
+        self,
+        sizing_config: Dict[str, Any],
+        rec: DecisionRecord,
+    ) -> Optional[Dict[str, Any]]:
+        return self._account_balance_tracker.snapshot_for_decision(sizing_config, rec)
+
+    def _resolve_position_size_usd(
+        self,
+        *,
+        is_simulation: bool,
+        rec: DecisionRecord,
+    ) -> Optional[Decimal]:
+        if is_simulation:
+            position_size = get_market_buy_usd()
+            rec.update(sizing_mode=SIZING_MODE_FIXED, resolved_trade_usd=position_size)
+            return position_size
+
+        sizing_config = validate_live_sizing_config()
+        sizing_mode = sizing_config["sizing_mode"]
+        rec.update(sizing_mode=sizing_mode)
+        snapshot = self._live_balance_snapshot_for_decision(sizing_config, rec)
+        if snapshot is None:
+            return None
+        free_collateral = snapshot["free_collateral"]
+        if sizing_mode == SIZING_MODE_FIXED:
+            position_size = sizing_config["fixed_market_buy_usd"]
+        elif sizing_mode == SIZING_MODE_PERCENT:
+            pct = sizing_config["pct_of_free_collateral_per_trade"]
+            position_size = (free_collateral * pct).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_DOWN,
+            )
+        else:
+            raise RuntimeError(f"unexpected SIZING_MODE after validation: {sizing_mode!r}")
+
+        if position_size <= LIVE_MIN_MARKET_BUY_USD:
+            rec.reject(
+                "position_size_below_live_minimum",
+                f"resolved_trade_usd={position_size} must be greater than {LIVE_MIN_MARKET_BUY_USD}",
+            )
+            return None
+        max_position_size = self.risk_engine.limits.max_position_size
+        if position_size > max_position_size:
+            rec.reject(
+                "size_exceeds_max_position_size",
+                f"resolved_trade_usd={position_size} exceeds MAX_POSITION_SIZE={max_position_size}",
+            )
+            return None
+        required_free_collateral = position_size + sizing_config["balance_safety_buffer_usd"]
+        if free_collateral < required_free_collateral:
+            rec.reject(
+                "balance_guard",
+                f"free_collateral={free_collateral} < required={required_free_collateral}",
+            )
+            return None
+        rec.update(resolved_trade_usd=position_size)
+        return position_size
+
+    def _live_balance_block_reason_for_order(
+        self,
+        sizing_config: Dict[str, Any],
+        position_size: Decimal,
+    ) -> Optional[str]:
+        return self._account_balance_tracker.block_reason_for_order(
+            sizing_config,
+            position_size,
+        )
 
     # ------------------------------------------------------------------
     # Redis
@@ -3519,6 +3738,7 @@ class IntegratedBTCStrategy(Strategy):
                 if store_pending:
                     self._store_pending_auto_redeem_event(event_key, payload, "invalid auto_redeem amount")
                 return False
+            self._mark_balance_stale(ACCOUNT_BALANCE_STALE_AFTER_REDEEM)
 
             if self._require_auto_redeem_token_hint() and not self._payload_has_token_hint(payload):
                 reason = "missing token/outcome hint"
@@ -3765,6 +3985,12 @@ class IntegratedBTCStrategy(Strategy):
     # ------------------------------------------------------------------
     # Strategy lifecycle
     # ------------------------------------------------------------------
+
+    def on_event(self, event):
+        if event.__class__.__name__ == "AccountState":
+            self._record_account_state(event)
+            return
+        super().on_event(event)
 
     def on_start(self):
         """Called when strategy starts - LOAD ALL MARKETS AND SUBSCRIBE IMMEDIATELY"""
@@ -4250,6 +4476,33 @@ class IntegratedBTCStrategy(Strategy):
             seconds_into_sub_interval = elapsed_secs % MARKET_INTERVAL_SECONDS
             TRADE_WINDOW_START = 780   # 13 minutes in
             TRADE_WINDOW_END   = 840   # 14 minutes in (60s window)
+            trade_window_label = trade_window_label_for_seconds_into_sub_interval(
+                seconds_into_sub_interval
+            )
+            shadow_key = (market_start_ts, sub_interval, trade_window_label)
+            if (
+                trade_window_label in SHADOW_POLICY_WINDOW_LABELS
+                and shadow_key not in self._shadow_policy_observed_keys
+                and not self._decision_in_progress
+                and not self._shadow_decision_in_progress
+            ):
+                self._shadow_policy_observed_keys.add(shadow_key)
+                self._shadow_decision_in_progress = True
+                logger.info(
+                    f"SHADOW POLICY OBSERVATION: {trade_window_label} "
+                    f"for {current_market['slug']} at {seconds_into_sub_interval:.1f}s"
+                )
+
+                def _run_shadow_policy_decision():
+                    try:
+                        self._make_shadow_policy_decision_sync(
+                            float(mid_price),
+                            trade_key=None,
+                        )
+                    finally:
+                        self._shadow_decision_in_progress = False
+
+                self.run_in_executor(_run_shadow_policy_decision)
 
             if (
                 TRADE_WINDOW_START <= seconds_into_sub_interval < TRADE_WINDOW_END
@@ -4294,21 +4547,42 @@ class IntegratedBTCStrategy(Strategy):
     # Trading decision (unchanged)
     # ------------------------------------------------------------------
 
-    def _make_trading_decision_sync(self, current_price, trade_key=None):
+    def _make_trading_decision_sync(
+        self,
+        current_price,
+        trade_key=None,
+        strategy_observation_mode: Optional[str] = None,
+    ):
         """Synchronous wrapper for trading decision (called from executor)."""
         # Convert float back to Decimal for processing
         from decimal import Decimal
         price_decimal = Decimal(str(current_price))
+        owns_decision_flag = strategy_observation_mode != "shadow_policy"
         
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(self._make_trading_decision(price_decimal, trade_key=trade_key))
+            loop.run_until_complete(
+                self._make_trading_decision(
+                    price_decimal,
+                    trade_key=trade_key,
+                    strategy_observation_mode=strategy_observation_mode,
+                )
+            )
         except Exception as e:
             logger.error(f"Trading decision aborted: {e}\n{traceback.format_exc()}")
         finally:
-            self._decision_in_progress = False
+            if owns_decision_flag:
+                self._decision_in_progress = False
             loop.close()
+
+    def _make_shadow_policy_decision_sync(self, current_price, trade_key=None):
+        """Synchronous wrapper for shadow policy observations."""
+        self._make_trading_decision_sync(
+            current_price,
+            trade_key=trade_key,
+            strategy_observation_mode="shadow_policy",
+        )
             
     async def _fetch_market_context(self, current_price: Decimal) -> dict:
         """
@@ -4407,7 +4681,12 @@ class IntegratedBTCStrategy(Strategy):
         )
         return metadata
 
-    async def _make_trading_decision(self, current_price: Decimal, trade_key=None) -> bool:
+    async def _make_trading_decision(
+        self,
+        current_price: Decimal,
+        trade_key=None,
+        strategy_observation_mode: Optional[str] = None,
+    ) -> bool:
         """
         Make a trading decision using the integrated strategy workflow.
 
@@ -4421,15 +4700,24 @@ class IntegratedBTCStrategy(Strategy):
         delegating to the simulation/live executor.
         """
         # --- Mode check ---
-        is_simulation = await self.check_simulation_mode()
-        observation_mode = "simulation" if is_simulation else "live_gate"
+        if strategy_observation_mode == "shadow_policy":
+            is_simulation = False
+            observation_mode = "shadow_policy"
+        else:
+            is_simulation = await self.check_simulation_mode()
+            observation_mode = (
+                strategy_observation_mode
+                if strategy_observation_mode is not None
+                else "simulation" if is_simulation else "live_gate"
+            )
+        observation_only = observation_mode == "shadow_policy"
 
         with DecisionRecord(
             current_price=current_price,
             strategy_observation_mode=observation_mode,
         ) as rec:
             return await self._make_trading_decision_body(
-                current_price, trade_key, is_simulation, rec
+                current_price, trade_key, is_simulation, rec, observation_only=observation_only
             )
 
     async def _make_trading_decision_body(
@@ -4438,13 +4726,18 @@ class IntegratedBTCStrategy(Strategy):
         trade_key,
         is_simulation: bool,
         rec: DecisionRecord,
+        observation_only: bool = False,
     ) -> bool:
         logger.info(f"Mode: {'SIMULATION' if is_simulation else 'LIVE TRADING'}")
-        order_config = validate_live_order_config()
+        order_config = (
+            validate_shadow_policy_observation_config()
+            if observation_only
+            else validate_live_order_config()
+        )
         order_type = order_config["order_type"]
-        quote_stability_required = order_config["quote_stability_required"]
         limit_ioc_fill_policy = order_config["limit_ioc_fill_policy"]
-        if not is_simulation:
+        quote_stability_required = order_config["quote_stability_required"]
+        if not is_simulation and not observation_only:
             unresolved = self._unresolved_settlement_unknowns()
             if unresolved:
                 logger.error(
@@ -4504,12 +4797,7 @@ class IntegratedBTCStrategy(Strategy):
                     seconds_into
                 ),
             )
-        try:
-            rec.update(trend_price_band=trend_price_band_for(float(current_price)))
-        except (TypeError, ValueError):
-            # current_price wasn't numeric — leave the band null; the
-            # downstream trend filter will already short-circuit.
-            pass
+        rec.update(trend_price_band=trend_price_band_for(float(current_price)))
 
         # --- Run all three signal processors ---
         signals = self._process_signals(current_price, metadata)
@@ -4553,8 +4841,13 @@ class IntegratedBTCStrategy(Strategy):
             fused_direction=str(fused.direction.value),
         )
 
-        # --- Position size is a fixed USD amount ---
-        POSITION_SIZE_USD = get_market_buy_usd()
+        # --- Resolve position size before depth/risk/execution use it ---
+        POSITION_SIZE_USD = self._resolve_position_size_usd(
+            is_simulation=is_simulation,
+            rec=rec,
+        )
+        if POSITION_SIZE_USD is None:
+            return False
 
         # =========================================================================
         # TREND FILTER — executable price sanity check at the late trade window
@@ -4761,6 +5054,14 @@ class IntegratedBTCStrategy(Strategy):
             )
             return False
 
+        if observation_only:
+            rec.decided(direction=direction)
+            logger.info(
+                "[SHADOW_POLICY] Decision observation reached executable-positive path; "
+                "no order submission, risk reservation, paper trade, or live ledger write performed"
+            )
+            return True
+
         # Risk engine tracks submitted orders plus filled markets until settlement.
         is_valid, error = self.risk_engine.validate_new_position(
             size=POSITION_SIZE_USD,
@@ -4772,7 +5073,10 @@ class IntegratedBTCStrategy(Strategy):
             rec.reject("risk_engine", str(error))
             return False
 
-        logger.info(f"Position size: ${POSITION_SIZE_USD:.2f} (fixed) | Direction: {direction.upper()}")
+        logger.info(
+            f"Position size: ${POSITION_SIZE_USD:.2f} "
+            f"({rec.fields['sizing_mode']}) | Direction: {direction.upper()}"
+        )
 
         # --- Liquidity guard: don't place if market has no real depth ---
         # The current bid/ask come from the last processed quote tick.
@@ -5098,28 +5402,67 @@ class IntegratedBTCStrategy(Strategy):
             logger.error("No instrument available")
             return False
 
-        # Runtime gate: enforce MARKET_BUY_USD > 5.50 before any live order
-        # submission. This is defense-in-depth for live-enabled processes whose
-        # environment changes after startup or for nonstandard submit call paths.
-        # The live path rejects the trade without using exception conversion as
-        # control flow.
-        gate_ok, gate_err, gate_amount = validate_live_market_buy_usd()
-        if not gate_ok:
-            logger.error(f"LIVE ORDER BLOCKED: {gate_err}")
-            return False
-
-        # Cycle-2 reviewer #2 finding: caller passes `position_size` derived
-        # from get_market_buy_usd() (ROUND_HALF_EVEN), while the gate quantizes
-        # with ROUND_DOWN. For values like 5.515 the two could diverge by one
-        # cent. Reject the order rather than silently sizing differently from
-        # what the gate validated.
-        if Decimal(str(position_size)).quantize(Decimal("0.01"), rounding=ROUND_DOWN) != gate_amount:
+        runtime_sizing_mode = get_sizing_mode_for_live()
+        pct_of_free_collateral = None
+        fixed_market_buy_usd = None
+        if runtime_sizing_mode == SIZING_MODE_FIXED:
+            gate_ok, gate_err, fixed_market_buy_usd = validate_live_market_buy_usd()
+            if not gate_ok:
+                logger.error(f"LIVE ORDER BLOCKED: {gate_err}")
+                return False
+        elif runtime_sizing_mode == SIZING_MODE_PERCENT:
+            pct_of_free_collateral = get_pct_of_free_collateral_per_trade()
+        else:
+            raise RuntimeError(f"unexpected SIZING_MODE after validation: {runtime_sizing_mode!r}")
+        runtime_sizing_config = {
+            "sizing_mode": runtime_sizing_mode,
+            "fixed_market_buy_usd": fixed_market_buy_usd,
+            "pct_of_free_collateral_per_trade": pct_of_free_collateral,
+            "max_account_state_age_seconds": get_max_account_state_age_seconds_for_live(),
+            "balance_safety_buffer_usd": get_balance_safety_buffer_usd_for_live(),
+        }
+        submitted_position_size = Decimal(str(position_size)).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_DOWN,
+        )
+        if submitted_position_size <= LIVE_MIN_MARKET_BUY_USD:
             logger.error(
-                f"LIVE ORDER BLOCKED: caller-supplied position_size={position_size} "
-                f"does not match gate-validated amount {gate_amount}. Restart with a "
-                f"consistent MARKET_BUY_USD."
+                f"LIVE ORDER BLOCKED: position_size={position_size} must be greater "
+                f"than {LIVE_MIN_MARKET_BUY_USD}"
             )
             return False
+        if runtime_sizing_mode == SIZING_MODE_FIXED:
+            gate_amount = runtime_sizing_config["fixed_market_buy_usd"]
+            if submitted_position_size != gate_amount:
+                logger.error(
+                    f"LIVE ORDER BLOCKED: caller-supplied position_size={position_size} "
+                    f"does not match fixed sizing amount {gate_amount}. Restart with a "
+                    f"consistent MARKET_BUY_USD."
+                )
+                return False
+        balance_block_reason = self._live_balance_block_reason_for_order(
+            runtime_sizing_config,
+            submitted_position_size,
+        )
+        if balance_block_reason is not None:
+            logger.error(f"LIVE ORDER BLOCKED: {balance_block_reason}")
+            return False
+        if runtime_sizing_mode == SIZING_MODE_PERCENT:
+            runtime_free_collateral = self._account_balance_tracker.latest_free_collateral
+            if runtime_free_collateral is None:
+                raise RuntimeError("fresh AccountState unexpectedly missing after balance guard")
+            runtime_pct = runtime_sizing_config["pct_of_free_collateral_per_trade"]
+            runtime_percent_size = (runtime_free_collateral * runtime_pct).quantize(
+                Decimal("0.01"),
+                rounding=ROUND_DOWN,
+            )
+            if submitted_position_size != runtime_percent_size:
+                logger.error(
+                    f"LIVE ORDER BLOCKED: caller-supplied position_size={position_size} "
+                    f"does not match percent sizing amount {runtime_percent_size}. "
+                    "Restart with a consistent PCT_OF_FREE_COLLATERAL_PER_TRADE and AccountState stream."
+                )
+                return False
 
         runtime_order_config = validate_live_order_config()
         runtime_order_type = runtime_order_config["order_type"]
@@ -5163,6 +5506,9 @@ class IntegratedBTCStrategy(Strategy):
                 )
                 return False
 
+        submitted_order_id = None
+        intent_persisted = False
+        submit_attempted = False
         try:
             # instrument is fetched below after determining YES vs NO token
 
@@ -5221,6 +5567,7 @@ class IntegratedBTCStrategy(Strategy):
 
             timestamp_ms = int(time.time() * 1000)
             unique_id = f"BTC-15MIN-${max_usd_amount:.0f}-{timestamp_ms}"
+            submitted_order_id = unique_id
             submitted_at = datetime.now(timezone.utc)
             market_meta = self._require_current_market_metadata("live order placement")
             market_slug = market_meta.get("slug")
@@ -5384,6 +5731,7 @@ class IntegratedBTCStrategy(Strategy):
                     meta=submitted_meta,
                     price_source=price_source,
                 )
+                intent_persisted = True
                 self._submitted_positions[unique_id] = submitted_meta
                 self.risk_engine.add_position(
                     position_id=unique_id,
@@ -5392,7 +5740,9 @@ class IntegratedBTCStrategy(Strategy):
                     direction="buy_yes" if direction == "long" else "buy_no",
                 )
 
+            submit_attempted = True
             self.submit_order(order)
+            self._mark_balance_stale(ACCOUNT_BALANCE_STALE_AFTER_ORDER, unique_id)
 
             logger.info(f"REAL ORDER SUBMITTED!")
             logger.info(f"  Order ID: {unique_id}")
@@ -5411,12 +5761,21 @@ class IntegratedBTCStrategy(Strategy):
             logger.error(f"Error placing real order: {e}")
             import traceback
             traceback.print_exc()
-            if "unique_id" in locals():
-                self._release_submitted_position(unique_id)
+            if submit_attempted:
+                self._mark_balance_stale(
+                    ACCOUNT_BALANCE_STALE_AFTER_ORDER,
+                    submitted_order_id,
+                )
+                self._block_live_settlement_ledger(
+                    f"submit_order raised for {submitted_order_id}; submitted intent remains unresolved: {e}"
+                )
+            elif intent_persisted:
+                self._block_live_settlement_ledger(
+                    "live order placement raised after persisting submit intent "
+                    f"for {submitted_order_id} before submit_order completed: {e}"
+                )
             self._track_order_event("rejected")
-            if order_type == ORDER_TYPE_LIMIT_IOC:
-                raise
-            return False
+            raise
 
     # ------------------------------------------------------------------
     # Signal processing
@@ -6710,6 +7069,8 @@ class IntegratedBTCStrategy(Strategy):
             self._release_risk_position_without_pnl(order_id, "submitted-order risk release")
             with self._settlement_lock:
                 self._submitted_positions.pop(order_id, None)
+        if terminal_intent_status is not None and has_submitted_intent:
+            self._clear_balance_stale_after_verified_no_fill(order_id)
         return meta
 
     def _record_invalid_live_fill_unknown(
@@ -7398,6 +7759,7 @@ class IntegratedBTCStrategy(Strategy):
             )
             if first_recorded_fill and self._pending_auto_redeem_events:
                 self._retry_pending_auto_redeems("first fill recorded")
+            self._mark_balance_stale(ACCOUNT_BALANCE_STALE_AFTER_ORDER, order_id)
             return True
 
     def on_order_filled(self, event):
@@ -7583,6 +7945,8 @@ def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, tes
     print("=" * 80)
 
     order_config = validate_live_order_config()
+    sizing_config = validate_live_sizing_config() if not simulation else None
+    nautilus_log_dir = get_nautilus_log_dir()
 
     if not quote_warning_patch_applied:
         raise RuntimeError("Polymarket quote-warning filter patch is required")
@@ -7615,12 +7979,17 @@ def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, tes
     print(f"  Initial Mode: {'SIMULATION' if simulation else 'LIVE TRADING'}")
     print(f"  Redis Control: {'Enabled' if redis_client else 'Disabled'}")
     print(f"  Grafana: {'Enabled' if enable_grafana else 'Disabled'}")
-    # Print the validated MARKET_BUY_USD. In live mode the startup gate has
-    # already raised before reaching here if the env value is missing/invalid,
-    # so get_market_buy_usd() returns a real value. In simulation the existing
-    # legacy default applies (tracked in the AGENTS.md/CLAUDE.md no-fallback
-    # audit as a pre-existing item.
-    print(f"  Max Trade Size: ${get_market_buy_usd()}")
+    if sizing_config is None:
+        print(f"  Sizing Mode: simulation fixed (${get_market_buy_usd()})")
+    elif sizing_config["sizing_mode"] == SIZING_MODE_FIXED:
+        print(f"  Sizing Mode: fixed (${sizing_config['fixed_market_buy_usd']})")
+    else:
+        print(
+            "  Sizing Mode: percent "
+            f"({sizing_config['pct_of_free_collateral_per_trade']} of free collateral)"
+        )
+    print(f"  Balance Safety Buffer: ${sizing_config['balance_safety_buffer_usd'] if sizing_config else 'N/A'}")
+    print(f"  Nautilus Log Dir: {nautilus_log_dir}")
     print(f"  Order Type: {order_config['order_type']}")
     print(
         "  Quote stability gate: "
@@ -7704,7 +8073,7 @@ def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, tes
         trader_id="BTC-15MIN-INTEGRATED-001",
         logging=LoggingConfig(
             log_level="INFO",
-            log_directory="./logs/nautilus",
+            log_directory=nautilus_log_dir,
         ),
         data_engine=LiveDataEngineConfig(qsize=6000),
         exec_engine=LiveExecEngineConfig(
@@ -7817,8 +8186,8 @@ def main():
     simulation = not args.live
 
     if not simulation:
-        # Live gate (1): MARKET_BUY_USD > 5.50 strict before any node startup
-        enforce_live_market_buy_usd_gate()
+        # Live gate (1): explicit sizing and balance-freshness configuration
+        validate_live_sizing_config()
         validate_live_order_config()
 
         # Live gate (2): interactive LIVE confirmation unless --confirm-live

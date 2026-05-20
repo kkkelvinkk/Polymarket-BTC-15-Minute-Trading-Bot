@@ -107,10 +107,14 @@ pip install -r requirements.txt
 ```
 ## 4. Configure Environment Variables
 
-Create or edit `.env` with your credentials:
+Repo-root plaintext `.env` is for local simulation/test-mode runs only. Live
+deployments must use SOPS through `/opt/polybot/secrets/.env.sops.yaml`; follow
+[deploy/README.md](deploy/README.md) for live first-run setup.
+
+For local simulation, create or edit `.env` with non-production credentials:
 
 ```env
-# Polymarket API Credentials
+# Polymarket API Credentials (local simulation/test-mode only)
 POLYMARKET_PK=your_private_key_here
 POLYMARKET_FUNDER=your_deposit_or_wallet_address_here
 POLYMARKET_SIGNATURE_TYPE=3
@@ -122,6 +126,7 @@ POLYMARKET_PASSPHRASE=wallet_derived_passphrase_here
 REDIS_HOST=localhost
 REDIS_PORT=6379
 REDIS_DB=2
+NAUTILUS_LOG_DIR=./logs/nautilus
 
 # Trading Parameters (SMOKE-TEST CONFIG shown — change to production after smoke trade settles)
 # MARKET_BUY_USD must be STRICTLY > 5.50 for live mode (smoke-test minimum: 5.51).
@@ -143,6 +148,14 @@ LIVE_SETTLEMENT_GRACE_SECONDS=3600
 REQUIRE_AUTO_REDEEM_TOKEN_HINT=true
 LIVE_TRADE_LEDGER_PATH=live_trades.json
 POLYGON_RPC_URL=https://your-polygon-rpc.example
+
+# Live sizing. fixed uses MARKET_BUY_USD. percent uses
+# PCT_OF_FREE_COLLATERAL_PER_TRADE and rejects, rather than clamps, if the
+# computed size exceeds MAX_POSITION_SIZE.
+SIZING_MODE=fixed
+#PCT_OF_FREE_COLLATERAL_PER_TRADE=0.05
+MAX_ACCOUNT_STATE_AGE_SECONDS=30
+BALANCE_SAFETY_BUFFER_USD=0.00
 
 # Live order type. Routine live resume should use limit_ioc.
 ORDER_TYPE=limit_ioc
@@ -169,22 +182,18 @@ The following were previously listed but are not read by the bot. Setting them i
 
 `--live` enforces three startup gates before any Nautilus node is built:
 
-1. **Strict minimum trade size.** `MARKET_BUY_USD > 5.50` is required (the
-   comparison is strict — `5.50` is blocked, `5.51` is the smoke-test minimum).
-   The value is quantized down to two decimal places BEFORE comparing, so
-   `5.5000001` (which would otherwise round-trip to `5.50` in arithmetic) is
-   also blocked. Missing, malformed, non-finite, zero, negative, or `<= 5.50`
-   values abort startup before the Nautilus node starts.
+1. **Explicit sizing and fresh free collateral.** `SIZING_MODE` is required in
+   live mode. `fixed` uses `MARKET_BUY_USD` and keeps the strict
+   `MARKET_BUY_USD > 5.50` startup/runtime gate. `percent` requires
+   `PCT_OF_FREE_COLLATERAL_PER_TRADE` in `(0, 1)` and computes the per-trade
+   budget from the latest Polymarket `AccountState` pUSD free collateral.
 
-   The same check runs again before any live order is submitted. Runtime
-   validation protects live-enabled processes if the environment changes after
-   startup or a nonstandard call path reaches order submission; a process
-   launched without `--live` is simulation-only and cannot later become live
-   through Redis. At the runtime call site the gate **rejects the individual
-   trade (fail-closed)** rather than aborting the process, so the trading loop
-   continues evaluating decisions but no live order is submitted. If you see
-   repeated "LIVE ORDER BLOCKED: MARKET_BUY_USD must be greater than 5.50"
-   log lines, fix `MARKET_BUY_USD` and restart.
+   Both modes require `MAX_ACCOUNT_STATE_AGE_SECONDS` and
+   `BALANCE_SAFETY_BUFFER_USD`. A live decision is rejected if no AccountState
+   has arrived, if the snapshot is stale, if free collateral is below
+   `resolved_trade_usd + BALANCE_SAFETY_BUFFER_USD`, or if the resolved size
+   exceeds `MAX_POSITION_SIZE`. Percent sizing rejects oversized trades rather
+   than silently clamping them.
 
 2. **Explicit order configuration.** Order-capable runs require `ORDER_TYPE`
    and `QUOTE_STABILITY_REQUIRED`; live mode validates them before building the
@@ -331,6 +340,7 @@ For quick observation, use simulation/test mode, not `--live`. Example `.env`
 settings:
 
 ```env
+NAUTILUS_LOG_DIR=./logs/nautilus
 ORDER_TYPE=limit_ioc
 QUOTE_STABILITY_REQUIRED=1
 LIMIT_REQUIRED_EDGE=0.05
@@ -365,6 +375,19 @@ failures, live fill drift, fees, settlement timing, ledger repair paths, and
 realized live P&L accounting. Older decided records that do not include
 `estimated_tokens_filled` and `estimated_actual_cost` are not suitable for this
 estimator.
+
+For the calibration gate, use the Path A + Path B analyzer instead:
+
+```bash
+venv/bin/python analyze_calibration.py --ledger live_trades.json --decisions decisions.jsonl
+```
+
+Path B joins every decision with a fused signal, including rejected decisions,
+to the closed Polymarket Gamma market resolution and reports bucketed
+calibration, Brier score, and log-loss. Entry/edge metrics, including Wilson
+edge after buffers, are computed only on records that also have executable-entry
+and estimated-cost fields. This is the calibration gate; the estimator above is
+only a quick inspection tool.
 
 For Polymarket's current deposit-wallet flow, `POLYMARKET_PK` is the private key for the signer wallet and `POLYMARKET_FUNDER` is the Polymarket deposit wallet address. Do not guess the funder address from MetaMask; discover it from Polymarket:
 
@@ -414,7 +437,8 @@ bash
 python bot.py --test-mode
 
 # Live trading mode (REAL MONEY!)
-python 15m_bot_runner.py --live
+# Use deploy/README.md and SOPS; repo-root plaintext .env is refused in live.
+python bot.py --live --confirm-live
 ```
 ## ⚙️ Configuration Options
 Argument	Description	Default
@@ -539,9 +563,10 @@ Open a Pull Request
 ## ❓ FAQ
 
 **Q: How much money do I need to start?**  
-**A:** Live mode requires `MARKET_BUY_USD > 5.50`. Use `$5.51` only for the
-first smoke test; normal live sizing should follow the plan/config, currently
-the `$55` per-trade target.
+**A:** Fixed live sizing requires `MARKET_BUY_USD > 5.50`; percent sizing
+uses `PCT_OF_FREE_COLLATERAL_PER_TRADE` and fresh AccountState free collateral.
+Use `$5.51` only for the first smoke test; normal live sizing should follow
+the plan/config, currently the `$55` per-trade target for fixed mode.
 
 **Q: Is this profitable?**  
 **A:** No claim is made from simulation records. Current simulation is

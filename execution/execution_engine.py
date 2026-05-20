@@ -100,6 +100,10 @@ class ExecutionEngine:
             risk_engine: Risk management engine
             dry_run: If True, simulate orders (no real trading)
         """
+        if not dry_run:
+            raise RuntimeError(
+                "Legacy ExecutionEngine live mode is disabled; use bot.py live order pipeline"
+            )
         self.risk_engine = risk_engine or get_risk_engine()
         self.dry_run = dry_run
         
@@ -216,24 +220,13 @@ class ExecutionEngine:
         take_profit: Optional[Decimal] = None,
         metadata: Dict[str, Any] = None,
     ) -> Optional[Order]:
-        """
-        Place market order.
-        
-        Args:
-            side: Buy or sell
-            size: Position size in USD
-            stop_loss: Stop loss price
-            take_profit: Take profit price
-            metadata: Additional order metadata
-            
-        Returns:
-            Order object
-        """
-        # Generate order ID
+        if not self.dry_run:
+            raise RuntimeError(
+                "Legacy ExecutionEngine live mode is disabled; use bot.py live order pipeline"
+            )
+
         self._order_counter += 1
         order_id = f"order_{self._order_counter}_{datetime.now().timestamp()}"
-        
-        # Create order
         order = Order(
             order_id=order_id,
             timestamp=datetime.now(),
@@ -246,8 +239,6 @@ class ExecutionEngine:
             take_profit=take_profit,
             metadata=metadata or {},
         )
-        
-        # Store order
         self._orders[order_id] = order
         self._total_orders += 1
         
@@ -256,35 +247,7 @@ class ExecutionEngine:
             f"{side.value.upper()} ${size:.2f}"
         )
         
-        # In live mode, submit to Polymarket via Nautilus
-        if not self.dry_run:
-            try:
-                from execution.nautilus_polymarket_integration import get_polymarket_integration
-                
-                integration = get_polymarket_integration(simulation_mode=False)
-                
-                # Place order via Nautilus
-                order_id_poly = await integration.place_market_order(
-                    side=side.value,
-                    size_usd=size,
-                    metadata=metadata,
-                )
-                
-                if order_id_poly:
-                    order.status = OrderStatus.SUBMITTED
-                    order.metadata["polymarket_order_id"] = order_id_poly
-                    logger.info(f"Order submitted to Polymarket: {order_id_poly}")
-                else:
-                    order.status = OrderStatus.REJECTED
-                    logger.error("Polymarket order submission failed")
-                    return None
-                    
-            except Exception as e:
-                logger.error(f"Failed to submit to Polymarket: {e}")
-                order.status = OrderStatus.REJECTED
-                return None
-        else:
-            order.status = OrderStatus.SUBMITTED
+        order.status = OrderStatus.SUBMITTED
         
         return order
     
@@ -293,16 +256,7 @@ class ExecutionEngine:
         order: Order,
         fill_price: Decimal,
     ) -> None:
-        """
-        Simulate order fill (for dry run mode).
-        
-        Args:
-            order: Order to fill
-            fill_price: Fill price
-        """
         logger.info(f"[SIMULATED] Filling order {order.order_id} @ ${fill_price:.2f}")
-        
-        # Update order
         order.status = OrderStatus.FILLED
         order.filled_size = order.size
         order.filled_price = fill_price

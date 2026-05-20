@@ -1,11 +1,14 @@
 import os
 import asyncio
-import math
 from decimal import Decimal
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
+from pathlib import Path
 from typing import Optional, Dict, Any
 from loguru import logger
 from dotenv import load_dotenv
+
+from execution.btc_market_slugs import current_btc_15m_slug, get_next_btc_15m_markets
+from sops_plaintext_env_guard import refuse_plaintext_env_in_live_mode
 
 from nautilus_trader.adapters.polymarket import POLYMARKET
 from nautilus_trader.adapters.polymarket import (
@@ -25,59 +28,18 @@ from nautilus_trader.config import (
     TradingNodeConfig,
 )
 from nautilus_trader.live.node import TradingNode
-from nautilus_trader.model.enums import OrderSide, OrderType, TimeInForce
-from nautilus_trader.model.objects import Quantity, Price
-from nautilus_trader.model.identifiers import ClientOrderId, InstrumentId
+from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.trading.strategy import Strategy
 
-load_dotenv()
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def current_btc_15m_slug() -> str:
-    """
-    Get the current BTC 15-minute market slug.
-    
-    Polymarket BTC 15-min markets follow the pattern:
-    btc-updown-15m-{unix_timestamp}
-    
-    Where unix_timestamp is the start of the 15-minute interval.
-    
-    Returns:
-        Current market slug (e.g., "btc-updown-15m-1739461800")
-    """
-    now = datetime.now(timezone.utc)
-    unix_s = int(now.timestamp())
-    interval_start = math.floor(unix_s / 900) * 900  # 900 = 15×60
-    slug = f"btc-updown-15m-{interval_start}"
-    
-    logger.info(f"Current BTC 15-min market slug: {slug}")
-    return slug
-
-
-def get_next_btc_15m_markets(count: int = 3) -> list[str]:
-    """
-    Get the next N BTC 15-minute market slugs.
-    
-    Useful for pre-loading markets that will be active soon.
-    
-    Args:
-        count: Number of future markets to include
-        
-    Returns:
-        List of market slugs including current and future markets
-    """
-    now = datetime.now(timezone.utc)
-    unix_s = int(now.timestamp())
-    interval_start = math.floor(unix_s / 900) * 900
-    
-    slugs = []
-    for i in range(count):
-        timestamp = interval_start + (i * 900)
-        slug = f"btc-updown-15m-{timestamp}"
-        slugs.append(slug)
-    
-    logger.info(f"BTC 15-min market slugs (next {count}): {slugs}")
-    return slugs
+def get_nautilus_log_dir() -> str:
+    raw = os.getenv("NAUTILUS_LOG_DIR")
+    if raw is None or raw == "":
+        raise RuntimeError("NAUTILUS_LOG_DIR must be set")
+    return raw
 
 
 class PolymarketBTCIntegration:
@@ -106,6 +68,10 @@ class PolymarketBTCIntegration:
         """
         self.simulation_mode = simulation_mode
         self.btc_market_condition_id = btc_market_condition_id
+        if self.simulation_mode:
+            load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
+        else:
+            refuse_plaintext_env_in_live_mode(repo_root=PROJECT_ROOT, argv=("--live",))
         
         # Nautilus components
         self.node: Optional[TradingNode] = None
@@ -158,7 +124,9 @@ class PolymarketBTCIntegration:
             await asyncio.sleep(5)
             
             # Find BTC instrument
-            await self._find_btc_instrument()
+            found_instrument = await self._find_btc_instrument()
+            if not found_instrument:
+                raise RuntimeError("No BTC 15-min instrument loaded")
             
             logger.info("✓ Nautilus-Polymarket integration started")
             return True
@@ -195,7 +163,7 @@ class PolymarketBTCIntegration:
             api_key=os.getenv("POLYMARKET_API_KEY"),
             api_secret=os.getenv("POLYMARKET_API_SECRET"),
             passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
-            instrument_provider=instrument_cfg,
+            instrument_config=instrument_cfg,
         )
         
         # Polymarket execution client config
@@ -204,7 +172,7 @@ class PolymarketBTCIntegration:
             api_key=os.getenv("POLYMARKET_API_KEY"),
             api_secret=os.getenv("POLYMARKET_API_SECRET"),
             passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
-            instrument_provider=instrument_cfg,
+            instrument_config=instrument_cfg,
         )
         
         # Trading node config
@@ -213,7 +181,7 @@ class PolymarketBTCIntegration:
             trader_id="BTC-15MIN-BOT-001",
             logging=LoggingConfig(
                 log_level="INFO",
-                log_directory="./logs/nautilus",
+                log_directory=get_nautilus_log_dir(),
             ),
             data_engine=LiveDataEngineConfig(qsize=6000),
             exec_engine=LiveExecEngineConfig(qsize=6000),
@@ -295,84 +263,13 @@ class PolymarketBTCIntegration:
         Returns:
             Order ID if successful
         """
-        if not self.node or not self.btc_instrument_id:
-            logger.error("Integration not ready - node or instrument missing")
-            return None
-        
         if self.simulation_mode:
             logger.info(f"[SIMULATION] Would place {side.upper()} order for ${size_usd}")
             return f"sim_order_{datetime.now().timestamp()}"
-        
-        try:
-            # Get instrument from cache
-            instrument = self.node.cache.instrument(self.btc_instrument_id)
-            
-            if not instrument:
-                logger.error(f"Instrument not in cache: {self.btc_instrument_id}")
-                return None
-            
-            # Convert side
-            order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
-            
-            # Get current best price from market
-            quote = self.node.cache.quote(self.btc_instrument_id)
-            
-            if not quote:
-                logger.warning("No quote available, using mid price")
-                current_price = Decimal("0.5")
-            else:
-                # Use mid price
-                current_price = (quote.bid_price + quote.ask_price) / 2
-            
-            # Calculate token quantity
-            # For Polymarket, tokens trade 0-1
-            # To spend $X, you need X / price tokens
-            if current_price > 0:
-                token_qty = float(size_usd) / float(current_price)
-            else:
-                token_qty = float(size_usd) * 2  # Fallback
-            
-            # Round to instrument precision
-            precision = instrument.size_precision
-            token_qty = round(token_qty, precision)
-            
-            # Create quantity
-            qty = Quantity(token_qty, precision=precision)
-            
-            # Generate unique order ID
-            timestamp_ms = int(datetime.now().timestamp() * 1000)
-            order_id = f"BTC-15MIN-{side.upper()}-{timestamp_ms}"
-            
-            # Create market order
-            # CRITICAL: Use quote_quantity=False to specify quantity in TOKENS
-            order = self.node.trader.order_factory.market(
-                instrument_id=self.btc_instrument_id,
-                order_side=order_side,
-                quantity=qty,
-                client_order_id=ClientOrderId(order_id),
-                quote_quantity=False,  # TOKENS, not USD
-                time_in_force=TimeInForce.IOC,  # Immediate or cancel
-            )
-            
-            # Submit order
-            logger.info(f"Submitting order: {order_side.name} {token_qty:.6f} tokens")
-            logger.info(f"  Estimated cost: ${size_usd:.2f}")
-            logger.info(f"  Price: ${float(current_price):.4f}")
-            
-            self.node.trader.submit_order(order)
-            
-            self.orders_submitted += 1
-            
-            logger.info(f"✓ Order submitted: {order_id}")
-            
-            return order_id
-            
-        except Exception as e:
-            logger.error(f"Failed to place order: {e}")
-            import traceback
-            traceback.print_exc()
-            self.orders_rejected += 1
-            return None
+        raise RuntimeError(
+            "Legacy PolymarketBTCIntegration live order submission is disabled; "
+            "use bot.py live order pipeline"
+        )
     
     async def place_limit_order(
         self,
@@ -393,61 +290,13 @@ class PolymarketBTCIntegration:
         Returns:
             Order ID if successful
         """
-        if not self.node or not self.btc_instrument_id:
-            return None
-        
         if self.simulation_mode:
             logger.info(f"[SIMULATION] Would place {side.upper()} limit @ ${limit_price:.4f}")
             return f"sim_order_{datetime.now().timestamp()}"
-        
-        try:
-            instrument = self.node.cache.instrument(self.btc_instrument_id)
-            
-            if not instrument:
-                return None
-            
-            # Convert side
-            order_side = OrderSide.BUY if side.lower() == "buy" else OrderSide.SELL
-            
-            # Calculate token quantity
-            token_qty = float(size_usd) / float(limit_price) if limit_price > 0 else float(size_usd) * 2
-            precision = instrument.size_precision
-            token_qty = round(token_qty, precision)
-            
-            qty = Quantity(token_qty, precision=precision)
-            
-            # Format price
-            price = Price.from_str(f"{float(limit_price):.4f}")
-            
-            # Generate order ID
-            timestamp_ms = int(datetime.now().timestamp() * 1000)
-            order_id = f"BTC-15MIN-LIMIT-{timestamp_ms}"
-            
-            # Create limit order
-            order = self.node.trader.order_factory.limit(
-                instrument_id=self.btc_instrument_id,
-                order_side=order_side,
-                quantity=qty,
-                price=price,
-                client_order_id=ClientOrderId(order_id),
-                quote_quantity=False,  # Quantity in TOKENS
-                time_in_force=TimeInForce.GTC,  # Good til cancelled
-            )
-            
-            logger.info(f"Submitting limit order: {order_side.name} {token_qty:.6f} @ ${limit_price:.4f}")
-            
-            self.node.trader.submit_order(order)
-            
-            self.orders_submitted += 1
-            
-            logger.info(f"✓ Limit order submitted: {order_id}")
-            
-            return order_id
-            
-        except Exception as e:
-            logger.error(f"Failed to place limit order: {e}")
-            self.orders_rejected += 1
-            return None
+        raise RuntimeError(
+            "Legacy PolymarketBTCIntegration live order submission is disabled; "
+            "use bot.py live order pipeline"
+        )
     
     def get_open_positions(self) -> list:
         """Get open positions from Nautilus."""

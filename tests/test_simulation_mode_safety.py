@@ -15,6 +15,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT_RESOLVED = REPO_ROOT.resolve()
 _STUBBED_MODULE_NAMES = []
+_DOTENV_CALLS = []
 
 
 class _DummyLogger:
@@ -32,12 +33,19 @@ class _DummyConfig:
         return cls(value)
 
 
+class _DummyOrderSideValue:
+    def __init__(self, name):
+        self.name = name
+
+
 class _DummyOrderSide:
-    BUY = "BUY"
+    BUY = _DummyOrderSideValue("BUY")
+    SELL = _DummyOrderSideValue("SELL")
 
 
 class _DummyTimeInForce:
     IOC = "IOC"
+    GTC = "GTC"
 
 
 class _DummyStrategy:
@@ -63,6 +71,9 @@ class _DummyRiskEngine:
         self._positions = {}
         self.realized_pnl = []
         self.restored_daily_stats = None
+        self.limits = types.SimpleNamespace(
+            max_position_size=Decimal(os.getenv("MAX_POSITION_SIZE", "5.51"))
+        )
 
     def add_position(self, position_id, size, entry_price, direction, **_kwargs):
         self._positions[str(position_id)] = {
@@ -169,7 +180,10 @@ def _install_bot_dependency_stubs():
         apply_polymarket_quote_warning_patch=lambda: True,
     )
     _install_module("polymarket_v2_compat", apply_polymarket_v2_patch=lambda: True)
-    _install_module("dotenv", load_dotenv=lambda: None)
+    _install_module(
+        "dotenv",
+        load_dotenv=lambda *args, **kwargs: _DOTENV_CALLS.append((args, kwargs)),
+    )
     _install_module("loguru", logger=_DummyLogger())
     _install_module("redis", Redis=_DummyRedis)
 
@@ -203,6 +217,7 @@ def _install_bot_dependency_stubs():
     _install_module(
         "nautilus_trader.model.enums",
         OrderSide=_DummyOrderSide,
+        OrderType=types.SimpleNamespace(MARKET="MARKET"),
         TimeInForce=_DummyTimeInForce,
     )
     _install_module("nautilus_trader.model.objects", Price=_DummyConfig, Quantity=_DummyConfig)
@@ -236,10 +251,18 @@ def _install_bot_dependency_stubs():
         "core.strategy_brain.fusion_engine.signal_fusion",
         get_fusion_engine=_DummyFusion,
     )
-    _install_module("execution.risk_engine", get_risk_engine=lambda: _DummyRiskEngine())
+    _install_module(
+        "execution.risk_engine",
+        get_risk_engine=lambda: _DummyRiskEngine(),
+        RiskEngine=_DummyRiskEngine,
+    )
     _install_module("monitoring.performance_tracker", get_performance_tracker=lambda: _DummyPerformanceTracker())
     _install_module("monitoring.grafana_exporter", get_grafana_exporter=lambda: object())
     _install_module("feedback.learning_engine", get_learning_engine=lambda: object())
+    _install_module(
+        "core.strategy_brain.signal_processors.base_processor",
+        SignalDirection=types.SimpleNamespace(BULLISH="BULLISH", BEARISH="BEARISH"),
+    )
 
 
 class SimulationModeSafetyTests(unittest.TestCase):
@@ -274,12 +297,24 @@ class SimulationModeSafetyTests(unittest.TestCase):
         self._original_ledger_path = self.bot.LIVE_TRADE_LEDGER_PATH
         self._original_require_token_hint = os.environ.get("REQUIRE_AUTO_REDEEM_TOKEN_HINT")
         self._original_order_type = os.environ.get("ORDER_TYPE")
+        self._original_sizing_mode = os.environ.get("SIZING_MODE")
+        self._original_market_buy_usd = os.environ.get("MARKET_BUY_USD")
+        self._original_max_position_size = os.environ.get("MAX_POSITION_SIZE")
+        self._original_max_account_state_age_seconds = os.environ.get("MAX_ACCOUNT_STATE_AGE_SECONDS")
+        self._original_balance_safety_buffer_usd = os.environ.get("BALANCE_SAFETY_BUFFER_USD")
+        self._original_nautilus_log_dir = os.environ.get("NAUTILUS_LOG_DIR")
         self._original_quote_stability_required = os.environ.get("QUOTE_STABILITY_REQUIRED")
         self._original_ev_fee_buffer = os.environ.get("EV_FEE_BUFFER")
         self._original_ev_spread_buffer = os.environ.get("EV_SPREAD_BUFFER")
         self._strategies = []
         os.environ["REQUIRE_AUTO_REDEEM_TOKEN_HINT"] = "true"
         os.environ["ORDER_TYPE"] = "market_ioc"
+        os.environ["SIZING_MODE"] = "fixed"
+        os.environ["MARKET_BUY_USD"] = "5.51"
+        os.environ["MAX_POSITION_SIZE"] = "5.51"
+        os.environ["MAX_ACCOUNT_STATE_AGE_SECONDS"] = "30"
+        os.environ["BALANCE_SAFETY_BUFFER_USD"] = "0.00"
+        os.environ["NAUTILUS_LOG_DIR"] = "/tmp/nautilus-test-logs"
         os.environ["QUOTE_STABILITY_REQUIRED"] = "3"
         os.environ["EV_FEE_BUFFER"] = "0.005"
         os.environ["EV_SPREAD_BUFFER"] = "0.01"
@@ -308,6 +343,30 @@ class SimulationModeSafetyTests(unittest.TestCase):
             os.environ.pop("ORDER_TYPE", None)
         else:
             os.environ["ORDER_TYPE"] = self._original_order_type
+        if self._original_sizing_mode is None:
+            os.environ.pop("SIZING_MODE", None)
+        else:
+            os.environ["SIZING_MODE"] = self._original_sizing_mode
+        if self._original_market_buy_usd is None:
+            os.environ.pop("MARKET_BUY_USD", None)
+        else:
+            os.environ["MARKET_BUY_USD"] = self._original_market_buy_usd
+        if self._original_max_position_size is None:
+            os.environ.pop("MAX_POSITION_SIZE", None)
+        else:
+            os.environ["MAX_POSITION_SIZE"] = self._original_max_position_size
+        if self._original_max_account_state_age_seconds is None:
+            os.environ.pop("MAX_ACCOUNT_STATE_AGE_SECONDS", None)
+        else:
+            os.environ["MAX_ACCOUNT_STATE_AGE_SECONDS"] = self._original_max_account_state_age_seconds
+        if self._original_balance_safety_buffer_usd is None:
+            os.environ.pop("BALANCE_SAFETY_BUFFER_USD", None)
+        else:
+            os.environ["BALANCE_SAFETY_BUFFER_USD"] = self._original_balance_safety_buffer_usd
+        if self._original_nautilus_log_dir is None:
+            os.environ.pop("NAUTILUS_LOG_DIR", None)
+        else:
+            os.environ["NAUTILUS_LOG_DIR"] = self._original_nautilus_log_dir
         if self._original_quote_stability_required is None:
             os.environ.pop("QUOTE_STABILITY_REQUIRED", None)
         else:
@@ -1092,9 +1151,11 @@ class SimulationModeSafetyTests(unittest.TestCase):
             (0.40, "no_strong_0.30_0.40"),
             (0.41, "no_moderate_0.40_0.48"),
             (0.48, "no_moderate_0.40_0.48"),
-            (0.49, "yes_moderate_0.48_0.60"),
-            (0.55, "yes_moderate_0.48_0.60"),
-            (0.59, "yes_moderate_0.48_0.60"),
+            (0.49, "neutral_0.48_0.52"),
+            (0.51, "neutral_0.48_0.52"),
+            (0.52, "yes_moderate_0.52_0.60"),
+            (0.55, "yes_moderate_0.52_0.60"),
+            (0.59, "yes_moderate_0.52_0.60"),
             (0.60, "yes_strong_0.60_0.70"),
             (0.65, "yes_strong_0.60_0.70"),
             (0.69, "yes_strong_0.60_0.70"),
@@ -1192,6 +1253,617 @@ class SimulationModeSafetyTests(unittest.TestCase):
                 os.environ.pop("PCT_OF_FREE_COLLATERAL_PER_TRADE", None)
             else:
                 os.environ["PCT_OF_FREE_COLLATERAL_PER_TRADE"] = original
+
+    def test_live_sizing_config_fixed_requires_account_state_env(self):
+        os.environ["SIZING_MODE"] = "fixed"
+        os.environ["MARKET_BUY_USD"] = "5.51"
+        os.environ["MAX_ACCOUNT_STATE_AGE_SECONDS"] = "30"
+        os.environ["BALANCE_SAFETY_BUFFER_USD"] = "0.25"
+
+        config = self.bot.validate_live_sizing_config()
+
+        self.assertEqual(config["sizing_mode"], "fixed")
+        self.assertEqual(config["fixed_market_buy_usd"], Decimal("5.51"))
+        self.assertEqual(config["max_account_state_age_seconds"], Decimal("30"))
+        self.assertEqual(config["balance_safety_buffer_usd"], Decimal("0.25"))
+
+    def test_live_sizing_config_percent_requires_pct(self):
+        original = os.environ.get("PCT_OF_FREE_COLLATERAL_PER_TRADE")
+        try:
+            os.environ["SIZING_MODE"] = "percent"
+            os.environ["PCT_OF_FREE_COLLATERAL_PER_TRADE"] = "0.05"
+            os.environ["MAX_ACCOUNT_STATE_AGE_SECONDS"] = "30"
+            os.environ["BALANCE_SAFETY_BUFFER_USD"] = "0.00"
+            config = self.bot.validate_live_sizing_config()
+        finally:
+            if original is None:
+                os.environ.pop("PCT_OF_FREE_COLLATERAL_PER_TRADE", None)
+            else:
+                os.environ["PCT_OF_FREE_COLLATERAL_PER_TRADE"] = original
+
+        self.assertEqual(config["sizing_mode"], "percent")
+        self.assertEqual(config["pct_of_free_collateral_per_trade"], Decimal("0.05"))
+
+    def test_percent_strategy_startup_does_not_read_market_buy_usd(self):
+        original_values = {
+            key: os.environ.get(key)
+            for key in (
+                "SIZING_MODE",
+                "MARKET_BUY_USD",
+                "PCT_OF_FREE_COLLATERAL_PER_TRADE",
+                "MAX_ACCOUNT_STATE_AGE_SECONDS",
+                "BALANCE_SAFETY_BUFFER_USD",
+            )
+        }
+        try:
+            os.environ["SIZING_MODE"] = "percent"
+            os.environ["MARKET_BUY_USD"] = "not-a-decimal"
+            os.environ["PCT_OF_FREE_COLLATERAL_PER_TRADE"] = "0.05"
+            os.environ["MAX_ACCOUNT_STATE_AGE_SECONDS"] = "30"
+            os.environ["BALANCE_SAFETY_BUFFER_USD"] = "0.00"
+
+            strategy = self._track_strategy(
+                self.bot.IntegratedBTCStrategy(
+                    redis_client=None,
+                    enable_grafana=False,
+                    simulation_mode=False,
+                )
+            )
+        finally:
+            for key, value in original_values.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.assertTrue(strategy.live_execution_enabled)
+
+    def test_balance_safety_buffer_rejects_sub_cent_precision(self):
+        original = os.environ.get("BALANCE_SAFETY_BUFFER_USD")
+        try:
+            os.environ["BALANCE_SAFETY_BUFFER_USD"] = "0.009"
+            with self.assertRaisesRegex(RuntimeError, "whole cents"):
+                self.bot.get_balance_safety_buffer_usd_for_live()
+            os.environ["BALANCE_SAFETY_BUFFER_USD"] = "0.019"
+            with self.assertRaisesRegex(RuntimeError, "whole cents"):
+                self.bot.get_balance_safety_buffer_usd_for_live()
+        finally:
+            if original is None:
+                os.environ.pop("BALANCE_SAFETY_BUFFER_USD", None)
+            else:
+                os.environ["BALANCE_SAFETY_BUFFER_USD"] = original
+
+    def test_balance_safety_buffer_accepts_cent_precision(self):
+        original = os.environ.get("BALANCE_SAFETY_BUFFER_USD")
+        try:
+            os.environ["BALANCE_SAFETY_BUFFER_USD"] = "0.010"
+            self.assertEqual(
+                self.bot.get_balance_safety_buffer_usd_for_live(),
+                Decimal("0.01"),
+            )
+        finally:
+            if original is None:
+                os.environ.pop("BALANCE_SAFETY_BUFFER_USD", None)
+            else:
+                os.environ["BALANCE_SAFETY_BUFFER_USD"] = original
+
+    def test_nautilus_log_dir_required(self):
+        original = os.environ.get("NAUTILUS_LOG_DIR")
+        try:
+            os.environ.pop("NAUTILUS_LOG_DIR", None)
+            with self.assertRaisesRegex(RuntimeError, "NAUTILUS_LOG_DIR"):
+                self.bot.get_nautilus_log_dir()
+            os.environ["NAUTILUS_LOG_DIR"] = "/tmp/nautilus-explicit"
+            self.assertEqual(self.bot.get_nautilus_log_dir(), "/tmp/nautilus-explicit")
+        finally:
+            if original is None:
+                os.environ.pop("NAUTILUS_LOG_DIR", None)
+            else:
+                os.environ["NAUTILUS_LOG_DIR"] = original
+
+    def test_bot_import_loads_repo_dotenv_explicitly_in_simulation(self):
+        self.assertTrue(
+            any(
+                kwargs.get("dotenv_path") == REPO_ROOT / ".env"
+                for _args, kwargs in _DOTENV_CALLS
+            )
+        )
+
+    def test_legacy_nautilus_integration_env_wiring(self):
+        sys.modules["execution"].__path__ = [str(REPO_ROOT / "execution")]
+        sys.modules.pop("execution.nautilus_polymarket_integration", None)
+        module = importlib.import_module("execution.nautilus_polymarket_integration")
+        dotenv_calls = []
+        guard_calls = []
+        original_load_dotenv = module.load_dotenv
+        original_guard = module.refuse_plaintext_env_in_live_mode
+        original_log_dir = os.environ.get("NAUTILUS_LOG_DIR")
+        try:
+            module.load_dotenv = lambda *args, **kwargs: dotenv_calls.append((args, kwargs))
+            module.refuse_plaintext_env_in_live_mode = (
+                lambda **kwargs: guard_calls.append(kwargs)
+            )
+            module.PolymarketBTCIntegration(simulation_mode=True)
+            live_integration = module.PolymarketBTCIntegration(simulation_mode=False)
+            os.environ["NAUTILUS_LOG_DIR"] = "/tmp/nautilus-legacy"
+            config = live_integration._create_nautilus_config()
+        finally:
+            module.load_dotenv = original_load_dotenv
+            module.refuse_plaintext_env_in_live_mode = original_guard
+            if original_log_dir is None:
+                os.environ.pop("NAUTILUS_LOG_DIR", None)
+            else:
+                os.environ["NAUTILUS_LOG_DIR"] = original_log_dir
+
+        self.assertEqual(dotenv_calls[0][1]["dotenv_path"], REPO_ROOT / ".env")
+        self.assertEqual(len(dotenv_calls), 1)
+        self.assertEqual(guard_calls[0]["repo_root"], REPO_ROOT)
+        self.assertEqual(tuple(guard_calls[0]["argv"]), ("--live",))
+        self.assertEqual(
+            config.kwargs["logging"].kwargs["log_directory"],
+            "/tmp/nautilus-legacy",
+        )
+        data_config = config.kwargs["data_clients"][self.bot.POLYMARKET]
+        exec_config = config.kwargs["exec_clients"][self.bot.POLYMARKET]
+        self.assertIn("instrument_config", data_config.kwargs)
+        self.assertIn("instrument_config", exec_config.kwargs)
+        self.assertNotIn("instrument_provider", data_config.kwargs)
+        self.assertNotIn("instrument_provider", exec_config.kwargs)
+
+    def _legacy_live_integration(self):
+        sys.modules["execution"].__path__ = [str(REPO_ROOT / "execution")]
+        module = importlib.import_module("execution.nautilus_polymarket_integration")
+        original_guard = module.refuse_plaintext_env_in_live_mode
+        try:
+            module.refuse_plaintext_env_in_live_mode = lambda **_kwargs: None
+            integration = module.PolymarketBTCIntegration(simulation_mode=False)
+        finally:
+            module.refuse_plaintext_env_in_live_mode = original_guard
+        return module, integration
+
+    def test_legacy_nautilus_live_order_submission_disabled(self):
+        _module, integration = self._legacy_live_integration()
+        integration.btc_instrument_id = "instrument"
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Legacy PolymarketBTCIntegration live order submission is disabled",
+        ):
+            asyncio.run(integration.place_market_order("buy", Decimal("5.51")))
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Legacy PolymarketBTCIntegration live order submission is disabled",
+        ):
+            asyncio.run(
+                integration.place_limit_order(
+                    "buy",
+                    Decimal("5.51"),
+                    Decimal("0.50"),
+                )
+            )
+
+    def test_execution_engine_live_mode_disabled(self):
+        sys.modules["execution"].__path__ = [str(REPO_ROOT / "execution")]
+        sys.modules.pop("execution.execution_engine", None)
+        module = importlib.import_module("execution.execution_engine")
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Legacy ExecutionEngine live mode is disabled",
+        ):
+            engine = module.ExecutionEngine(dry_run=False)
+
+        engine = module.ExecutionEngine(dry_run=True)
+        engine.dry_run = False
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Legacy ExecutionEngine live mode is disabled",
+        ):
+            asyncio.run(
+                engine.place_market_order(
+                    module.OrderSide.BUY,
+                    Decimal("5.51"),
+                )
+            )
+        self.assertEqual(engine._orders, {})
+        self.assertEqual(engine._order_counter, 0)
+        self.assertEqual(engine._total_orders, 0)
+
+    def test_legacy_polymarket_client_live_order_submission_disabled(self):
+        sys.modules["execution"].__path__ = [str(REPO_ROOT / "execution")]
+        sys.modules.pop("execution.polymarket_client", None)
+        module = importlib.import_module("execution.polymarket_client")
+        client = module.PolymarketClient(
+            private_key="0x" + "1" * 64,
+            api_key="api-key",
+            api_secret="api-secret",
+            api_passphrase="passphrase",
+        )
+        client.client = object()
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Legacy PolymarketClient live order submission is disabled",
+        ):
+            asyncio.run(
+                client.place_order(
+                    token_id="token",
+                    side="buy",
+                    size=Decimal("1"),
+                    price=Decimal("0.50"),
+                )
+            )
+
+    def _account_state(
+        self,
+        free_collateral,
+        seconds_old=0,
+        *,
+        is_reported=True,
+        account_issuer="POLYMARKET",
+        include_reported=True,
+        currency="pUSD",
+    ):
+        class _Money:
+            def as_decimal(self):
+                return Decimal(str(free_collateral))
+
+        class _AccountId:
+            def get_issuer(self):
+                return account_issuer
+
+        class AccountState:
+            pass
+
+        event = AccountState()
+        if include_reported:
+            event.is_reported = is_reported
+        event.account_id = _AccountId()
+        event.balances = [
+            types.SimpleNamespace(currency=currency, free=_Money()),
+        ]
+        event.ts_event = int(
+            (datetime.now(timezone.utc) - timedelta(seconds=seconds_old)).timestamp()
+            * 1_000_000_000
+        )
+        return event
+
+    def test_account_state_updates_free_collateral_cache(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+
+        strategy.on_event(self._account_state("100.25"))
+
+        self.assertEqual(strategy._latest_free_collateral, Decimal("100.25"))
+        self.assertEqual(strategy._account_state_sequence, 1)
+        self.assertIsNone(strategy._balance_stale_reason)
+
+    def test_account_state_rejects_usdc_currency(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "exactly one pUSD balance"):
+            strategy.on_event(self._account_state("100.25", currency="USDC"))
+
+    def test_account_state_rejects_system_calculated_state(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+        strategy.on_event(self._account_state("10.00"))
+        strategy._mark_balance_stale(
+            self.bot.ACCOUNT_BALANCE_STALE_AFTER_ORDER,
+            "order-account-state-reported",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "exchange-reported"):
+            strategy.on_event(self._account_state("11.00", is_reported=False))
+
+        self.assertEqual(strategy._latest_free_collateral, Decimal("10.00"))
+        self.assertEqual(
+            strategy._balance_stale_reason,
+            self.bot.ACCOUNT_BALANCE_STALE_AFTER_ORDER,
+        )
+
+    def test_account_state_rejects_missing_reported_flag(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "missing is_reported"):
+            strategy.on_event(self._account_state("10.00", include_reported=False))
+
+    def test_account_state_rejects_non_polymarket_issuer(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "issuer must be POLYMARKET"):
+            strategy.on_event(self._account_state("10.00", account_issuer="BINANCE"))
+
+    def test_fixed_sizing_uses_market_buy_usd_and_fresh_balance(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+        strategy.on_event(self._account_state("10.00"))
+        rec = self.bot.DecisionRecord(current_price=Decimal("0.70"))
+
+        size = strategy._resolve_position_size_usd(is_simulation=False, rec=rec)
+
+        self.assertEqual(size, Decimal("5.51"))
+        self.assertEqual(rec.fields["sizing_mode"], "fixed")
+        self.assertEqual(rec.fields["free_collateral_at_decision"], Decimal("10.00"))
+        self.assertIsNone(rec.fields["rejected_at_gate"])
+
+    def test_percent_sizing_uses_free_collateral(self):
+        original_pct = os.environ.get("PCT_OF_FREE_COLLATERAL_PER_TRADE")
+        try:
+            os.environ["SIZING_MODE"] = "percent"
+            os.environ["PCT_OF_FREE_COLLATERAL_PER_TRADE"] = "0.05"
+            os.environ["MAX_POSITION_SIZE"] = "55.00"
+            strategy = self._track_strategy(
+                self.bot.IntegratedBTCStrategy(
+                    redis_client=None,
+                    enable_grafana=False,
+                    simulation_mode=False,
+                )
+            )
+            strategy.on_event(self._account_state("1000.00"))
+            rec = self.bot.DecisionRecord(current_price=Decimal("0.70"))
+            size = strategy._resolve_position_size_usd(is_simulation=False, rec=rec)
+        finally:
+            if original_pct is None:
+                os.environ.pop("PCT_OF_FREE_COLLATERAL_PER_TRADE", None)
+            else:
+                os.environ["PCT_OF_FREE_COLLATERAL_PER_TRADE"] = original_pct
+
+        self.assertEqual(size, Decimal("50.00"))
+        self.assertEqual(rec.fields["sizing_mode"], "percent")
+
+    def test_percent_sizing_without_account_state_rejects_no_balance(self):
+        original_pct = os.environ.get("PCT_OF_FREE_COLLATERAL_PER_TRADE")
+        try:
+            os.environ["SIZING_MODE"] = "percent"
+            os.environ["PCT_OF_FREE_COLLATERAL_PER_TRADE"] = "0.05"
+            strategy = self._track_strategy(
+                self.bot.IntegratedBTCStrategy(
+                    redis_client=None,
+                    enable_grafana=False,
+                    simulation_mode=False,
+                )
+            )
+            rec = self.bot.DecisionRecord(current_price=Decimal("0.70"))
+            size = strategy._resolve_position_size_usd(is_simulation=False, rec=rec)
+        finally:
+            if original_pct is None:
+                os.environ.pop("PCT_OF_FREE_COLLATERAL_PER_TRADE", None)
+            else:
+                os.environ["PCT_OF_FREE_COLLATERAL_PER_TRADE"] = original_pct
+
+        self.assertIsNone(size)
+        self.assertEqual(rec.fields["rejected_at_gate"], "no_balance")
+
+    def test_stale_account_state_rejects(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+        strategy.on_event(self._account_state("10.00", seconds_old=31))
+        rec = self.bot.DecisionRecord(current_price=Decimal("0.70"))
+
+        size = strategy._resolve_position_size_usd(is_simulation=False, rec=rec)
+
+        self.assertIsNone(size)
+        self.assertEqual(rec.fields["rejected_at_gate"], "stale_balance")
+        self.assertEqual(rec.fields["balance_stale_reason"], "too_old")
+
+    def test_future_account_state_rejects(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "must not be in the future"):
+            strategy.on_event(self._account_state("10.00", seconds_old=-10))
+
+        self.assertIsNone(strategy._latest_free_collateral)
+        self.assertEqual(strategy._account_state_sequence, 0)
+
+    def test_future_account_state_does_not_clear_after_order_staleness(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+        strategy.on_event(self._account_state("10.00", seconds_old=1))
+        strategy._mark_balance_stale(
+            self.bot.ACCOUNT_BALANCE_STALE_AFTER_ORDER,
+            "order-future-state",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "must not be in the future"):
+            strategy.on_event(self._account_state("11.00", seconds_old=-10))
+
+        self.assertEqual(strategy._latest_free_collateral, Decimal("10.00"))
+        self.assertEqual(strategy._account_state_sequence, 1)
+        self.assertEqual(
+            strategy._balance_stale_reason,
+            self.bot.ACCOUNT_BALANCE_STALE_AFTER_ORDER,
+        )
+
+    def test_balance_marked_stale_after_order_rejects_until_account_state_refresh(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+        strategy.on_event(self._account_state("10.00"))
+        strategy._mark_balance_stale(
+            self.bot.ACCOUNT_BALANCE_STALE_AFTER_ORDER,
+            "order-refresh-required",
+        )
+        stale_rec = self.bot.DecisionRecord(current_price=Decimal("0.70"))
+
+        stale_size = strategy._resolve_position_size_usd(is_simulation=False, rec=stale_rec)
+
+        self.assertIsNone(stale_size)
+        self.assertEqual(stale_rec.fields["rejected_at_gate"], "stale_balance_after_order")
+        strategy.on_event(self._account_state("10.00"))
+        fresh_rec = self.bot.DecisionRecord(current_price=Decimal("0.70"))
+        fresh_size = strategy._resolve_position_size_usd(is_simulation=False, rec=fresh_rec)
+        self.assertEqual(fresh_size, Decimal("5.51"))
+
+    def test_older_account_state_does_not_clear_after_order_staleness(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+        strategy.on_event(self._account_state("10.00", seconds_old=10))
+        strategy._mark_balance_stale(
+            self.bot.ACCOUNT_BALANCE_STALE_AFTER_ORDER,
+            "order-older-state",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "newer than the stale-balance"):
+            strategy.on_event(self._account_state("11.00", seconds_old=5))
+
+        rec = self.bot.DecisionRecord(current_price=Decimal("0.70"))
+        size = strategy._resolve_position_size_usd(is_simulation=False, rec=rec)
+        self.assertIsNone(size)
+        self.assertEqual(rec.fields["rejected_at_gate"], "stale_balance_after_order")
+
+    def test_older_account_state_does_not_clear_after_redeem_staleness(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+        strategy.on_event(self._account_state("10.00", seconds_old=10))
+        strategy._mark_balance_stale(self.bot.ACCOUNT_BALANCE_STALE_AFTER_REDEEM)
+
+        with self.assertRaisesRegex(RuntimeError, "newer than the stale-balance"):
+            strategy.on_event(self._account_state("11.00", seconds_old=5))
+
+        rec = self.bot.DecisionRecord(current_price=Decimal("0.70"))
+        size = strategy._resolve_position_size_usd(is_simulation=False, rec=rec)
+        self.assertIsNone(size)
+        self.assertEqual(rec.fields["rejected_at_gate"], "stale_balance_after_redeem")
+
+    def test_account_state_timestamp_must_increase(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+        strategy.on_event(self._account_state("10.00", seconds_old=5))
+
+        with self.assertRaisesRegex(RuntimeError, "increase monotonically"):
+            strategy.on_event(self._account_state("11.00", seconds_old=10))
+
+    def test_percent_sizing_above_max_position_rejects_not_clamps(self):
+        original_pct = os.environ.get("PCT_OF_FREE_COLLATERAL_PER_TRADE")
+        try:
+            os.environ["SIZING_MODE"] = "percent"
+            os.environ["PCT_OF_FREE_COLLATERAL_PER_TRADE"] = "0.10"
+            os.environ["MAX_POSITION_SIZE"] = "55.00"
+            strategy = self._track_strategy(
+                self.bot.IntegratedBTCStrategy(
+                    redis_client=None,
+                    enable_grafana=False,
+                    simulation_mode=False,
+                )
+            )
+            strategy.on_event(self._account_state("1000.00"))
+            rec = self.bot.DecisionRecord(current_price=Decimal("0.70"))
+            size = strategy._resolve_position_size_usd(is_simulation=False, rec=rec)
+        finally:
+            if original_pct is None:
+                os.environ.pop("PCT_OF_FREE_COLLATERAL_PER_TRADE", None)
+            else:
+                os.environ["PCT_OF_FREE_COLLATERAL_PER_TRADE"] = original_pct
+
+        self.assertIsNone(size)
+        self.assertEqual(rec.fields["rejected_at_gate"], "size_exceeds_max_position_size")
+
+    def test_place_real_order_percent_rejects_size_mismatch(self):
+        original_values = {
+            key: os.environ.get(key)
+            for key in ("SIZING_MODE", "PCT_OF_FREE_COLLATERAL_PER_TRADE")
+        }
+        try:
+            os.environ["SIZING_MODE"] = "percent"
+            os.environ["PCT_OF_FREE_COLLATERAL_PER_TRADE"] = "0.05"
+            strategy = self._track_strategy(
+                self.bot.IntegratedBTCStrategy(
+                    redis_client=None,
+                    enable_grafana=False,
+                    simulation_mode=False,
+                )
+            )
+            strategy.instrument_id = "dummy-instrument-id"
+            strategy.on_event(self._account_state("1000.00"))
+
+            result = asyncio.run(
+                strategy._place_real_order(
+                    signal=types.SimpleNamespace(score=77, confidence=0.67),
+                    position_size=Decimal("49.00"),
+                    current_price=Decimal("0.62"),
+                    direction="long",
+                    order_type=self.bot.ORDER_TYPE_MARKET_IOC,
+                )
+            )
+        finally:
+            for key, value in original_values.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.assertFalse(result)
+        self.assertEqual(strategy._submitted_order_intents, {})
 
     # --- ORDER_TYPE validation ----------------------------------------------
 
@@ -1473,6 +2145,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
         original = os.environ.get("MARKET_BUY_USD")
         try:
             os.environ["MARKET_BUY_USD"] = "5.51"
+            strategy.on_event(self._account_state("10.00"))
             # Returns False because of later checks (NO token absent for short,
             # etc.), but if it raised an unexpected exception that would be a
             # signal the gate failed unexpectedly.
@@ -1508,6 +2181,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
         strategy._yes_instrument_id = yes_instrument_id
         strategy._stable_tick_count = 3
         strategy._last_bid_ask = (Decimal("0.60"), Decimal("0.62"))
+        strategy.risk_engine.validate_new_position = lambda **_kwargs: (False, "risk blocked")
         submitted = {}
 
         class _Instrument:
@@ -1554,6 +2228,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
             os.environ["QUOTE_STABILITY_REQUIRED"] = "3"
             os.environ["LIMIT_REQUIRED_EDGE"] = "0.05"
             os.environ["LIMIT_IOC_FILL_POLICY"] = "partial_ok"
+            strategy.on_event(self._account_state("10.00"))
             result = asyncio.run(
                 strategy._place_real_order(
                     signal=types.SimpleNamespace(score=77, confidence=0.67),
@@ -1583,6 +2258,151 @@ class SimulationModeSafetyTests(unittest.TestCase):
         self.assertFalse(intent["quote_quantity"])
         self.assertEqual(intent["quantity_mode"], "base_quantity")
         self.assertEqual(intent["submitted_limit_price"], Decimal("0.62"))
+
+    def test_place_real_order_pre_intent_exception_does_not_block_live_settlement(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+        condition_id = "conditionpreintent"
+        yes_token_id = "yestoken"
+        yes_instrument_id = f"{condition_id}-{yes_token_id}.POLYMARKET"
+        strategy.instrument_id = yes_instrument_id
+        strategy._yes_instrument_id = yes_instrument_id
+        strategy._stable_tick_count = 3
+        strategy._last_bid_ask = (Decimal("0.60"), Decimal("0.62"))
+
+        class _Instrument:
+            size_precision = 6
+            price_precision = 2
+            info = {}
+
+        class _Cache:
+            def instrument(self, _instrument_id):
+                return _Instrument()
+
+        class _OrderFactory:
+            def market(self, **_kwargs):
+                raise AssertionError("market order factory should not be called")
+
+        def _raise_metadata_error():
+            raise RuntimeError("metadata exploded")
+
+        strategy.cache = _Cache()
+        strategy.order_factory = _OrderFactory()
+        strategy._current_market_metadata = _raise_metadata_error
+
+        original_values = {
+            key: os.environ.get(key)
+            for key in ("MARKET_BUY_USD", "ORDER_TYPE", "QUOTE_STABILITY_REQUIRED")
+        }
+        try:
+            os.environ["MARKET_BUY_USD"] = "5.51"
+            os.environ["ORDER_TYPE"] = "market_ioc"
+            os.environ["QUOTE_STABILITY_REQUIRED"] = "3"
+            strategy.on_event(self._account_state("10.00"))
+            with self.assertRaisesRegex(RuntimeError, "metadata exploded"):
+                asyncio.run(
+                    strategy._place_real_order(
+                        signal=types.SimpleNamespace(score=77, confidence=0.67),
+                        position_size=Decimal("5.51"),
+                        current_price=Decimal("0.62"),
+                        direction="long",
+                        order_type=self.bot.ORDER_TYPE_MARKET_IOC,
+                    )
+                )
+        finally:
+            for key, value in original_values.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.assertEqual(strategy._submitted_order_intents, {})
+        self.assertIsNone(strategy._settlement_ledger_blocked_reason)
+        self.assertIsNone(strategy._balance_stale_reason)
+
+    def test_place_real_order_submit_exception_blocks_persisted_intent(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+        condition_id = "conditionsubmitraises"
+        yes_token_id = "yestoken"
+        no_token_id = "notoken"
+        yes_instrument_id = f"{condition_id}-{yes_token_id}.POLYMARKET"
+        strategy.instrument_id = yes_instrument_id
+        strategy._yes_instrument_id = yes_instrument_id
+        strategy._stable_tick_count = 3
+        strategy._last_bid_ask = (Decimal("0.60"), Decimal("0.62"))
+
+        class _Instrument:
+            size_precision = 6
+            price_precision = 2
+            info = {}
+
+        class _Cache:
+            def instrument(self, _instrument_id):
+                return _Instrument()
+
+        class _OrderFactory:
+            def market(self, **kwargs):
+                return {"kind": "market", **kwargs}
+
+        def _raise_submit_error(_order):
+            raise RuntimeError("submit exploded")
+
+        strategy.cache = _Cache()
+        strategy.order_factory = _OrderFactory()
+        strategy.submit_order = _raise_submit_error
+        now = datetime.now(timezone.utc)
+        strategy._current_market_metadata = lambda: {
+            "slug": "slug-live-submit-raises",
+            "condition_id": condition_id,
+            "yes_token_id": yes_token_id,
+            "no_token_id": no_token_id,
+            "start_time": (now - timedelta(minutes=15)).isoformat(),
+            "end_time": (now + timedelta(minutes=15)).isoformat(),
+        }
+
+        original_values = {
+            key: os.environ.get(key)
+            for key in ("MARKET_BUY_USD", "ORDER_TYPE", "QUOTE_STABILITY_REQUIRED")
+        }
+        try:
+            os.environ["MARKET_BUY_USD"] = "5.51"
+            os.environ["ORDER_TYPE"] = "market_ioc"
+            os.environ["QUOTE_STABILITY_REQUIRED"] = "3"
+            strategy.on_event(self._account_state("10.00"))
+            with self.assertRaisesRegex(RuntimeError, "submit exploded"):
+                asyncio.run(
+                    strategy._place_real_order(
+                        signal=types.SimpleNamespace(score=77, confidence=0.67),
+                        position_size=Decimal("5.51"),
+                        current_price=Decimal("0.62"),
+                        direction="long",
+                        order_type=self.bot.ORDER_TYPE_MARKET_IOC,
+                    )
+                )
+        finally:
+            for key, value in original_values.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.assertTrue(strategy._submitted_order_intents)
+        self.assertEqual(
+            strategy._balance_stale_reason,
+            self.bot.ACCOUNT_BALANCE_STALE_AFTER_ORDER,
+        )
+        self.assertIn("submit_order raised", strategy._settlement_ledger_blocked_reason)
 
     def test_place_real_order_rejects_yes_instrument_token_mismatch(self):
         strategy = self._track_strategy(
@@ -1632,6 +2452,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
             os.environ["MARKET_BUY_USD"] = "5.51"
             os.environ["ORDER_TYPE"] = "market_ioc"
             os.environ["QUOTE_STABILITY_REQUIRED"] = "3"
+            strategy.on_event(self._account_state("10.00"))
             result = asyncio.run(
                 strategy._place_real_order(
                     signal=types.SimpleNamespace(score=77, confidence=0.67),
@@ -1701,6 +2522,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
             os.environ["MARKET_BUY_USD"] = "5.51"
             os.environ["ORDER_TYPE"] = "market_ioc"
             os.environ["QUOTE_STABILITY_REQUIRED"] = "3"
+            strategy.on_event(self._account_state("10.00"))
             result = asyncio.run(
                 strategy._place_real_order(
                     signal=types.SimpleNamespace(score=77, confidence=0.67),
@@ -1779,6 +2601,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
             os.environ["QUOTE_STABILITY_REQUIRED"] = "3"
             os.environ["LIMIT_REQUIRED_EDGE"] = "0.05"
             os.environ["LIMIT_IOC_FILL_POLICY"] = "partial_ok"
+            strategy.on_event(self._account_state("10.00"))
             result = asyncio.run(
                 strategy._place_real_order(
                     signal=types.SimpleNamespace(score=77, confidence=0.67),
@@ -1860,6 +2683,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
             os.environ["QUOTE_STABILITY_REQUIRED"] = "3"
             os.environ["LIMIT_REQUIRED_EDGE"] = "0.05"
             os.environ["LIMIT_IOC_FILL_POLICY"] = "partial_ok"
+            strategy.on_event(self._account_state("10.00"))
             result = asyncio.run(
                 strategy._place_real_order(
                     signal=types.SimpleNamespace(score=77, confidence=0.67),
@@ -1975,6 +2799,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
             os.environ["MIN_SIGNAL_CONFIDENCE"] = "0.60"
             os.environ["EV_FEE_BUFFER"] = "0.005"
             os.environ["EV_SPREAD_BUFFER"] = "0.01"
+            strategy.on_event(self._account_state("10.00"))
             rec = self.bot.DecisionRecord(current_price=Decimal("0.70"))
             result = asyncio.run(
                 strategy._make_trading_decision_body(
@@ -2094,6 +2919,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
             os.environ["MIN_SIGNAL_CONFIDENCE"] = "0.60"
             os.environ["EV_FEE_BUFFER"] = "0.005"
             os.environ["EV_SPREAD_BUFFER"] = "0.01"
+            strategy.on_event(self._account_state("10.00"))
             rec = self.bot.DecisionRecord(current_price=Decimal("0.70"))
             with self.assertRaisesRegex(RuntimeError, "actual_cost must be explicit"):
                 asyncio.run(
@@ -2112,6 +2938,324 @@ class SimulationModeSafetyTests(unittest.TestCase):
                     os.environ[key] = value
 
         self.assertIsNone(rec.fields["estimated_actual_cost"])
+
+    def test_shadow_policy_positive_decision_does_not_execute_or_write_paper_trade(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+        strategy._stable_tick_count = 3
+        strategy.price_history = [Decimal("0.70")] * 20
+        strategy.instrument_id = "yes-instrument"
+        strategy._yes_instrument_id = "yes-instrument"
+        strategy._yes_token_id = "yes-token"
+        strategy._last_bid_ask = (Decimal("0.60"), Decimal("0.62"))
+
+        fused = types.SimpleNamespace(
+            source="Fusion",
+            direction=types.SimpleNamespace(value="bullish"),
+            score=77,
+            confidence=0.67,
+        )
+        strategy._process_signals = lambda _current_price, _metadata: [fused]
+        strategy.fusion_engine = types.SimpleNamespace(
+            fuse_signals=lambda _signals, min_signals, min_score: fused
+        )
+
+        async def _market_context(_current_price):
+            return {
+                "deviation": 0.0,
+                "momentum": 0.0,
+                "volatility": 0.0,
+                "tick_buffer": [],
+                "yes_token_id": "yes-token",
+                "yes_order_book": {
+                    "bids": [],
+                    "asks": [{"price": "0.62", "size": "20"}],
+                },
+            }
+
+        async def _unexpected_place(*_args, **_kwargs):
+            raise AssertionError("shadow policy must not place live orders")
+
+        async def _unexpected_paper(*_args, **_kwargs):
+            raise AssertionError("shadow policy must not write paper trades")
+
+        strategy._fetch_market_context = _market_context
+        strategy._place_real_order = _unexpected_place
+        strategy._record_paper_trade = _unexpected_paper
+        now = datetime.now(timezone.utc)
+        strategy._current_market_metadata = lambda: {
+            "slug": "slug-shadow-policy",
+            "condition_id": "condition-shadow-policy",
+            "yes_token_id": "yes-token",
+            "no_token_id": "no-token",
+            "start_time": (now - timedelta(minutes=15)).isoformat(),
+            "end_time": (now + timedelta(minutes=15)).isoformat(),
+        }
+
+        original_values = {
+            key: os.environ.get(key)
+            for key in (
+                "MARKET_BUY_USD",
+                "ORDER_TYPE",
+                "QUOTE_STABILITY_REQUIRED",
+                "MIN_SIGNAL_CONFIDENCE",
+                "EV_FEE_BUFFER",
+                "EV_SPREAD_BUFFER",
+            )
+        }
+        try:
+            os.environ["MARKET_BUY_USD"] = "5.51"
+            os.environ["ORDER_TYPE"] = "market_ioc"
+            os.environ["QUOTE_STABILITY_REQUIRED"] = "3"
+            os.environ["MIN_SIGNAL_CONFIDENCE"] = "0.60"
+            os.environ["EV_FEE_BUFFER"] = "0.005"
+            os.environ["EV_SPREAD_BUFFER"] = "0.01"
+            strategy.on_event(self._account_state("10.00"))
+            rec = self.bot.DecisionRecord(
+                current_price=Decimal("0.70"),
+                strategy_observation_mode="shadow_policy",
+            )
+            result = asyncio.run(
+                strategy._make_trading_decision_body(
+                    Decimal("0.70"),
+                    trade_key=None,
+                    is_simulation=False,
+                    rec=rec,
+                    observation_only=True,
+                )
+            )
+        finally:
+            for key, value in original_values.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.assertTrue(result)
+        self.assertEqual(rec.fields["strategy_observation_mode"], "shadow_policy")
+        self.assertEqual(rec.fields["decided_direction"], "long")
+        self.assertEqual(strategy._submitted_order_intents, {})
+
+    def test_shadow_policy_rejects_below_quote_stability_threshold(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+        strategy._stable_tick_count = 2
+
+        original_values = {
+            key: os.environ.get(key)
+            for key in (
+                "MARKET_BUY_USD",
+                "ORDER_TYPE",
+                "QUOTE_STABILITY_REQUIRED",
+                "MIN_SIGNAL_CONFIDENCE",
+                "EV_FEE_BUFFER",
+                "EV_SPREAD_BUFFER",
+            )
+        }
+        try:
+            os.environ["MARKET_BUY_USD"] = "5.51"
+            os.environ["ORDER_TYPE"] = "market_ioc"
+            os.environ["QUOTE_STABILITY_REQUIRED"] = "3"
+            os.environ["MIN_SIGNAL_CONFIDENCE"] = "0.60"
+            os.environ["EV_FEE_BUFFER"] = "0.005"
+            os.environ["EV_SPREAD_BUFFER"] = "0.01"
+            rec = self.bot.DecisionRecord(
+                current_price=Decimal("0.70"),
+                strategy_observation_mode="shadow_policy",
+            )
+            result = asyncio.run(
+                strategy._make_trading_decision_body(
+                    Decimal("0.70"),
+                    trade_key=None,
+                    is_simulation=False,
+                    rec=rec,
+                    observation_only=True,
+                )
+            )
+        finally:
+            for key, value in original_values.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.assertFalse(result)
+        self.assertEqual(
+            rec.fields["rejected_at_gate"],
+            "quote_stability_below_configured_threshold",
+        )
+        self.assertEqual(strategy._submitted_order_intents, {})
+
+    def test_shadow_policy_uses_live_percent_sizing(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+        strategy._stable_tick_count = 3
+        strategy.price_history = [Decimal("0.70")] * 20
+        strategy.instrument_id = "yes-instrument"
+        strategy._yes_instrument_id = "yes-instrument"
+        strategy._yes_token_id = "yes-token"
+        strategy._last_bid_ask = (Decimal("0.60"), Decimal("0.62"))
+
+        fused = types.SimpleNamespace(
+            source="Fusion",
+            direction=types.SimpleNamespace(value="bullish"),
+            score=77,
+            confidence=0.67,
+        )
+        strategy._process_signals = lambda _current_price, _metadata: [fused]
+        strategy.fusion_engine = types.SimpleNamespace(
+            fuse_signals=lambda _signals, min_signals, min_score: fused
+        )
+
+        async def _market_context(_current_price):
+            return {
+                "deviation": 0.0,
+                "momentum": 0.0,
+                "volatility": 0.0,
+                "tick_buffer": [],
+                "yes_token_id": "yes-token",
+                "yes_order_book": {
+                    "bids": [],
+                    "asks": [{"price": "0.62", "size": "20"}],
+                },
+            }
+
+        async def _unexpected_place(*_args, **_kwargs):
+            raise AssertionError("shadow policy must not place live orders")
+
+        strategy._fetch_market_context = _market_context
+        strategy._place_real_order = _unexpected_place
+        now = datetime.now(timezone.utc)
+        strategy._current_market_metadata = lambda: {
+            "slug": "slug-shadow-policy-percent",
+            "condition_id": "condition-shadow-policy-percent",
+            "yes_token_id": "yes-token",
+            "no_token_id": "no-token",
+            "start_time": (now - timedelta(minutes=15)).isoformat(),
+            "end_time": (now + timedelta(minutes=15)).isoformat(),
+        }
+
+        original_values = {
+            key: os.environ.get(key)
+            for key in (
+                "MARKET_BUY_USD",
+                "ORDER_TYPE",
+                "QUOTE_STABILITY_REQUIRED",
+                "MIN_SIGNAL_CONFIDENCE",
+                "EV_FEE_BUFFER",
+                "EV_SPREAD_BUFFER",
+                "SIZING_MODE",
+                "PCT_OF_FREE_COLLATERAL_PER_TRADE",
+                "MAX_POSITION_SIZE",
+            )
+        }
+        try:
+            os.environ["MARKET_BUY_USD"] = "5.51"
+            os.environ["ORDER_TYPE"] = "market_ioc"
+            os.environ["QUOTE_STABILITY_REQUIRED"] = "3"
+            os.environ["MIN_SIGNAL_CONFIDENCE"] = "0.60"
+            os.environ["EV_FEE_BUFFER"] = "0.005"
+            os.environ["EV_SPREAD_BUFFER"] = "0.01"
+            os.environ["SIZING_MODE"] = "percent"
+            os.environ["PCT_OF_FREE_COLLATERAL_PER_TRADE"] = "0.05"
+            os.environ["MAX_POSITION_SIZE"] = "55.00"
+            strategy.risk_engine.limits.max_position_size = Decimal("55.00")
+            strategy.on_event(self._account_state("200.00"))
+            rec = self.bot.DecisionRecord(
+                current_price=Decimal("0.70"),
+                strategy_observation_mode="shadow_policy",
+            )
+            result = asyncio.run(
+                strategy._make_trading_decision_body(
+                    Decimal("0.70"),
+                    trade_key=None,
+                    is_simulation=False,
+                    rec=rec,
+                    observation_only=True,
+                )
+            )
+        finally:
+            for key, value in original_values.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.assertTrue(result)
+        self.assertEqual(rec.fields["sizing_mode"], "percent")
+        self.assertEqual(rec.fields["resolved_trade_usd"], Decimal("10.00"))
+        self.assertEqual(rec.fields["strategy_observation_mode"], "shadow_policy")
+        self.assertEqual(strategy._submitted_order_intents, {})
+        self.assertEqual(len(strategy.risk_engine._positions), 0)
+
+    def test_shadow_policy_sync_does_not_clear_live_decision_flag(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+        calls = []
+
+        async def _record_call(*args, **kwargs):
+            calls.append((args, kwargs))
+            return False
+
+        strategy._decision_in_progress = True
+        strategy._make_trading_decision = _record_call
+
+        strategy._make_trading_decision_sync(
+            0.70,
+            trade_key=None,
+            strategy_observation_mode="shadow_policy",
+        )
+
+        self.assertTrue(strategy._decision_in_progress)
+        self.assertEqual(calls[0][1]["strategy_observation_mode"], "shadow_policy")
+
+    def test_shadow_policy_wrapper_bypasses_redis_mode_check(self):
+        strategy = self._track_strategy(
+            self.bot.IntegratedBTCStrategy(
+                redis_client=None,
+                enable_grafana=False,
+                simulation_mode=False,
+            )
+        )
+        calls = []
+
+        async def _record_body(current_price, trade_key, is_simulation, rec, observation_only=False):
+            calls.append((current_price, trade_key, is_simulation, rec, observation_only))
+            return True
+
+        strategy._make_trading_decision_body = _record_body
+
+        result = asyncio.run(
+            strategy._make_trading_decision(
+                Decimal("0.70"),
+                trade_key=None,
+                strategy_observation_mode="shadow_policy",
+            )
+        )
+
+        self.assertTrue(result)
+        self.assertFalse(calls[0][2])
+        self.assertTrue(calls[0][4])
 
     def test_fetch_market_context_uses_market_metadata_yes_token_for_order_book(self):
         strategy = self._new_strategy()
@@ -2349,6 +3493,10 @@ class SimulationModeSafetyTests(unittest.TestCase):
         self.assertEqual(
             config_kwargs["timeout_shutdown"],
             self.bot.NAUTILUS_SHUTDOWN_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            config_kwargs["logging"].kwargs["log_directory"],
+            "/tmp/nautilus-test-logs",
         )
 
     def test_trading_node_dispose_does_not_wait_on_executor_shutdown(self):
@@ -4433,6 +5581,107 @@ class SimulationModeSafetyTests(unittest.TestCase):
         data = json.loads(self._test_ledger_path.read_text(encoding="utf-8"))
         self.assertEqual(data["submitted_order_intents"][order_id]["status"], "ORDER_DENIED_NO_FILL")
 
+    def test_terminal_no_fill_clears_after_order_balance_staleness(self):
+        strategy = self._new_strategy()
+        strategy.on_event(self._account_state("10.00"))
+        order_id = "intent-denied-clears-balance"
+        strategy._mark_balance_stale(
+            self.bot.ACCOUNT_BALANCE_STALE_AFTER_ORDER,
+            order_id,
+        )
+        meta = self._live_trade_meta(order_id=order_id, token_id="token-intent")
+        meta.pop("filled_qty")
+        meta.pop("filled_notional")
+        strategy._submitted_positions[order_id] = dict(meta)
+        strategy.risk_engine.add_position(order_id, Decimal("2.00"), Decimal("0.50"), "buy_yes")
+        strategy._persist_submitted_order_intent_locked(order_id, meta, "ask")
+
+        class _DeniedEvent:
+            client_order_id = order_id
+            venue_order_id = "0xdenied-clear-stale"
+            reason = "no match"
+            filled_qty = Decimal("0")
+
+        strategy.on_order_denied(_DeniedEvent())
+
+        self.assertIsNone(strategy._balance_stale_reason)
+        self.assertNotIn(order_id, strategy._submitted_positions)
+        self.assertNotIn(order_id, strategy.risk_engine._positions)
+        self.assertEqual(
+            strategy._submitted_order_intents[order_id]["status"],
+            "ORDER_DENIED_NO_FILL",
+        )
+
+    def test_untracked_terminal_no_fill_does_not_clear_after_order_balance_staleness(self):
+        strategy = self._new_strategy()
+        strategy.on_event(self._account_state("10.00"))
+        stale_order_id = "submitted-order-awaiting-balance"
+        strategy._mark_balance_stale(
+            self.bot.ACCOUNT_BALANCE_STALE_AFTER_ORDER,
+            stale_order_id,
+        )
+
+        class _DeniedEvent:
+            client_order_id = "unknown-denied-no-fill"
+            venue_order_id = "0xunknown-denied-no-fill"
+            reason = "no match"
+            filled_qty = Decimal("0")
+
+        strategy.on_order_denied(_DeniedEvent())
+
+        self.assertEqual(
+            strategy._balance_stale_reason,
+            self.bot.ACCOUNT_BALANCE_STALE_AFTER_ORDER,
+        )
+        self.assertEqual(
+            strategy._account_balance_tracker.balance_stale_order_id,
+            stale_order_id,
+        )
+        rec = self.bot.DecisionRecord(current_price=Decimal("0.70"))
+        size = strategy._resolve_position_size_usd(is_simulation=False, rec=rec)
+        self.assertIsNone(size)
+        self.assertEqual(rec.fields["rejected_at_gate"], "stale_balance_after_order")
+
+    def test_duplicate_no_fill_does_not_clear_newer_order_balance_staleness(self):
+        strategy = self._new_strategy()
+        strategy.on_event(self._account_state("10.00"))
+        first_order_id = "older-denied-order"
+        first_meta = self._live_trade_meta(order_id=first_order_id, token_id="token-first")
+        first_meta.pop("filled_qty")
+        first_meta.pop("filled_notional")
+        strategy._submitted_positions[first_order_id] = dict(first_meta)
+        strategy.risk_engine.add_position(first_order_id, Decimal("2.00"), Decimal("0.50"), "buy_yes")
+        strategy._persist_submitted_order_intent_locked(first_order_id, first_meta, "ask")
+        strategy._mark_balance_stale(
+            self.bot.ACCOUNT_BALANCE_STALE_AFTER_ORDER,
+            first_order_id,
+        )
+
+        class _FirstDeniedEvent:
+            client_order_id = first_order_id
+            venue_order_id = "0xolder-denied-order"
+            reason = "no match"
+            filled_qty = Decimal("0")
+
+        strategy.on_order_denied(_FirstDeniedEvent())
+        self.assertIsNone(strategy._balance_stale_reason)
+
+        newer_order_id = "newer-filled-order"
+        strategy._mark_balance_stale(
+            self.bot.ACCOUNT_BALANCE_STALE_AFTER_ORDER,
+            newer_order_id,
+        )
+        strategy.on_order_denied(_FirstDeniedEvent())
+
+        self.assertEqual(
+            strategy._balance_stale_reason,
+            self.bot.ACCOUNT_BALANCE_STALE_AFTER_ORDER,
+        )
+        self.assertEqual(
+            strategy._account_balance_tracker.balance_stale_order_id,
+            newer_order_id,
+        )
+
     def test_terminal_event_with_fill_evidence_blocks_instead_of_marking_no_fill(self):
         strategy = self._new_strategy()
         order_id = "intent-denied-with-fill"
@@ -6061,6 +7310,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
 
     def test_unmatched_redeem_is_retried_after_fill(self):
         strategy = self._new_strategy()
+        strategy.on_event(self._account_state("10.00"))
         payload = {
             "txn_hash": "0xearly",
             "amount": "4",
@@ -6073,6 +7323,10 @@ class SimulationModeSafetyTests(unittest.TestCase):
         self.assertFalse(strategy._handle_auto_redeem_event(payload))
         self.assertEqual(len(strategy._pending_auto_redeem_events), 1)
         self.assertEqual(len(strategy._seen_auto_redeem_events), 0)
+        self.assertEqual(
+            strategy._balance_stale_reason,
+            self.bot.ACCOUNT_BALANCE_STALE_AFTER_REDEEM,
+        )
 
         strategy._open_live_trades["order-early"] = self._live_trade_meta(
             order_id="order-early",
@@ -6089,6 +7343,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
 
     def test_redeem_without_token_hint_is_not_auto_allocated(self):
         strategy = self._new_strategy()
+        strategy.on_event(self._account_state("10.00"))
         strategy._open_live_trades["order-manual-risk"] = self._live_trade_meta(
             order_id="order-manual-risk",
             token_id="token-manual-risk",
@@ -6110,6 +7365,10 @@ class SimulationModeSafetyTests(unittest.TestCase):
         self.assertIn("order-manual-risk", strategy._open_live_trades)
         self.assertEqual(len(strategy._pending_auto_redeem_events), 1)
         self.assertEqual(len(strategy._seen_auto_redeem_events), 0)
+        self.assertEqual(
+            strategy._balance_stale_reason,
+            self.bot.ACCOUNT_BALANCE_STALE_AFTER_REDEEM,
+        )
 
     def test_auto_redeem_buy_side_is_not_an_outcome_hint(self):
         strategy = self._new_strategy()

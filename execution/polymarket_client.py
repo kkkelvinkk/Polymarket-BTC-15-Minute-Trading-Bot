@@ -3,15 +3,12 @@ Polymarket Client - Production Implementation
 Real API integration with Polymarket CLOB
 """
 import os
-import asyncio
 from decimal import Decimal
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from loguru import logger
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType as PolyOrderType
-from py_clob_client.order_builder.constants import BUY, SELL
 POLYMARKET_AVAILABLE = True
 
 
@@ -254,60 +251,10 @@ class PolymarketClient:
         Returns:
             Order ID if successful
         """
-        if not self.client:
-            logger.error("Client not connected")
-            return None
-        
-        try:
-            # Convert to Polymarket format
-            poly_side = BUY if side.lower() == "buy" else SELL
-            
-            # If no price specified, use market order (best available price)
-            if price is None:
-                # Get best price from orderbook
-                book = await self.get_orderbook(token_id)
-                if not book:
-                    logger.error("Cannot get market price")
-                    return None
-                
-                if side.lower() == "buy":
-                    price = book["asks"][0]["price"] if book["asks"] else Decimal("0.5")
-                else:
-                    price = book["bids"][0]["price"] if book["bids"] else Decimal("0.5")
-            
-            # Create order arguments
-            order_args = OrderArgs(
-                token_id=token_id,
-                price=float(price),
-                size=float(size),
-                side=poly_side,
-                fee_rate_bps=0,  # Fee in basis points
-            )
-            
-            # Build and sign order
-            signed_order = self.client.create_order(order_args)
-            
-            # Submit order
-            response = self.client.post_order(signed_order, order_type=order_type)
-            
-            if response and "orderID" in response:
-                order_id = response["orderID"]
-                
-                logger.info(
-                    f"Order placed: {order_id} "
-                    f"{side.upper()} {size} @ {price:.4f}"
-                )
-                
-                return order_id
-            else:
-                logger.error(f"Order placement failed: {response}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Error placing order: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
+        raise RuntimeError(
+            "Legacy PolymarketClient live order submission is disabled; "
+            "use bot.py live order pipeline"
+        )
     
     async def cancel_order(self, order_id: str) -> bool:
         """

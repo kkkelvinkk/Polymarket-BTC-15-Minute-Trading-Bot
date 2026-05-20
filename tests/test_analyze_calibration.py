@@ -12,6 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 import analyze_calibration as ac
+import calibration_decision_join as cdj
 
 
 def _resolved_trade(order_id, conf, payout, pnl, size, entry, settled_at):
@@ -38,6 +39,41 @@ def _unresolved_trade():
         "size": "5",
         "entry_price": "0.5",
     }
+
+
+def _decision(decision_id, slug, confidence, direction, entry="0.55", cost="5.50"):
+    return {
+        "decision_id": decision_id,
+        "slug": slug,
+        "fused_confidence": confidence,
+        "fused_direction": direction,
+        "executable_entry": entry,
+        "estimated_actual_cost": cost,
+    }
+
+
+def _gamma_market(slug, winner, closed=True):
+    outcomes = ["Yes", "No"]
+    if winner == "long":
+        prices = ["1", "0"]
+    elif winner == "short":
+        prices = ["0", "1"]
+    else:
+        prices = ["0.5", "0.5"]
+    return {
+        "slug": slug,
+        "closed": closed,
+        "outcomes": json.dumps(outcomes),
+        "outcomePrices": json.dumps(prices),
+    }
+
+
+class _Resolver:
+    def __init__(self, markets):
+        self.markets = markets
+
+    def market_for_slug(self, slug):
+        return self.markets[slug]
 
 
 class IsResolvedTests(unittest.TestCase):
@@ -129,6 +165,201 @@ class AnalyzePathATests(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "non-positive size"):
             ac.analyze_path_a(ledger, self.fee, self.spread)
+
+
+class AnalyzePathBTests(unittest.TestCase):
+    def test_gamma_fetch_requests_closed_markets(self):
+        class _Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return [_gamma_market("slug-closed", "long")]
+
+        class _Client:
+            def __init__(self):
+                self.calls = []
+
+            def get(self, url, params):
+                self.calls.append((url, params))
+                return _Response()
+
+        client = _Client()
+
+        market = cdj.fetch_gamma_market_by_slug(client, "slug-closed")
+
+        self.assertEqual(market["slug"], "slug-closed")
+        self.assertEqual(
+            client.calls,
+            [
+                (
+                    cdj.GAMMA_MARKETS_URL,
+                    {"slug": "slug-closed", "closed": "true", "limit": 2},
+                )
+            ],
+        )
+
+    def test_gamma_fetch_returns_none_when_slug_has_no_closed_market(self):
+        class _Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return []
+
+        class _Client:
+            def get(self, url, params):
+                self.url = url
+                self.params = params
+                return _Response()
+
+        client = _Client()
+
+        market = cdj.fetch_gamma_market_by_slug(client, "slug-open")
+
+        self.assertIsNone(market)
+        self.assertEqual(client.url, cdj.GAMMA_MARKETS_URL)
+        self.assertEqual(client.params, {"slug": "slug-open", "closed": "true", "limit": 2})
+
+    def test_gamma_fetch_requires_exact_closed_slug_when_candidates_exist(self):
+        class _Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return [_gamma_market("different-closed-slug", "long")]
+
+        class _Client:
+            def get(self, url, params):
+                return _Response()
+
+        with self.assertRaisesRegex(ValueError, "no exact closed match"):
+            cdj.fetch_gamma_market_by_slug(_Client(), "requested-slug")
+
+    def test_joins_decisions_to_gamma_resolution_by_slug(self):
+        records = [
+            _decision("D1", "slug-a", 0.72, "bullish", entry="0.50", cost="5.00"),
+            _decision("D2", "slug-b", 0.68, "bearish", entry="0.55", cost="5.00"),
+        ]
+        resolver = _Resolver(
+            {
+                "slug-a": _gamma_market("slug-a", "long"),
+                "slug-b": _gamma_market("slug-b", "long"),
+            }
+        )
+        report = ac.analyze_path_b(records, resolver, Decimal("0.005"), Decimal("0.01"))
+
+        self.assertEqual(report["total_decision_records"], 2)
+        self.assertEqual(report["resolved_calibration_records"], 2)
+        self.assertIn(0.7, report["buckets"])
+        bucket = report["buckets"][0.7]
+        self.assertEqual(bucket["n"], 2)
+        self.assertAlmostEqual(bucket["win_rate"], 0.5)
+        self.assertEqual(bucket["entry_samples"], 2)
+        self.assertAlmostEqual(bucket["entry_win_rate"], 0.5)
+        self.assertAlmostEqual(bucket["weighted_avg_entry_price"], 0.525)
+        self.assertAlmostEqual(bucket["probability_edge"], -0.025)
+        self.assertAlmostEqual(
+            bucket["wilson_edge_after_buffers"],
+            bucket["entry_wilson_lower_bound_95"] - 0.525 - 0.005 - 0.01,
+        )
+
+    def test_includes_rejected_decisions_with_fused_signal(self):
+        record = _decision("D1", "slug-a", 0.71, "bullish")
+        record["rejected_at_gate"] = "trend_filter_neutral"
+        resolver = _Resolver({"slug-a": _gamma_market("slug-a", "long")})
+
+        report = ac.analyze_path_b([record], resolver, Decimal("0.005"), Decimal("0.01"))
+
+        self.assertEqual(report["resolved_calibration_records"], 1)
+        self.assertEqual(report["buckets"][0.7]["win_rate"], 1.0)
+
+    def test_excludes_pending_and_pre_fusion_records(self):
+        records = [
+            _decision("D1", "slug-open", 0.72, "bullish"),
+            _decision("D2", "slug-missing-fusion", None, None),
+            _decision("D3", None, 0.80, "bearish"),
+        ]
+        resolver = _Resolver({"slug-open": _gamma_market("slug-open", "long", closed=False)})
+
+        report = ac.analyze_path_b(records, resolver, Decimal("0.005"), Decimal("0.01"))
+
+        self.assertEqual(report["buckets"], {})
+        self.assertEqual(report["excluded_records"]["pending_market"], 1)
+        self.assertEqual(report["excluded_records"]["missing_fused_signal"], 1)
+        self.assertEqual(report["excluded_records"]["missing_market_slug"], 1)
+
+    def test_excludes_no_closed_gamma_match_as_pending_market(self):
+        records = [_decision("D1", "slug-open", 0.72, "bullish")]
+        resolver = _Resolver({"slug-open": None})
+
+        report = ac.analyze_path_b(records, resolver, Decimal("0.005"), Decimal("0.01"))
+
+        self.assertEqual(report["buckets"], {})
+        self.assertEqual(report["excluded_records"]["pending_market"], 1)
+        self.assertEqual(report["resolved_calibration_records"], 0)
+
+    def test_excludes_records_with_omitted_decision_fields(self):
+        records = [
+            {"decision_id": "D1", "fused_confidence": 0.72, "fused_direction": "bullish"},
+            {"decision_id": "D2", "slug": "slug-missing-fused"},
+            {
+                "slug": "slug-missing-entry",
+                "fused_confidence": 0.74,
+                "fused_direction": "bullish",
+            },
+        ]
+        resolver = _Resolver(
+            {"slug-missing-entry": _gamma_market("slug-missing-entry", "long")}
+        )
+
+        report = ac.analyze_path_b(records, resolver, Decimal("0.005"), Decimal("0.01"))
+
+        self.assertEqual(report["total_decision_records"], 3)
+        self.assertEqual(report["resolved_calibration_records"], 1)
+        self.assertEqual(report["excluded_records"]["missing_market_slug"], 1)
+        self.assertEqual(report["excluded_records"]["missing_fused_signal"], 1)
+        self.assertEqual(report["excluded_records"]["missing_entry_metrics"], 1)
+        self.assertEqual(report["buckets"][0.7]["entry_samples"], 0)
+        self.assertIsNone(report["buckets"][0.7]["entry_win_rate"])
+        self.assertIsNone(report["buckets"][0.7]["probability_edge"])
+        self.assertIsNone(report["buckets"][0.7]["wilson_edge_after_buffers"])
+
+    def test_path_b_edge_metrics_use_entry_complete_cohort(self):
+        entry_missing_winner = _decision(
+            "D1", "slug-missing-entry-winner", 0.72, "bullish"
+        )
+        entry_missing_winner.pop("executable_entry")
+        entry_missing_winner.pop("estimated_actual_cost")
+        records = [
+            entry_missing_winner,
+            _decision("D2", "slug-entry-loser", 0.73, "bearish", entry="0.55", cost="5.00"),
+        ]
+        resolver = _Resolver(
+            {
+                "slug-missing-entry-winner": _gamma_market(
+                    "slug-missing-entry-winner", "long"
+                ),
+                "slug-entry-loser": _gamma_market("slug-entry-loser", "long"),
+            }
+        )
+
+        report = ac.analyze_path_b(records, resolver, Decimal("0.005"), Decimal("0.01"))
+
+        bucket = report["buckets"][0.7]
+        self.assertEqual(bucket["n"], 2)
+        self.assertAlmostEqual(bucket["win_rate"], 0.5)
+        self.assertEqual(bucket["entry_samples"], 1)
+        self.assertAlmostEqual(bucket["entry_win_rate"], 0.0)
+        self.assertAlmostEqual(bucket["weighted_avg_entry_price"], 0.55)
+        self.assertAlmostEqual(bucket["probability_edge"], -0.55)
+
+    def test_closed_market_without_one_winner_raises(self):
+        record = _decision("D1", "slug-bad", 0.72, "bullish")
+        resolver = _Resolver({"slug-bad": _gamma_market("slug-bad", "none")})
+
+        with self.assertRaisesRegex(ValueError, "no winning outcome"):
+            ac.analyze_path_b([record], resolver, Decimal("0.005"), Decimal("0.01"))
 
 
 class GateThreeCheckTests(unittest.TestCase):

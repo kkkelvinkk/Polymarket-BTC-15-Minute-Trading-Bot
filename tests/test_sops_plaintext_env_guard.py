@@ -9,6 +9,8 @@ from sops_plaintext_env_guard import (
     refuse_plaintext_env_in_live_mode,
 )
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 class IsLiveInvocationTests(unittest.TestCase):
     def test_live_flag_in_argv(self):
@@ -109,6 +111,41 @@ class RefusePlaintextEnvTests(unittest.TestCase):
                 os.environ.pop("BOT_LIVE_MODE", None)
             else:
                 os.environ["BOT_LIVE_MODE"] = original
+
+
+class DeployServiceTests(unittest.TestCase):
+    def test_service_template_uses_sops_exec_env_by_default(self):
+        service = (REPO_ROOT / "deploy" / "polybot.service").read_text(encoding="utf-8")
+
+        self.assertIn("sops exec-env", service)
+        self.assertIn("ExecStart=/usr/local/bin/sops exec-env", service)
+        self.assertNotIn("\nEnvironmentFile=", service)
+
+    def test_deploy_readme_first_run_uses_sops_secret_file(self):
+        readme = (REPO_ROOT / "deploy" / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn("/opt/polybot/secrets/.env.sops.yaml", readme)
+        self.assertNotIn(
+            "/opt/polybot/Polymarket-BTC-15-Minute-Trading-Bot/.env",
+            readme,
+        )
+        self.assertIn("Repo-root plaintext `.env` files are simulation-only", readme)
+
+    def test_top_level_docs_scope_plaintext_env_to_local_simulation(self):
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+
+        self.assertIn("Repo-root plaintext `.env` is for local simulation/test-mode", readme)
+        self.assertIn("/opt/polybot/secrets/.env.sops.yaml", readme)
+        self.assertIn("Live deployments must use SOPS", env_example)
+        self.assertIn("Live mode refuses repo-root plaintext `.env`", env_example)
+
+    def test_execution_plan_security_checklist_uses_sops_secret_file(self):
+        plan = (REPO_ROOT / "EXECUTION_PLAN.md").read_text(encoding="utf-8")
+
+        self.assertIn("/opt/polybot/secrets/.env.sops.yaml", plan)
+        self.assertNotIn("Polymarket private key in `.env`", plan)
+        self.assertNotIn("`.env` file mode `0600", plan)
 
 
 if __name__ == "__main__":

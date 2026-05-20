@@ -26,9 +26,9 @@ Usage::
 Outputs a per-bucket table plus a final pass/fail summary against the
 three gates. **Decision-only**: the script never modifies the ledger.
 
-This script ships even before ``decisions.jsonl`` has accumulated Path B
-data — it reports the Path A view alone, and explicitly says "Path B not
-yet wired" if no ``decisions.jsonl`` is provided.
+When ``--decisions`` is supplied, the script also performs Path B: it joins
+``decisions.jsonl`` records to Polymarket Gamma market resolutions by slug and
+reports confidence-bucket calibration across accepted and rejected decisions.
 """
 
 from __future__ import annotations
@@ -41,6 +41,14 @@ from collections import defaultdict
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+
+import httpx
+
+from calibration_decision_join import (
+    GammaResolutionResolver,
+    analyze_path_b,
+    load_decision_records,
+)
 
 
 RESOLVED_SOURCES = ("auto_redeem", "late_auto_redeem", "manual_reconciliation")
@@ -244,6 +252,22 @@ def gate_three_check(buckets: dict) -> tuple[bool, list[str]]:
     return False, reasons
 
 
+def path_b_sample_check(buckets: dict) -> tuple[bool, list[str]]:
+    passing_buckets = [
+        bucket for bucket, stats in buckets.items() if stats["n"] >= 200
+    ]
+    if passing_buckets:
+        return True, [f"Path B buckets with n>=200: {sorted(passing_buckets)}"]
+    return False, ["no Path B confidence bucket has n>=200 resolved decisions yet"]
+
+
+def _format_optional_float(value: Any, width: int, precision: int = 4, signed: bool = False) -> str:
+    if value is None:
+        return "NA".rjust(width)
+    sign = "+" if signed else ""
+    return f"{value:{sign}{width}.{precision}f}"
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Calibration analysis")
     parser.add_argument("--ledger", required=True, help="Path to live_trades.json")
@@ -312,19 +336,64 @@ def main(argv=None) -> int:
     if args.decisions:
         decisions_path = Path(args.decisions)
         if not decisions_path.exists():
-            print(f"\nPath B — decisions.jsonl not found at {decisions_path}; skipped.")
+            print(f"\nERROR: decisions.jsonl not found at {decisions_path}", file=sys.stderr)
+            return 2
         else:
-            count = sum(1 for _ in open(decisions_path, "r", encoding="utf-8"))
+            decision_records = load_decision_records(decisions_path)
+            with httpx.Client(timeout=20.0) as client:
+                resolver = GammaResolutionResolver(client)
+                path_b_report = analyze_path_b(
+                    decision_records,
+                    resolver,
+                    fee_buffer,
+                    spread_buffer,
+                )
+            print(f"\nPath B — decisions.jsonl joined to Polymarket Gamma resolutions from {decisions_path}")
+            print(f"  total decision records: {path_b_report['total_decision_records']}")
+            print(f"  resolved calibration records: {path_b_report['resolved_calibration_records']}")
+            print("  excluded records:")
+            for reason, count in path_b_report["excluded_records"].items():
+                print(f"    {reason}: {count}")
+            if not path_b_report["buckets"]:
+                print("  No resolved decision observations yet; nothing to bucket.")
+            else:
+                cols = (
+                    ("conf", 6), ("n", 5), ("win_rate", 9), ("wilson_lo", 10),
+                    ("entry_n", 8), ("entry_win", 9), ("entry_wil", 9),
+                    ("w_avg_entry", 12), ("prob_edge", 11), ("wilson_edge", 12),
+                    ("brier", 8), ("log_loss", 9),
+                )
+                header = " ".join(name.rjust(width) for name, width in cols)
+                print("  " + header)
+                for bucket in sorted(path_b_report["buckets"]):
+                    s = path_b_report["buckets"][bucket]
+                    row = (
+                        f"{bucket:6.1f}",
+                        f"{s['n']:5d}",
+                        f"{s['win_rate']:9.1%}",
+                        f"{s['wilson_lower_bound_95']:10.4f}",
+                        f"{s['entry_samples']:8d}",
+                        _format_optional_float(s["entry_win_rate"], 9),
+                        _format_optional_float(s["entry_wilson_lower_bound_95"], 9),
+                        _format_optional_float(s["weighted_avg_entry_price"], 12),
+                        _format_optional_float(s["probability_edge"], 11, signed=True),
+                        _format_optional_float(s["wilson_edge_after_buffers"], 12, signed=True),
+                        f"{s['brier']:8.4f}",
+                        f"{s['log_loss']:9.4f}",
+                    )
+                    print("  " + " ".join(row))
+            passed_b, reasons_b = path_b_sample_check(path_b_report["buckets"])
             print(
-                f"\nPath B — found {count} decision records in {decisions_path}. "
-                "Joining against Polymarket historical resolutions is not yet "
-                "implemented in this script; ship that join in a follow-up."
+                "Path B sample gate: "
+                f"{'PASS' if passed_b else 'FAIL / INSUFFICIENT DATA'}"
             )
+            for reason in reasons_b:
+                print(f"  - {reason}")
     else:
         print(
             "\nPath B not provided. Pass --decisions /path/to/decisions.jsonl "
-            "to inspect the unbiased decision-observation set (currently produced "
-            "only when decision logging lands on _make_trading_decision)."
+            "to join the unbiased decision-observation set against Polymarket "
+            "historical resolutions."
         )
     return 0
 

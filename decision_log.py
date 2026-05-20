@@ -126,6 +126,12 @@ class DecisionRecord:
             "yes_ask": None,
             "no_ask": None,
             "model_signals": None,
+            "sizing_mode": None,
+            "resolved_trade_usd": None,
+            "free_collateral_at_decision": None,
+            "account_state_age_seconds": None,
+            "account_state_sequence": None,
+            "balance_stale_reason": None,
         }
 
     def update(self, **kwargs: Any) -> None:

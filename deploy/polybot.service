@@ -14,8 +14,8 @@
 # guarantee. After a failure, the operator must inspect the journal, reconcile
 # any unresolved ledger state, and then ``systemctl start polybot`` explicitly.
 #
-# If switching to SOPS, comment out the EnvironmentFile and
-# ExecStart lines below and uncomment the sops exec-env variants.
+# Live mode refuses repo-root plaintext .env before dotenv loading. Keep live
+# credentials in the SOPS file referenced by ExecStart.
 
 [Unit]
 Description=Polymarket BTC 15-Min Trading Bot
@@ -28,20 +28,14 @@ User=polybot
 Group=polybot
 WorkingDirectory=/opt/polybot/Polymarket-BTC-15-Minute-Trading-Bot
 
-# --- Env loading: pick ONE of the two stanzas below ---
-
-# Pre-SOPS (plaintext .env, NOT recommended for production secrets):
-EnvironmentFile=/opt/polybot/Polymarket-BTC-15-Minute-Trading-Bot/.env
-
-# Post-SOPS (preferred for production after SOPS is adopted):
-#ExecStart=/usr/local/bin/sops exec-env /opt/polybot/secrets/.env.sops.yaml \
-#  '/opt/polybot/venv/bin/python bot.py --live --confirm-live'
+# Plaintext .env launches are blocked in live mode. Do not enable
+# EnvironmentFile=/opt/polybot/Polymarket-BTC-15-Minute-Trading-Bot/.env
 
 Environment=LIVE_TRADE_LEDGER_PATH=/opt/polybot/ledger/live_trades.json
 Environment=NAUTILUS_LOG_DIR=/opt/polybot/logs/nautilus
 Environment=DECISION_LOG_PATH=/opt/polybot/ledger/decisions.jsonl
 
-ExecStart=/opt/polybot/venv/bin/python bot.py --live --confirm-live
+ExecStart=/usr/local/bin/sops exec-env /opt/polybot/secrets/.env.sops.yaml '/opt/polybot/venv/bin/python bot.py --live --confirm-live'
 
 Restart=no
 

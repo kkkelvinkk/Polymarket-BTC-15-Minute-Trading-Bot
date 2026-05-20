@@ -13,12 +13,14 @@ automatically — the operator copies them into place on the target server.
 │   ├── bot.py
 │   ├── mark_settlement_resolved.py
 │   ├── ...
-│   └── .env                                    # mode 0600 polybot:polybot (or use SOPS, see below)
+│   └── ...                                    # no repo-root plaintext .env in live mode
 ├── ledger/
 │   ├── live_trades.json                        # mode 0640 polybot:polybot
 │   ├── live_trades.json.lock                   # fcntl lock file
 │   ├── decisions.jsonl                         # Phase 2.4 observation log
 │   └── archive/                                # rotated decisions.jsonl
+├── secrets/
+│   └── .env.sops.yaml                          # encrypted live env, mode 0600
 └── logs/
     ├── bot.log                                 # logrotated
     └── nautilus/                               # Nautilus TradingNode logs
@@ -34,7 +36,7 @@ separate mount.
 # As root
 useradd --system --home /opt/polybot --shell /usr/sbin/nologin polybot
 install -d -o polybot -g polybot -m 750 /opt/polybot
-install -d -o polybot -g polybot -m 750 /opt/polybot/ledger /opt/polybot/logs
+install -d -o polybot -g polybot -m 750 /opt/polybot/ledger /opt/polybot/logs /opt/polybot/secrets
 
 # As polybot
 sudo -u polybot bash -c '
@@ -46,9 +48,9 @@ sudo -u polybot bash -c '
   ../venv/bin/pip install -r requirements.txt
 '
 
-# Place credentials (do NOT commit; mode 0600)
-sudo -u polybot install -m 0600 /path/to/your/real/.env \
-  /opt/polybot/Polymarket-BTC-15-Minute-Trading-Bot/.env
+# Place encrypted live credentials (do NOT commit; mode 0600)
+sudo -u polybot install -m 0600 /path/to/your/real/.env.sops.yaml \
+  /opt/polybot/secrets/.env.sops.yaml
 
 # Install systemd unit + logrotate + backup cron
 sudo cp deploy/polybot.service /etc/systemd/system/polybot.service
@@ -70,9 +72,10 @@ sudo systemctl enable polybot
    `mark_settlement_resolved.py` BEFORE starting the service. The
    service will refuse to place new orders while any unresolved ledger
    state exists.
-4. **Verify env values.** `MARKET_BUY_USD > 5.50` strictly. `--confirm-live`
-   is set in the unit file's `ExecStart` so the bot doesn't prompt for `LIVE`
-   at startup.
+4. **Verify env values.** `SIZING_MODE`, `MAX_ACCOUNT_STATE_AGE_SECONDS`,
+   `BALANCE_SAFETY_BUFFER_USD`, and `NAUTILUS_LOG_DIR` must be explicit. For
+   fixed sizing, `MARKET_BUY_USD > 5.50` strictly. `--confirm-live` is set in
+   the unit file's `ExecStart` so the bot doesn't prompt for `LIVE` at startup.
 
 ## Operate
 
@@ -113,8 +116,10 @@ Wire that into your Grafana instance if available.
 
 ## Security checklist
 
-- `.env` (or `.env.sops.yaml`) mode `0600 polybot:polybot`. Never commit
-  real credentials.
+- `/opt/polybot/secrets/.env.sops.yaml` mode `0600 polybot:polybot`.
+  Never commit real credentials.
+- Repo-root plaintext `.env` files are simulation-only and must not be present
+  on the live server.
 - Bot user has no shell (`/usr/sbin/nologin`). Operator interacts via
   `systemctl`, `journalctl`, and `mark_settlement_resolved.py` over SSH only.
 - Firewall: outbound to `clob.polymarket.com:443`,
@@ -124,15 +129,22 @@ Wire that into your Grafana instance if available.
 - The `mark_settlement_resolved.py` tool requires shell access to the
   server. Restrict SSH accordingly.
 
-## SOPS (Phase 6, when adopted)
+## SOPS (Phase 6)
 
-If the team adopts SOPS for credential management:
+Live mode is wired for SOPS credential management:
 
-1. Encrypt `.env` as `/opt/polybot/secrets/.env.sops.yaml` with your team's
-   key (age, gcpkms, awskms, etc. — see `sops --help`).
-2. Edit `/etc/systemd/system/polybot.service`: comment out the
-   `EnvironmentFile=` line and uncomment the `sops exec-env` ExecStart line.
+1. Encrypt a plaintext source kept outside the live repo as
+   `/opt/polybot/secrets/.env.sops.yaml` with your team's key (age, gcpkms,
+   awskms, etc. — see `sops --help`).
+2. Keep `/etc/systemd/system/polybot.service` on the shipped `sops exec-env`
+   `ExecStart=` line.
 3. Reload and restart: `sudo systemctl daemon-reload && sudo systemctl restart polybot`.
+
+`bot.py` now runs the plaintext `.env` guard before dotenv loading and skips
+`load_dotenv()` entirely in live mode. Live mode refuses to start when a
+repo-root plaintext `.env` is present. Launch live SOPS runs through
+`sops exec-env` with `NAUTILUS_LOG_DIR` supplied in the encrypted environment
+or the systemd unit.
 
 See `deploy/.env.sops.yaml.example` for the encrypted-credentials shape.
 

@@ -2,25 +2,18 @@
 SOPS credential management guard (Pattern A).
 
 This module ships the "refuse plaintext .env in live mode" check from
-EXECUTION_PLAN.md as a standalone callable. It is NOT wired into
-``bot.py`` import-time yet — the plan explicitly requires operator approval
-before changing live-mode env-loading behavior, since current operators run
-with plaintext ``.env`` files and switching them off without warning would
-break their workflow.
+EXECUTION_PLAN.md as a standalone callable. ``bot.py`` calls it at import time
+BEFORE ``load_dotenv()`` runs::
 
-When the operator decides to adopt SOPS, the integration is a one-liner near
-the top of ``bot.py``, BEFORE ``load_dotenv()`` runs::
-
-    # === SOPS plaintext-env guard (operator-opted-in via repo edit) ===
     from sops_plaintext_env_guard import refuse_plaintext_env_in_live_mode
     refuse_plaintext_env_in_live_mode(repo_root=Path(__file__).parent)
 
 The plan's "Pattern A" is implemented here: check ``--live`` argument
-presence at module-import time, before ``load_dotenv()``. If both
-``--live`` and a plaintext ``.env`` are present at the repo root, refuse to
-start. The operator-supplied alternative is to inject credentials via
-``sops exec-env`` so the process environment already has the values when
-``load_dotenv()`` is skipped.
+presence at module-import time, before dotenv loading. Live mode then skips
+``load_dotenv()`` entirely. If both ``--live`` and a plaintext ``.env`` are
+present at the repo root, refuse to start. The operator-supplied alternative
+is to inject credentials via ``sops exec-env`` so the process environment
+already has the values.
 """
 
 from __future__ import annotations
@@ -34,7 +27,7 @@ from typing import Iterable
 _DEFAULT_LIVE_FLAGS = ("--live",)
 
 
-def _is_live_invocation(argv: Iterable[str] | None = None) -> bool:
+def is_live_invocation(argv: Iterable[str] | None = None) -> bool:
     """Return True if the process is being launched in live mode.
 
     Reads from ``sys.argv`` by default. The operator can also set
@@ -49,6 +42,9 @@ def _is_live_invocation(argv: Iterable[str] | None = None) -> bool:
     if os.getenv("BOT_LIVE_MODE", "").strip().lower() in {"1", "true", "yes", "on"}:
         return True
     return False
+
+
+_is_live_invocation = is_live_invocation
 
 
 def refuse_plaintext_env_in_live_mode(
@@ -70,7 +66,7 @@ def refuse_plaintext_env_in_live_mode(
     Does NOT inspect simulation-mode invocations; plaintext ``.env`` is
     still acceptable for ``--test-mode`` and default simulation.
     """
-    if not _is_live_invocation(argv):
+    if not is_live_invocation(argv):
         return
 
     env_path = repo_root / ".env"
