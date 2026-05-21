@@ -249,6 +249,7 @@ def _install_bot_dependency_stubs():
     )
     _install_module(
         "core.strategy_brain.fusion_engine.signal_fusion",
+        SignalFusionEngine=_DummyFusion,
         get_fusion_engine=_DummyFusion,
     )
     _install_module(
@@ -301,6 +302,9 @@ class SimulationModeSafetyTests(unittest.TestCase):
         self._original_market_buy_usd = os.environ.get("MARKET_BUY_USD")
         self._original_max_position_size = os.environ.get("MAX_POSITION_SIZE")
         self._original_max_account_state_age_seconds = os.environ.get("MAX_ACCOUNT_STATE_AGE_SECONDS")
+        self._original_max_decision_snapshot_age_seconds = os.environ.get(
+            "MAX_DECISION_SNAPSHOT_AGE_SECONDS"
+        )
         self._original_balance_safety_buffer_usd = os.environ.get("BALANCE_SAFETY_BUFFER_USD")
         self._original_nautilus_log_dir = os.environ.get("NAUTILUS_LOG_DIR")
         self._original_quote_stability_required = os.environ.get("QUOTE_STABILITY_REQUIRED")
@@ -313,6 +317,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
         os.environ["MARKET_BUY_USD"] = "5.51"
         os.environ["MAX_POSITION_SIZE"] = "5.51"
         os.environ["MAX_ACCOUNT_STATE_AGE_SECONDS"] = "30"
+        os.environ["MAX_DECISION_SNAPSHOT_AGE_SECONDS"] = "10"
         os.environ["BALANCE_SAFETY_BUFFER_USD"] = "0.00"
         os.environ["NAUTILUS_LOG_DIR"] = "/tmp/nautilus-test-logs"
         os.environ["QUOTE_STABILITY_REQUIRED"] = "3"
@@ -359,6 +364,12 @@ class SimulationModeSafetyTests(unittest.TestCase):
             os.environ.pop("MAX_ACCOUNT_STATE_AGE_SECONDS", None)
         else:
             os.environ["MAX_ACCOUNT_STATE_AGE_SECONDS"] = self._original_max_account_state_age_seconds
+        if self._original_max_decision_snapshot_age_seconds is None:
+            os.environ.pop("MAX_DECISION_SNAPSHOT_AGE_SECONDS", None)
+        else:
+            os.environ["MAX_DECISION_SNAPSHOT_AGE_SECONDS"] = (
+                self._original_max_decision_snapshot_age_seconds
+            )
         if self._original_balance_safety_buffer_usd is None:
             os.environ.pop("BALANCE_SAFETY_BUFFER_USD", None)
         else:
@@ -461,6 +472,48 @@ class SimulationModeSafetyTests(unittest.TestCase):
     def _track_strategy(self, strategy):
         self._strategies.append(strategy)
         return strategy
+
+    def _decision_snapshot(self, strategy, current_price, rec):
+        return strategy._capture_decision_input_snapshot(
+            current_price,
+            rec.fields["decision_id"],
+        )
+
+    def _live_order_snapshot_kwargs(
+        self,
+        *,
+        direction="long",
+        condition_id="conditionliveorder",
+        yes_token_id="yestoken",
+        no_token_id="notoken",
+        yes_instrument_id=None,
+        no_instrument_id=None,
+        derive_yes_instrument=True,
+        derive_no_instrument=True,
+        quoted_price=Decimal("0.62"),
+        decision_stable_tick_count=3,
+    ):
+        if derive_yes_instrument and yes_instrument_id is None:
+            yes_instrument_id = f"{condition_id}-{yes_token_id}.POLYMARKET"
+        if derive_no_instrument and no_instrument_id is None:
+            no_instrument_id = f"{condition_id}-{no_token_id}.POLYMARKET"
+        return {
+            "market_meta": {
+                "slug": f"slug-{condition_id}",
+                "condition_id": condition_id,
+                "yes_token_id": yes_token_id,
+                "no_token_id": no_token_id,
+                "yes_instrument_id": yes_instrument_id,
+                "no_instrument_id": no_instrument_id,
+                "start_time": datetime.now(timezone.utc).isoformat(),
+                "end_time": (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(),
+            },
+            "quoted_price": quoted_price,
+            "price_source": "YES ask" if direction == "long" else "NO ask",
+            "decision_stable_tick_count": decision_stable_tick_count,
+            "decision_reference_time": datetime.now(timezone.utc),
+            "decision_record": self.bot.DecisionRecord(current_price=quoted_price),
+        }
 
     def test_strategy_defaults_to_simulation_without_redis(self):
         strategy = self._track_strategy(
@@ -749,6 +802,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
                     current_price=0.5,
                     direction="long",
                     order_type=self.bot.ORDER_TYPE_MARKET_IOC,
+                    **self._live_order_snapshot_kwargs(direction="long"),
                 )
             )
             self.assertFalse(result)
@@ -1853,6 +1907,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
                     current_price=Decimal("0.62"),
                     direction="long",
                     order_type=self.bot.ORDER_TYPE_MARKET_IOC,
+                    **self._live_order_snapshot_kwargs(direction="long"),
                 )
             )
         finally:
@@ -2118,6 +2173,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
                     current_price=0.5,
                     direction="long",
                     order_type=self.bot.ORDER_TYPE_MARKET_IOC,
+                    **self._live_order_snapshot_kwargs(direction="long"),
                 )
             )
             self.assertFalse(result)
@@ -2156,6 +2212,11 @@ class SimulationModeSafetyTests(unittest.TestCase):
                     current_price=0.5,
                     direction="short",  # forces the no_id is None branch
                     order_type=self.bot.ORDER_TYPE_MARKET_IOC,
+                    **self._live_order_snapshot_kwargs(
+                        direction="short",
+                        derive_no_instrument=False,
+                        quoted_price=Decimal("0.40"),
+                    ),
                 )
             )
             self.assertFalse(result)
@@ -2239,6 +2300,13 @@ class SimulationModeSafetyTests(unittest.TestCase):
                     accepted_limit_price=Decimal("0.62"),
                     submitted_limit_price=Decimal("0.62"),
                     limit_order_token_qty=Decimal("8.887096"),
+                    **self._live_order_snapshot_kwargs(
+                        direction="long",
+                        condition_id=condition_id,
+                        yes_token_id=yes_token_id,
+                        no_token_id=no_token_id,
+                        yes_instrument_id=yes_instrument_id,
+                    ),
                 )
             )
         finally:
@@ -2312,6 +2380,12 @@ class SimulationModeSafetyTests(unittest.TestCase):
                         current_price=Decimal("0.62"),
                         direction="long",
                         order_type=self.bot.ORDER_TYPE_MARKET_IOC,
+                        **self._live_order_snapshot_kwargs(
+                            direction="long",
+                            condition_id=condition_id,
+                            yes_token_id=yes_token_id,
+                            yes_instrument_id=yes_instrument_id,
+                        ),
                     )
                 )
         finally:
@@ -2388,6 +2462,13 @@ class SimulationModeSafetyTests(unittest.TestCase):
                         current_price=Decimal("0.62"),
                         direction="long",
                         order_type=self.bot.ORDER_TYPE_MARKET_IOC,
+                        **self._live_order_snapshot_kwargs(
+                            direction="long",
+                            condition_id=condition_id,
+                            yes_token_id=yes_token_id,
+                            no_token_id=no_token_id,
+                            yes_instrument_id=yes_instrument_id,
+                        ),
                     )
                 )
         finally:
@@ -2460,6 +2541,13 @@ class SimulationModeSafetyTests(unittest.TestCase):
                     current_price=Decimal("0.62"),
                     direction="long",
                     order_type=self.bot.ORDER_TYPE_MARKET_IOC,
+                    **self._live_order_snapshot_kwargs(
+                        direction="long",
+                        condition_id=condition_id,
+                        yes_token_id="yestoken",
+                        no_token_id="notoken",
+                        yes_instrument_id=strategy.instrument_id,
+                    ),
                 )
             )
         finally:
@@ -2530,6 +2618,15 @@ class SimulationModeSafetyTests(unittest.TestCase):
                     current_price=Decimal("0.62"),
                     direction="short",
                     order_type=self.bot.ORDER_TYPE_MARKET_IOC,
+                    **self._live_order_snapshot_kwargs(
+                        direction="short",
+                        condition_id=condition_id,
+                        yes_token_id="yestoken",
+                        no_token_id="notoken",
+                        yes_instrument_id=strategy.instrument_id,
+                        no_instrument_id=strategy._no_instrument_id,
+                        quoted_price=Decimal("0.40"),
+                    ),
                 )
             )
         finally:
@@ -2612,6 +2709,13 @@ class SimulationModeSafetyTests(unittest.TestCase):
                     accepted_limit_price=Decimal("0.62"),
                     submitted_limit_price=Decimal("0.63"),
                     limit_order_token_qty=Decimal("8.887096"),
+                    **self._live_order_snapshot_kwargs(
+                        direction="long",
+                        condition_id=condition_id,
+                        yes_token_id=yes_token_id,
+                        no_token_id=no_token_id,
+                        yes_instrument_id=yes_instrument_id,
+                    ),
                 )
             )
         finally:
@@ -2694,6 +2798,13 @@ class SimulationModeSafetyTests(unittest.TestCase):
                     accepted_limit_price=Decimal("0.62"),
                     submitted_limit_price=Decimal("0.62"),
                     limit_order_token_qty=Decimal("8.887097"),
+                    **self._live_order_snapshot_kwargs(
+                        direction="long",
+                        condition_id=condition_id,
+                        yes_token_id=yes_token_id,
+                        no_token_id=no_token_id,
+                        yes_instrument_id=yes_instrument_id,
+                    ),
                 )
             )
         finally:
@@ -2736,15 +2847,18 @@ class SimulationModeSafetyTests(unittest.TestCase):
             direction=types.SimpleNamespace(value="bullish"),
             score=77,
             confidence=0.67,
+            metadata={"test_signal": "limit_ioc"},
         )
-        strategy._process_signals = lambda _current_price, _metadata: [fused]
+        strategy._process_signals = (
+            lambda _snapshot, _metadata, *, observation_only=False: [fused]
+        )
         strategy.fusion_engine = types.SimpleNamespace(
             fuse_signals=lambda _signals, min_signals, min_score: fused
         )
 
-        async def _market_context(_current_price):
+        async def _market_context(_snapshot, *, observation_only=False):
             return {
-                "deviation": 0.0,
+                "context_sma20_deviation": 0.0,
                 "momentum": 0.0,
                 "volatility": 0.0,
                 "tick_buffer": [],
@@ -2803,7 +2917,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
             rec = self.bot.DecisionRecord(current_price=Decimal("0.70"))
             result = asyncio.run(
                 strategy._make_trading_decision_body(
-                    Decimal("0.70"),
+                    self._decision_snapshot(strategy, Decimal("0.70"), rec),
                     trade_key=("unit", 1),
                     is_simulation=False,
                     rec=rec,
@@ -2858,15 +2972,18 @@ class SimulationModeSafetyTests(unittest.TestCase):
             direction=types.SimpleNamespace(value="bullish"),
             score=77,
             confidence=0.67,
+            metadata={"test_signal": "missing_depth_cost"},
         )
-        strategy._process_signals = lambda _current_price, _metadata: [fused]
+        strategy._process_signals = (
+            lambda _snapshot, _metadata, *, observation_only=False: [fused]
+        )
         strategy.fusion_engine = types.SimpleNamespace(
             fuse_signals=lambda _signals, min_signals, min_score: fused
         )
 
-        async def _market_context(_current_price):
+        async def _market_context(_snapshot, *, observation_only=False):
             return {
-                "deviation": 0.0,
+                "context_sma20_deviation": 0.0,
                 "momentum": 0.0,
                 "volatility": 0.0,
                 "tick_buffer": [],
@@ -2924,7 +3041,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "actual_cost must be explicit"):
                 asyncio.run(
                     strategy._make_trading_decision_body(
-                        Decimal("0.70"),
+                        self._decision_snapshot(strategy, Decimal("0.70"), rec),
                         trade_key=("unit", 1),
                         is_simulation=False,
                         rec=rec,
@@ -2959,15 +3076,18 @@ class SimulationModeSafetyTests(unittest.TestCase):
             direction=types.SimpleNamespace(value="bullish"),
             score=77,
             confidence=0.67,
+            metadata={"test_signal": "shadow_policy"},
         )
-        strategy._process_signals = lambda _current_price, _metadata: [fused]
-        strategy.fusion_engine = types.SimpleNamespace(
+        strategy._process_signals = (
+            lambda _snapshot, _metadata, *, observation_only=False: [fused]
+        )
+        strategy._shadow_fusion_engine = types.SimpleNamespace(
             fuse_signals=lambda _signals, min_signals, min_score: fused
         )
 
-        async def _market_context(_current_price):
+        async def _market_context(_snapshot, *, observation_only=False):
             return {
-                "deviation": 0.0,
+                "context_sma20_deviation": 0.0,
                 "momentum": 0.0,
                 "volatility": 0.0,
                 "tick_buffer": [],
@@ -3022,7 +3142,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
             )
             result = asyncio.run(
                 strategy._make_trading_decision_body(
-                    Decimal("0.70"),
+                    self._decision_snapshot(strategy, Decimal("0.70"), rec),
                     trade_key=None,
                     is_simulation=False,
                     rec=rec,
@@ -3075,7 +3195,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
             )
             result = asyncio.run(
                 strategy._make_trading_decision_body(
-                    Decimal("0.70"),
+                    self._decision_snapshot(strategy, Decimal("0.70"), rec),
                     trade_key=None,
                     is_simulation=False,
                     rec=rec,
@@ -3116,15 +3236,18 @@ class SimulationModeSafetyTests(unittest.TestCase):
             direction=types.SimpleNamespace(value="bullish"),
             score=77,
             confidence=0.67,
+            metadata={"test_signal": "shadow_percent"},
         )
-        strategy._process_signals = lambda _current_price, _metadata: [fused]
-        strategy.fusion_engine = types.SimpleNamespace(
+        strategy._process_signals = (
+            lambda _snapshot, _metadata, *, observation_only=False: [fused]
+        )
+        strategy._shadow_fusion_engine = types.SimpleNamespace(
             fuse_signals=lambda _signals, min_signals, min_score: fused
         )
 
-        async def _market_context(_current_price):
+        async def _market_context(_snapshot, *, observation_only=False):
             return {
-                "deviation": 0.0,
+                "context_sma20_deviation": 0.0,
                 "momentum": 0.0,
                 "volatility": 0.0,
                 "tick_buffer": [],
@@ -3182,7 +3305,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
             )
             result = asyncio.run(
                 strategy._make_trading_decision_body(
-                    Decimal("0.70"),
+                    self._decision_snapshot(strategy, Decimal("0.70"), rec),
                     trade_key=None,
                     is_simulation=False,
                     rec=rec,
@@ -3219,9 +3342,13 @@ class SimulationModeSafetyTests(unittest.TestCase):
 
         strategy._decision_in_progress = True
         strategy._make_trading_decision = _record_call
+        snapshot = strategy._capture_decision_input_snapshot(
+            Decimal("0.70"),
+            "decision-shadow-sync",
+        )
 
         strategy._make_trading_decision_sync(
-            0.70,
+            snapshot,
             trade_key=None,
             strategy_observation_mode="shadow_policy",
         )
@@ -3239,15 +3366,19 @@ class SimulationModeSafetyTests(unittest.TestCase):
         )
         calls = []
 
-        async def _record_body(current_price, trade_key, is_simulation, rec, observation_only=False):
-            calls.append((current_price, trade_key, is_simulation, rec, observation_only))
+        async def _record_body(decision_snapshot, trade_key, is_simulation, rec, observation_only=False):
+            calls.append((decision_snapshot, trade_key, is_simulation, rec, observation_only))
             return True
 
         strategy._make_trading_decision_body = _record_body
+        snapshot = strategy._capture_decision_input_snapshot(
+            Decimal("0.70"),
+            "decision-shadow-wrapper",
+        )
 
         result = asyncio.run(
             strategy._make_trading_decision(
-                Decimal("0.70"),
+                snapshot,
                 trade_key=None,
                 strategy_observation_mode="shadow_policy",
             )
@@ -3313,7 +3444,11 @@ class SimulationModeSafetyTests(unittest.TestCase):
         try:
             sys.modules[news_module_name] = news_module
             sys.modules[coinbase_module_name] = coinbase_module
-            metadata = asyncio.run(strategy._fetch_market_context(Decimal("0.60")))
+            snapshot = strategy._capture_decision_input_snapshot(
+                Decimal("0.60"),
+                "decision-context",
+            )
+            metadata = asyncio.run(strategy._fetch_market_context(snapshot))
         finally:
             if original_news_module is None:
                 sys.modules.pop(news_module_name, None)
@@ -3327,6 +3462,8 @@ class SimulationModeSafetyTests(unittest.TestCase):
         self.assertEqual(metadata["yes_token_id"], "market-yes-token")
         self.assertEqual(metadata["yes_order_book"]["token_id"], "market-yes-token")
         self.assertEqual(metadata["no_order_book"]["token_id"], "market-no-token")
+        self.assertEqual(metadata["decision_id"], "decision-context")
+        self.assertEqual(metadata["context_sma20_deviation"], 0.0)
         self.assertEqual(calls, ["market-yes-token", "market-no-token"])
 
     def test_fetch_market_context_fails_closed_on_cached_yes_token_mismatch(self):
@@ -3347,7 +3484,11 @@ class SimulationModeSafetyTests(unittest.TestCase):
         strategy.current_instrument_index = 0
 
         with self.assertRaisesRegex(RuntimeError, "cached YES token_id does not match"):
-            asyncio.run(strategy._fetch_market_context(Decimal("0.60")))
+            snapshot = strategy._capture_decision_input_snapshot(
+                Decimal("0.60"),
+                "decision-context-mismatch",
+            )
+            asyncio.run(strategy._fetch_market_context(snapshot))
 
     def test_live_redis_read_error_aborts_mode_check(self):
         class _BrokenRedis:
@@ -8257,17 +8398,37 @@ class SimulationModeSafetyTests(unittest.TestCase):
         strategy = self._new_strategy()
         strategy.live_execution_enabled = True
         strategy.current_simulation_mode = False
+        strategy._decision_in_progress = True
         errors = []
         original_error = self.bot.logger.error
+        original_decision_log_path = os.environ.get("DECISION_LOG_PATH")
+        decision_log_path = Path(str(self._test_ledger_path) + ".decisions.jsonl")
         self.bot.logger.error = lambda message, *args, **kwargs: errors.append(str(message))
+        os.environ["DECISION_LOG_PATH"] = str(decision_log_path)
+        snapshot = strategy._capture_decision_input_snapshot(
+            Decimal("0.70"),
+            "decision-mode-control-error",
+        )
+
+        async def _raise_mode_control_error():
+            raise RuntimeError("mode control unavailable")
+
+        strategy.check_simulation_mode = _raise_mode_control_error
 
         try:
-            strategy._make_trading_decision_sync(0.70)
+            with self.assertRaisesRegex(RuntimeError, "mode control unavailable"):
+                strategy._make_trading_decision_sync(snapshot)
         finally:
             self.bot.logger.error = original_error
+            if original_decision_log_path is None:
+                os.environ.pop("DECISION_LOG_PATH", None)
+            else:
+                os.environ["DECISION_LOG_PATH"] = original_decision_log_path
+            decision_log_path.unlink(missing_ok=True)
 
         self.assertFalse(strategy._decision_in_progress)
         self.assertTrue(any("Trading decision aborted" in message for message in errors))
+        self.assertTrue(any("mode control unavailable" in message for message in errors))
         self.assertTrue(any("Traceback" in message for message in errors))
 
 
@@ -8565,9 +8726,13 @@ class SimulationModeSafetyTests(unittest.TestCase):
         errors = []
         original_error = self.bot.logger.error
         self.bot.logger.error = lambda message, *args, **kwargs: errors.append(str(message))
+        snapshot = strategy._capture_decision_input_snapshot(
+            Decimal("0.70"),
+            "decision-unresolved-settlement",
+        )
 
         try:
-            placed = asyncio.run(strategy._make_trading_decision(Decimal("0.70")))
+            placed = asyncio.run(strategy._make_trading_decision(snapshot))
         finally:
             self.bot.logger.error = original_error
 

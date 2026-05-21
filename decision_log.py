@@ -48,6 +48,10 @@ def _default_decision_log_path() -> Path:
 _write_lock = threading.Lock()
 
 
+def new_decision_id() -> str:
+    return str(uuid.uuid4())
+
+
 def _json_default(obj: Any) -> Any:
     if isinstance(obj, Decimal):
         return str(obj)
@@ -97,10 +101,11 @@ class DecisionRecord:
         current_price: Any,
         path: Optional[Path] = None,
         strategy_observation_mode: str = "live_gate",
+        decision_id: Optional[str] = None,
     ) -> None:
         self._path = path or _default_decision_log_path()
         self.fields: dict = {
-            "decision_id": str(uuid.uuid4()),
+            "decision_id": decision_id if decision_id is not None else new_decision_id(),
             "ts": datetime.now(timezone.utc).isoformat(),
             "current_price": (
                 str(current_price) if current_price is not None else None
@@ -110,6 +115,15 @@ class DecisionRecord:
             "yes_token_id": None,
             "no_token_id": None,
             "market_end_time": None,
+            "decision_snapshot_at": None,
+            "decision_reference_time": None,
+            "decision_price_history_len": None,
+            "decision_tick_buffer_len": None,
+            "decision_market_timestamp": None,
+            "decision_sub_interval": None,
+            "context_sma20_deviation": None,
+            "context_momentum": None,
+            "context_volatility": None,
             "seconds_into_sub_interval": None,
             "trade_window_label": None,
             "trend_price_band": None,

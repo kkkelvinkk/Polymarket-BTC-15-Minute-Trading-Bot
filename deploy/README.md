@@ -73,9 +73,10 @@ sudo systemctl enable polybot
    service will refuse to place new orders while any unresolved ledger
    state exists.
 4. **Verify env values.** `SIZING_MODE`, `MAX_ACCOUNT_STATE_AGE_SECONDS`,
-   `BALANCE_SAFETY_BUFFER_USD`, and `NAUTILUS_LOG_DIR` must be explicit. For
-   fixed sizing, `MARKET_BUY_USD > 5.50` strictly. `--confirm-live` is set in
-   the unit file's `ExecStart` so the bot doesn't prompt for `LIVE` at startup.
+   `MAX_DECISION_SNAPSHOT_AGE_SECONDS`, `BALANCE_SAFETY_BUFFER_USD`, and
+   `NAUTILUS_LOG_DIR` must be explicit. For fixed sizing,
+   `MARKET_BUY_USD > 5.50` strictly. `--confirm-live` is set in the unit file's
+   `ExecStart` so the bot doesn't prompt for `LIVE` at startup.
 
 ## Operate
 

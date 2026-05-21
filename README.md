@@ -188,12 +188,13 @@ The following were previously listed but are not read by the bot. Setting them i
    `PCT_OF_FREE_COLLATERAL_PER_TRADE` in `(0, 1)` and computes the per-trade
    budget from the latest Polymarket `AccountState` pUSD free collateral.
 
-   Both modes require `MAX_ACCOUNT_STATE_AGE_SECONDS` and
-   `BALANCE_SAFETY_BUFFER_USD`. A live decision is rejected if no AccountState
-   has arrived, if the snapshot is stale, if free collateral is below
-   `resolved_trade_usd + BALANCE_SAFETY_BUFFER_USD`, or if the resolved size
-   exceeds `MAX_POSITION_SIZE`. Percent sizing rejects oversized trades rather
-   than silently clamping them.
+   Both modes require `MAX_ACCOUNT_STATE_AGE_SECONDS`,
+   `MAX_DECISION_SNAPSHOT_AGE_SECONDS`, and `BALANCE_SAFETY_BUFFER_USD`. A live
+   decision is rejected if no AccountState has arrived, if the frozen decision
+   snapshot ages past `MAX_DECISION_SNAPSHOT_AGE_SECONDS` before execution, if
+   free collateral is below `resolved_trade_usd + BALANCE_SAFETY_BUFFER_USD`,
+   or if the resolved size exceeds `MAX_POSITION_SIZE`. Percent sizing rejects
+   oversized trades rather than silently clamping them.
 
 2. **Explicit order configuration.** Order-capable runs require `ORDER_TYPE`
    and `QUOTE_STABILITY_REQUIRED`; live mode validates them before building the

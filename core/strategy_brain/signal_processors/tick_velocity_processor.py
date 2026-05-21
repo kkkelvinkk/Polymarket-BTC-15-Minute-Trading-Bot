@@ -38,7 +38,7 @@ INTEGRATION:
     metadata['tick_buffer'] = list(self._tick_buffer)
 """
 from decimal import Decimal
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from collections import deque
 from typing import Optional, Dict, Any, List
 from loguru import logger
@@ -96,9 +96,8 @@ class TickVelocityProcessor(BaseSignalProcessor):
 
         for tick in tick_buffer:
             ts = tick['ts']
-            # Normalise timezone
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
+            if ts.tzinfo is None or ts.utcoffset() is None:
+                raise RuntimeError("TickVelocity requires timezone-aware tick timestamps")
             diff = abs((ts - target).total_seconds())
             if diff < best_diff:
                 best_diff = diff
@@ -126,7 +125,13 @@ class TickVelocityProcessor(BaseSignalProcessor):
             )
             return None
 
-        now = datetime.now(timezone.utc)
+        now = metadata.get("decision_reference_time")
+        if now is None:
+            raise RuntimeError("TickVelocity requires decision_reference_time metadata")
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise RuntimeError(
+                "TickVelocity requires timezone-aware decision_reference_time metadata"
+            )
         curr = float(current_price)
 
         # Get historical prices from the buffer

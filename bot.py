@@ -80,7 +80,7 @@ from core.strategy_brain.signal_processors.divergence_processor import PriceDive
 from core.strategy_brain.signal_processors.orderbook_processor import OrderBookImbalanceProcessor
 from core.strategy_brain.signal_processors.tick_velocity_processor import TickVelocityProcessor
 from core.strategy_brain.signal_processors.deribit_pcr_processor import DeribitPCRProcessor
-from core.strategy_brain.fusion_engine.signal_fusion import get_fusion_engine
+from core.strategy_brain.fusion_engine.signal_fusion import SignalFusionEngine, get_fusion_engine
 from execution.risk_engine import get_risk_engine
 from monitoring.performance_tracker import get_performance_tracker
 from monitoring.grafana_exporter import get_grafana_exporter
@@ -99,7 +99,9 @@ from account_state_collateral import (
     ACCOUNT_BALANCE_STALE_AFTER_REDEEM,
     AccountBalanceTracker,
 )
-from decision_log import DecisionRecord
+from decision_context import fetch_market_context_for_snapshot
+from decision_log import DecisionRecord, new_decision_id
+from decision_snapshot import DecisionInputSnapshot, DecisionTickSnapshot
 from depth_estimator import (
     InvalidBookLevelError,
     estimate_limit_ioc_fill,
@@ -222,6 +224,14 @@ AUTO_REDEEM_OUTCOME_VALUES = {
 
 class SettlementLedgerError(RuntimeError):
     """Raised when live settlement ledger state cannot be trusted."""
+
+
+class DecisionSnapshotCaptureError(RuntimeError):
+    """Raised after a trigger-time decision snapshot capture failure is recorded."""
+
+
+class DecisionExecutorEnqueueError(RuntimeError):
+    """Raised after a decision executor enqueue failure is recorded."""
 
 
 @dataclass
@@ -405,6 +415,24 @@ def get_max_account_state_age_seconds_for_live() -> Decimal:
     if not value.is_finite() or value <= Decimal("0"):
         raise RuntimeError(
             f"MAX_ACCOUNT_STATE_AGE_SECONDS must be finite and > 0, got {raw!r}"
+        )
+    return value
+
+
+def get_max_decision_snapshot_age_seconds_for_live() -> Decimal:
+    """Required live decision-input freshness threshold."""
+    raw = os.getenv("MAX_DECISION_SNAPSHOT_AGE_SECONDS")
+    if raw is None or raw == "":
+        raise RuntimeError("MAX_DECISION_SNAPSHOT_AGE_SECONDS must be set for live trading")
+    try:
+        value = Decimal(raw)
+    except InvalidOperation as exc:
+        raise RuntimeError(
+            f"MAX_DECISION_SNAPSHOT_AGE_SECONDS must be a decimal, got {raw!r}"
+        ) from exc
+    if not value.is_finite() or value <= Decimal("0"):
+        raise RuntimeError(
+            f"MAX_DECISION_SNAPSHOT_AGE_SECONDS must be finite and > 0, got {raw!r}"
         )
     return value
 
@@ -920,6 +948,9 @@ class IntegratedBTCStrategy(Strategy):
         self._last_no_bid_ask = None  # (bid_decimal, ask_decimal) for NO token when subscribed
         self._last_trade_wait_log_key = None
         self._decision_in_progress = False
+        self._restart_in_progress = False
+        self._decision_state_lock = threading.RLock()
+        self._signal_processing_lock = threading.RLock()
         self._submitted_positions = {}
         self._open_live_trades: Dict[str, Dict[str, Any]] = {}
         self._settled_live_trades: List[Dict[str, Any]] = []
@@ -981,16 +1012,37 @@ class IntegratedBTCStrategy(Strategy):
             max_days_to_expiry=2,
             cache_seconds=300,          # refresh every 5 min
         )
+        self._shadow_spike_detector = SpikeDetectionProcessor(
+            spike_threshold=0.05,
+            lookback_periods=20,
+        )
+        self._shadow_sentiment_processor = SentimentProcessor(
+            extreme_fear_threshold=25,
+            extreme_greed_threshold=75,
+        )
+        self._shadow_divergence_processor = PriceDivergenceProcessor(
+            divergence_threshold=0.05,
+        )
+        self._shadow_orderbook_processor = OrderBookImbalanceProcessor(
+            imbalance_threshold=0.30,
+            min_book_volume=50.0,
+        )
+        self._shadow_tick_velocity_processor = TickVelocityProcessor(
+            velocity_threshold_60s=0.015,
+            velocity_threshold_30s=0.010,
+        )
+        self._shadow_deribit_pcr_processor = DeribitPCRProcessor(
+            bullish_pcr_threshold=1.20,
+            bearish_pcr_threshold=0.70,
+            max_days_to_expiry=2,
+            cache_seconds=300,
+        )
 
         # Signal fusion — update weights for 6 processors
         self.fusion_engine = get_fusion_engine()
-        # Rebalanced weights (must sum ≤ 1.0; higher = more influence)
-        self.fusion_engine.set_weight("OrderBookImbalance", 0.30)  # best real-time signal
-        self.fusion_engine.set_weight("TickVelocity",       0.25)  # fast poly momentum
-        self.fusion_engine.set_weight("PriceDivergence",    0.18)  # spot momentum
-        self.fusion_engine.set_weight("SpikeDetection",     0.12)  # mean reversion
-        self.fusion_engine.set_weight("DeribitPCR",         0.10)  # institutional sentiment
-        self.fusion_engine.set_weight("SentimentAnalysis",  0.05)  # daily F&G (weak)
+        self._shadow_fusion_engine = SignalFusionEngine()
+        self._configure_fusion_engine(self.fusion_engine)
+        self._configure_fusion_engine(self._shadow_fusion_engine)
 
         # Risk management
         self.risk_engine = get_risk_engine()
@@ -1057,6 +1109,16 @@ class IntegratedBTCStrategy(Strategy):
         )
         logger.info("=" * 80)
 
+    @staticmethod
+    def _configure_fusion_engine(fusion_engine: SignalFusionEngine) -> None:
+        # Rebalanced weights (must sum <= 1.0; higher = more influence)
+        fusion_engine.set_weight("OrderBookImbalance", 0.30)
+        fusion_engine.set_weight("TickVelocity", 0.25)
+        fusion_engine.set_weight("PriceDivergence", 0.18)
+        fusion_engine.set_weight("SpikeDetection", 0.12)
+        fusion_engine.set_weight("DeribitPCR", 0.10)
+        fusion_engine.set_weight("SentimentAnalysis", 0.05)
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -1084,11 +1146,12 @@ class IntegratedBTCStrategy(Strategy):
 
     def _reset_stability(self, reason: str = ""):
         """Mark the market as unstable and reset the counter."""
-        if self._market_stable:
-            logger.warning(f"Market stability RESET{' – ' + reason if reason else ''}")
-        self._market_stable = False
-        self._stable_tick_count = 0
-        self._quote_stability_missing_logged = False
+        with self._decision_state_lock:
+            if self._market_stable:
+                logger.warning(f"Market stability RESET{' – ' + reason if reason else ''}")
+            self._market_stable = False
+            self._stable_tick_count = 0
+            self._quote_stability_missing_logged = False
 
     @property
     def _latest_free_collateral(self) -> Optional[Decimal]:
@@ -4259,14 +4322,24 @@ class IntegratedBTCStrategy(Strategy):
             return False
         
         # Switch to next market
-        self.current_instrument_index = next_index
-        self.instrument_id = next_market['instrument'].id
-        self.next_switch_time = next_market['end_time']
-        self._yes_token_id = next_market.get('yes_token_id')
-        self._yes_instrument_id = next_market.get('yes_instrument_id', next_market['instrument'].id)
-        self._no_instrument_id = next_market.get('no_instrument_id')
-        self._last_bid_ask = None
-        self._last_no_bid_ask = None
+        with self._decision_state_lock:
+            if self._decision_in_progress:
+                logger.warning("Market switch due, but a trade decision is in progress; postponing")
+                return False
+            self.current_instrument_index = next_index
+            self.instrument_id = next_market['instrument'].id
+            self.next_switch_time = next_market['end_time']
+            self._yes_token_id = next_market.get('yes_token_id')
+            self._yes_instrument_id = next_market.get('yes_instrument_id', next_market['instrument'].id)
+            self._no_instrument_id = next_market.get('no_instrument_id')
+            self._last_bid_ask = None
+            self._last_no_bid_ask = None
+            self._stable_tick_count = 0
+            self._market_stable = False
+            self._waiting_for_market_open = False  # Market is now active
+            # Reset trade timer so we trade at the NEXT quote we receive
+            # Use -1 so any interval will trigger (same as startup)
+            self.last_trade_time = -1
         
         logger.info("=" * 80)
         logger.info(f"SWITCHING TO NEXT MARKET: {next_market['slug']}")
@@ -4274,13 +4347,6 @@ class IntegratedBTCStrategy(Strategy):
         logger.info(f"  Market ends at: {self.next_switch_time.strftime('%H:%M:%S')}")
         logger.info("=" * 80)
         
-        self._stable_tick_count = 0
-        self._market_stable = False
-        self._waiting_for_market_open = False  # Market is now active
-        
-        # Reset trade timer so we trade at the NEXT quote we receive
-        # Use -1 so any interval will trigger (same as startup)
-        self.last_trade_time = -1
         logger.info(f"  Trade timer reset — will trade on next tick")
         
         self.subscribe_quote_ticks(self.instrument_id)
@@ -4311,7 +4377,11 @@ class IntegratedBTCStrategy(Strategy):
             # --- auto-restart check ---
             uptime_minutes = (datetime.now(timezone.utc) - self.bot_start_time).total_seconds() / 60
             if uptime_minutes >= self.restart_after_minutes:
-                if self._decision_in_progress:
+                with self._decision_state_lock:
+                    decision_in_progress = self._decision_in_progress
+                    if not decision_in_progress:
+                        self._restart_in_progress = True
+                if decision_in_progress:
                     logger.warning("AUTO-RESTART due, but a trade decision is in progress; postponing")
                     await asyncio.sleep(10)
                     continue
@@ -4324,24 +4394,42 @@ class IntegratedBTCStrategy(Strategy):
             self._settle_expired_live_trades()
 
             if self.next_switch_time and now >= self.next_switch_time:
+                with self._decision_state_lock:
+                    decision_in_progress = self._decision_in_progress
+                if decision_in_progress:
+                    logger.warning("Market switch due, but a trade decision is in progress; postponing")
+                    await asyncio.sleep(10)
+                    continue
                 if self._waiting_for_market_open:
                     # The future market we were waiting for has now opened
                     # Treat it like a market switch so trade timer resets
                     logger.info("=" * 80)
                     logger.info(f"⏰ WAITING MARKET NOW OPEN: {now.strftime('%H:%M:%S')} UTC")
                     logger.info("=" * 80)
-                    # Update next_switch_time to the market's END time
-                    if (self.current_instrument_index >= 0 and
-                            self.current_instrument_index < len(self.all_btc_instruments)):
-                        current_market = self.all_btc_instruments[self.current_instrument_index]
-                        self.next_switch_time = current_market['end_time']
-                        logger.info(f"  Market ends at {self.next_switch_time.strftime('%H:%M:%S')} UTC")
-                    self._waiting_for_market_open = False
-                    self._market_stable = False
-                    self._stable_tick_count = 0
-                    self._last_bid_ask = None
-                    self._last_no_bid_ask = None
-                    self.last_trade_time = -1  # Trade immediately on next tick
+                    postpone_market_open = False
+                    market_end_time = None
+                    with self._decision_state_lock:
+                        if self._decision_in_progress:
+                            postpone_market_open = True
+                        else:
+                            # Update next_switch_time to the market's END time
+                            if (self.current_instrument_index >= 0 and
+                                    self.current_instrument_index < len(self.all_btc_instruments)):
+                                current_market = self.all_btc_instruments[self.current_instrument_index]
+                                self.next_switch_time = current_market['end_time']
+                                market_end_time = self.next_switch_time
+                            self._waiting_for_market_open = False
+                            self._market_stable = False
+                            self._stable_tick_count = 0
+                            self._last_bid_ask = None
+                            self._last_no_bid_ask = None
+                            self.last_trade_time = -1  # Trade immediately on next tick
+                    if postpone_market_open:
+                        logger.warning("Market open transition due, but a trade decision is in progress; postponing")
+                        await asyncio.sleep(10)
+                        continue
+                    if market_end_time is not None:
+                        logger.info(f"  Market ends at {market_end_time.strftime('%H:%M:%S')} UTC")
                     logger.info("  ✓ MARKET OPEN — waiting for stable quotes")
                 else:
                     # Normal market switch
@@ -4373,7 +4461,9 @@ class IntegratedBTCStrategy(Strategy):
 
             if bid is None or ask is None:
                 if is_yes_tick:
-                    self._reset_stability(f"missing quote side bid={bid}, ask={ask}")
+                    with self._decision_state_lock:
+                        if tick.instrument_id == self.instrument_id:
+                            self._reset_stability(f"missing quote side bid={bid}, ask={ask}")
                 return
                 
             try:
@@ -4381,42 +4471,112 @@ class IntegratedBTCStrategy(Strategy):
                 ask_decimal = ask.as_decimal()
             except Exception as e:
                 if is_yes_tick:
-                    self._reset_stability(f"malformed quote bid={bid}, ask={ask}: {e}")
+                    with self._decision_state_lock:
+                        if tick.instrument_id == self.instrument_id:
+                            self._reset_stability(f"malformed quote bid={bid}, ask={ask}: {e}")
                 return
 
             if not self._is_quote_valid(bid_decimal, ask_decimal):
                 if is_yes_tick:
-                    self._reset_stability(
-                        f"invalid quote bid={bid_decimal}, ask={ask_decimal}",
-                    )
+                    with self._decision_state_lock:
+                        if tick.instrument_id == self.instrument_id:
+                            self._reset_stability(
+                                f"invalid quote bid={bid_decimal}, ask={ask_decimal}",
+                            )
                 return
 
-            if is_no_tick:
-                self._last_no_bid_ask = (bid_decimal, ask_decimal)
-                return
-
-            # Always store price history
-            mid_price = (bid_decimal + ask_decimal) / 2
-            self.price_history.append(mid_price)
-            if len(self.price_history) > self.max_history:
-                self.price_history.pop(0)
-            
-            # Store latest bid/ask for liquidity check before order placement
-            self._last_bid_ask = (bid_decimal, ask_decimal)
-
-            # Tick buffer for TickVelocityProcessor (rolling 90s window)
-            self._tick_buffer.append({'ts': now, 'price': mid_price})
-
-            # Stability gate
-            if not self._market_stable:
-                self._stable_tick_count += 1
-                if self._stable_tick_count >= self._quote_stability_required:
-                    self._market_stable = True
-                    logger.info(
-                        f"✓ Market STABLE after {self._stable_tick_count} valid quote ticks"
-                    )
-                else:
+            trigger_decision_state = None
+            market_start_ts = None
+            elapsed_secs = None
+            sub_interval = None
+            trade_key = None
+            seconds_into_sub_interval = None
+            trade_window_label = None
+            shadow_key = None
+            TRADE_WINDOW_START = 780   # 13 minutes in
+            TRADE_WINDOW_END   = 840   # 14 minutes in (60s window)
+            with self._decision_state_lock:
+                locked_is_yes_tick = tick.instrument_id == self.instrument_id
+                locked_is_no_tick = (
+                    getattr(self, "_no_instrument_id", None) is not None
+                    and tick.instrument_id == self._no_instrument_id
+                )
+                if not locked_is_yes_tick and not locked_is_no_tick:
                     return
+
+                if locked_is_no_tick:
+                    self._last_no_bid_ask = (bid_decimal, ask_decimal)
+                    return
+
+                # Always store price history
+                mid_price = (bid_decimal + ask_decimal) / 2
+                self.price_history.append(mid_price)
+                if len(self.price_history) > self.max_history:
+                    self.price_history.pop(0)
+
+                # Store latest bid/ask for liquidity check before order placement
+                self._last_bid_ask = (bid_decimal, ask_decimal)
+
+                # Tick buffer for TickVelocityProcessor (rolling 90s window)
+                self._tick_buffer.append({'ts': now, 'price': mid_price})
+
+                # Stability gate
+                if not self._market_stable:
+                    self._stable_tick_count += 1
+                    if self._stable_tick_count >= self._quote_stability_required:
+                        self._market_stable = True
+                        logger.info(
+                            f"✓ Market STABLE after {self._stable_tick_count} valid quote ticks"
+                        )
+                    else:
+                        return
+
+                tick_market_index = self.current_instrument_index
+                tick_instrument_id = self.instrument_id
+                tick_waiting_for_market_open = self._waiting_for_market_open
+                tick_price_history_len = len(self.price_history)
+                if 0 <= tick_market_index < len(self.all_btc_instruments):
+                    current_market = dict(self.all_btc_instruments[tick_market_index])
+                else:
+                    current_market = None
+                if not tick_waiting_for_market_open and current_market is not None:
+                    market_start_ts = current_market['market_timestamp']
+                    elapsed_secs = now.timestamp() - market_start_ts
+                    if elapsed_secs >= 0:
+                        sub_interval = int(elapsed_secs // MARKET_INTERVAL_SECONDS)
+                        trade_key = (market_start_ts, sub_interval)
+                        seconds_into_sub_interval = elapsed_secs % MARKET_INTERVAL_SECONDS
+                        trade_window_label = trade_window_label_for_seconds_into_sub_interval(
+                            seconds_into_sub_interval
+                        )
+                        shadow_key = (market_start_ts, sub_interval, trade_window_label)
+                        shadow_capture_candidate = (
+                            trade_window_label in SHADOW_POLICY_WINDOW_LABELS
+                            and shadow_key not in self._shadow_policy_observed_keys
+                            and not self._decision_in_progress
+                            and not self._shadow_decision_in_progress
+                            and not self._restart_in_progress
+                        )
+                        live_capture_candidate = (
+                            TRADE_WINDOW_START <= seconds_into_sub_interval < TRADE_WINDOW_END
+                            and trade_key != self.last_trade_time
+                            and not self._decision_in_progress
+                            and not self._shadow_decision_in_progress
+                            and not self._restart_in_progress
+                        )
+                        if shadow_capture_candidate or live_capture_candidate:
+                            try:
+                                trigger_decision_state = self._capture_locked_decision_state(now)
+                            except Exception as exc:
+                                self._raise_decision_snapshot_capture_error(
+                                    current_price=mid_price,
+                                    decision_id=new_decision_id(),
+                                    market_timestamp=market_start_ts,
+                                    sub_interval=sub_interval,
+                                    seconds_into_sub_interval=seconds_into_sub_interval,
+                                    trade_window_label=trade_window_label,
+                                    exc=exc,
+                                )
 
             # =========================================================================
             # FIXED TRADING LOGIC:
@@ -4438,27 +4598,17 @@ class IntegratedBTCStrategy(Strategy):
             # =========================================================================
 
             # Block trading if waiting for a future market to open
-            if self._waiting_for_market_open:
+            if tick_waiting_for_market_open:
                 return
 
             # Get current market info
-            if (self.current_instrument_index < 0 or
-                    self.current_instrument_index >= len(self.all_btc_instruments)):
+            if current_market is None:
                 return
-
-            current_market = self.all_btc_instruments[self.current_instrument_index]
-            market_start_ts = current_market['market_timestamp']  # Slug timestamp = market start (Unix)
 
             # How many 15-min intervals have elapsed since this market opened?
-            elapsed_secs = now.timestamp() - market_start_ts
-            if elapsed_secs < 0:
+            if elapsed_secs is None or elapsed_secs < 0:
                 # Market hasn't started yet — block
                 return
-
-            sub_interval = int(elapsed_secs // MARKET_INTERVAL_SECONDS)
-
-            # Unique trade key: (market_start_timestamp, sub_interval)
-            trade_key = (market_start_ts, sub_interval)
 
             # =========================================================================
             # TRADE WINDOW: minutes 13–14 of each 15-min market (780–840 seconds in)
@@ -4473,21 +4623,48 @@ class IntegratedBTCStrategy(Strategy):
             #   Price < 0.40 -> candidate NO trade
             #   Price 0.40-0.60 -> skip as too close to 0.50
             # =========================================================================
-            seconds_into_sub_interval = elapsed_secs % MARKET_INTERVAL_SECONDS
-            TRADE_WINDOW_START = 780   # 13 minutes in
-            TRADE_WINDOW_END   = 840   # 14 minutes in (60s window)
-            trade_window_label = trade_window_label_for_seconds_into_sub_interval(
-                seconds_into_sub_interval
-            )
-            shadow_key = (market_start_ts, sub_interval, trade_window_label)
-            if (
-                trade_window_label in SHADOW_POLICY_WINDOW_LABELS
-                and shadow_key not in self._shadow_policy_observed_keys
-                and not self._decision_in_progress
-                and not self._shadow_decision_in_progress
-            ):
-                self._shadow_policy_observed_keys.add(shadow_key)
-                self._shadow_decision_in_progress = True
+            schedule_shadow_policy = False
+            shadow_decision_snapshot = None
+            with self._decision_state_lock:
+                same_tick_market = (
+                    self.current_instrument_index == tick_market_index
+                    and self.instrument_id == tick_instrument_id
+                )
+                if (
+                    same_tick_market
+                    and trigger_decision_state is not None
+                    and trade_window_label in SHADOW_POLICY_WINDOW_LABELS
+                    and shadow_key not in self._shadow_policy_observed_keys
+                    and not self._decision_in_progress
+                    and not self._shadow_decision_in_progress
+                    and not self._restart_in_progress
+                ):
+                    decision_id = new_decision_id()
+                    try:
+                        shadow_decision_snapshot = self._decision_snapshot_from_state(
+                            current_price=mid_price,
+                            decision_id=decision_id,
+                            state=trigger_decision_state,
+                            market_timestamp=market_start_ts,
+                            sub_interval=sub_interval,
+                            seconds_into_sub_interval=seconds_into_sub_interval,
+                            trade_window_label=trade_window_label,
+                        )
+                    except Exception as exc:
+                        self._raise_decision_snapshot_capture_error(
+                            current_price=mid_price,
+                            decision_id=decision_id,
+                            market_timestamp=market_start_ts,
+                            sub_interval=sub_interval,
+                            seconds_into_sub_interval=seconds_into_sub_interval,
+                            trade_window_label=trade_window_label,
+                            exc=exc,
+                        )
+                    self._shadow_policy_observed_keys.add(shadow_key)
+                    self._shadow_decision_in_progress = True
+                    schedule_shadow_policy = True
+
+            if schedule_shadow_policy:
                 logger.info(
                     f"SHADOW POLICY OBSERVATION: {trade_window_label} "
                     f"for {current_market['slug']} at {seconds_into_sub_interval:.1f}s"
@@ -4496,20 +4673,66 @@ class IntegratedBTCStrategy(Strategy):
                 def _run_shadow_policy_decision():
                     try:
                         self._make_shadow_policy_decision_sync(
-                            float(mid_price),
+                            shadow_decision_snapshot,
                             trade_key=None,
                         )
                     finally:
+                        with self._decision_state_lock:
+                            self._shadow_decision_in_progress = False
+
+                try:
+                    self.run_in_executor(_run_shadow_policy_decision)
+                except Exception as exc:
+                    with self._decision_state_lock:
                         self._shadow_decision_in_progress = False
+                        self._shadow_policy_observed_keys.discard(shadow_key)
+                    self._raise_decision_executor_enqueue_error(
+                        decision_snapshot=shadow_decision_snapshot,
+                        strategy_observation_mode="shadow_policy",
+                        exc=exc,
+                    )
 
-                self.run_in_executor(_run_shadow_policy_decision)
+            schedule_live_decision = False
+            live_decision_snapshot = None
+            with self._decision_state_lock:
+                same_tick_market = (
+                    self.current_instrument_index == tick_market_index
+                    and self.instrument_id == tick_instrument_id
+                )
+                if (
+                    same_tick_market
+                    and trigger_decision_state is not None
+                    and TRADE_WINDOW_START <= seconds_into_sub_interval < TRADE_WINDOW_END
+                    and trade_key != self.last_trade_time
+                    and not self._decision_in_progress
+                    and not self._shadow_decision_in_progress
+                    and not self._restart_in_progress
+                ):
+                    decision_id = new_decision_id()
+                    try:
+                        live_decision_snapshot = self._decision_snapshot_from_state(
+                            current_price=mid_price,
+                            decision_id=decision_id,
+                            state=trigger_decision_state,
+                            market_timestamp=market_start_ts,
+                            sub_interval=sub_interval,
+                            seconds_into_sub_interval=seconds_into_sub_interval,
+                            trade_window_label=trade_window_label,
+                        )
+                    except Exception as exc:
+                        self._raise_decision_snapshot_capture_error(
+                            current_price=mid_price,
+                            decision_id=decision_id,
+                            market_timestamp=market_start_ts,
+                            sub_interval=sub_interval,
+                            seconds_into_sub_interval=seconds_into_sub_interval,
+                            trade_window_label=trade_window_label,
+                            exc=exc,
+                        )
+                    self._decision_in_progress = True
+                    schedule_live_decision = True
 
-            if (
-                TRADE_WINDOW_START <= seconds_into_sub_interval < TRADE_WINDOW_END
-                and trade_key != self.last_trade_time
-                and not self._decision_in_progress
-            ):
-                self._decision_in_progress = True
+            if schedule_live_decision:
 
                 logger.info("=" * 80)
                 logger.info(f" LATE-WINDOW TRADE: {now.strftime('%Y-%m-%d %H:%M:%S')} UTC")
@@ -4517,13 +4740,33 @@ class IntegratedBTCStrategy(Strategy):
                 logger.info(f"   Sub-interval #{sub_interval} ({seconds_into_sub_interval:.1f}s in = {seconds_into_sub_interval/60:.1f} min)")
                 logger.info(f"   Price: ${float(mid_price):,.4f} | Bid: ${float(bid_decimal):,.4f} | Ask: ${float(ask_decimal):,.4f}")
                 logger.info(f"   Trend strength: {'STRONG ✓' if float(mid_price) > 0.60 or float(mid_price) < 0.40 else 'WEAK — may skip'}")
-                logger.info(f"   Price history: {len(self.price_history)} points")
+                logger.info(f"   Price history: {tick_price_history_len} points")
                 logger.info("=" * 80)
 
-                self.run_in_executor(
-                    lambda: self._make_trading_decision_sync(float(mid_price), trade_key)
-                )
-            elif trade_key != self._last_trade_wait_log_key:
+                try:
+                    self.run_in_executor(
+                        lambda: self._make_trading_decision_sync(live_decision_snapshot, trade_key)
+                    )
+                except Exception as exc:
+                    with self._decision_state_lock:
+                        self._decision_in_progress = False
+                    self._raise_decision_executor_enqueue_error(
+                        decision_snapshot=live_decision_snapshot,
+                        strategy_observation_mode="mode_check_pending",
+                        exc=exc,
+                    )
+            else:
+                log_waiting_for_window = False
+                with self._decision_state_lock:
+                    same_tick_market = (
+                        self.current_instrument_index == tick_market_index
+                        and self.instrument_id == tick_instrument_id
+                    )
+                    if same_tick_market and trade_key != self._last_trade_wait_log_key:
+                        self._last_trade_wait_log_key = trade_key
+                        log_waiting_for_window = True
+                if not log_waiting_for_window:
+                    return
                 window_start = datetime.fromtimestamp(
                     market_start_ts + (sub_interval * MARKET_INTERVAL_SECONDS) + TRADE_WINDOW_START,
                     timezone.utc,
@@ -4538,10 +4781,13 @@ class IntegratedBTCStrategy(Strategy):
                     f"{window_end.strftime('%H:%M:%S')} UTC "
                     f"({seconds_until_window:.0f}s remaining) for {current_market['slug']}"
                 )
-                self._last_trade_wait_log_key = trade_key
 
+        except (DecisionSnapshotCaptureError, DecisionExecutorEnqueueError) as e:
+            logger.error(f"Error processing quote tick: {e}")
+            raise
         except Exception as e:
             logger.error(f"Error processing quote tick: {e}")
+            raise
 
     # ------------------------------------------------------------------
     # Trading decision (unchanged)
@@ -4549,14 +4795,11 @@ class IntegratedBTCStrategy(Strategy):
 
     def _make_trading_decision_sync(
         self,
-        current_price,
+        decision_snapshot: DecisionInputSnapshot,
         trade_key=None,
         strategy_observation_mode: Optional[str] = None,
     ):
         """Synchronous wrapper for trading decision (called from executor)."""
-        # Convert float back to Decimal for processing
-        from decimal import Decimal
-        price_decimal = Decimal(str(current_price))
         owns_decision_flag = strategy_observation_mode != "shadow_policy"
         
         loop = asyncio.new_event_loop()
@@ -4564,126 +4807,303 @@ class IntegratedBTCStrategy(Strategy):
         try:
             loop.run_until_complete(
                 self._make_trading_decision(
-                    price_decimal,
+                    decision_snapshot,
                     trade_key=trade_key,
                     strategy_observation_mode=strategy_observation_mode,
                 )
             )
         except Exception as e:
             logger.error(f"Trading decision aborted: {e}\n{traceback.format_exc()}")
+            raise
         finally:
             if owns_decision_flag:
-                self._decision_in_progress = False
+                with self._decision_state_lock:
+                    self._decision_in_progress = False
             loop.close()
 
-    def _make_shadow_policy_decision_sync(self, current_price, trade_key=None):
+    def _make_shadow_policy_decision_sync(
+        self,
+        decision_snapshot: DecisionInputSnapshot,
+        trade_key=None,
+    ):
         """Synchronous wrapper for shadow policy observations."""
         self._make_trading_decision_sync(
-            current_price,
+            decision_snapshot,
             trade_key=trade_key,
             strategy_observation_mode="shadow_policy",
         )
-            
-    async def _fetch_market_context(self, current_price: Decimal) -> dict:
-        """
-        Fetch REAL external data to populate signal processor metadata.
 
-        Returns a dict with:
-          - sentiment_score (float 0-100): live Fear & Greed index, or None
-          - spot_price (float): live BTC-USD from Coinbase, or None
-          - deviation (float): polymarket price vs SMA-20 (always computed)
-          - momentum (float): 5-period rate of change (always computed)
-          - volatility (float): price std-dev over last 20 ticks (always computed)
-        """
-        current_price_float = float(current_price)
-
-        # --- Always-available stats from local price_history ---
-        recent_prices = [float(p) for p in self.price_history[-20:]]
-        sma_20 = sum(recent_prices) / len(recent_prices)
-        deviation = (current_price_float - sma_20) / sma_20
-        momentum = (
-            (current_price_float - float(self.price_history[-5])) / float(self.price_history[-5])
-            if len(self.price_history) >= 5 else 0.0
-        )
-        variance = sum((p - sma_20) ** 2 for p in recent_prices) / len(recent_prices)
-        volatility = math.sqrt(variance)
-
-        market_meta = self._require_current_market_metadata("market context fetch")
-        yes_token_id = market_meta.get("yes_token_id")
-        if yes_token_id in (None, ""):
-            raise RuntimeError("market context fetch: current market metadata missing yes_token_id")
-        if self._yes_token_id not in (None, "") and self._yes_token_id != yes_token_id:
-            raise RuntimeError(
-                "market context fetch: cached YES token_id does not match current market metadata "
-                f"({self._yes_token_id!r} != {yes_token_id!r})"
+    def _record_decision_snapshot_capture_exception(
+        self,
+        *,
+        current_price: Decimal,
+        decision_id: str,
+        market_timestamp: Optional[float],
+        sub_interval: Optional[int],
+        seconds_into_sub_interval: Optional[float],
+        trade_window_label: Optional[str],
+        exc: Exception,
+    ) -> None:
+        with DecisionRecord(
+            current_price=current_price,
+            strategy_observation_mode="snapshot_capture",
+            decision_id=decision_id,
+        ) as rec:
+            rec.update(
+                decision_market_timestamp=market_timestamp,
+                decision_sub_interval=sub_interval,
+                seconds_into_sub_interval=seconds_into_sub_interval,
+                trade_window_label=trade_window_label,
             )
-        no_token_id = market_meta.get("no_token_id")
-        metadata = {
-            "deviation": deviation,
-            "momentum": momentum,
-            "volatility": volatility,
-            # Tick buffer for TickVelocityProcessor
-            "tick_buffer": list(self._tick_buffer),
-            # YES token id for OrderBookImbalanceProcessor
-            "yes_token_id": yes_token_id,
+            rec.reject(
+                "snapshot_capture_exception",
+                f"{type(exc).__name__}: {exc}",
+            )
+
+    def _raise_decision_snapshot_capture_error(
+        self,
+        *,
+        current_price: Decimal,
+        decision_id: str,
+        market_timestamp: Optional[float],
+        sub_interval: Optional[int],
+        seconds_into_sub_interval: Optional[float],
+        trade_window_label: Optional[str],
+        exc: Exception,
+    ) -> None:
+        self._record_decision_snapshot_capture_exception(
+            current_price=current_price,
+            decision_id=decision_id,
+            market_timestamp=market_timestamp,
+            sub_interval=sub_interval,
+            seconds_into_sub_interval=seconds_into_sub_interval,
+            trade_window_label=trade_window_label,
+            exc=exc,
+        )
+        raise DecisionSnapshotCaptureError("decision snapshot capture failed") from exc
+
+    def _record_decision_executor_enqueue_exception(
+        self,
+        *,
+        decision_snapshot: DecisionInputSnapshot,
+        strategy_observation_mode: str,
+        exc: Exception,
+    ) -> None:
+        with DecisionRecord(
+            current_price=decision_snapshot.current_price,
+            strategy_observation_mode=strategy_observation_mode,
+            decision_id=decision_snapshot.decision_id,
+        ) as rec:
+            rec.update(
+                slug=decision_snapshot.market_slug,
+                condition_id=decision_snapshot.condition_id,
+                yes_token_id=decision_snapshot.yes_token_id,
+                no_token_id=decision_snapshot.no_token_id,
+                market_end_time=decision_snapshot.market_end_time,
+                decision_snapshot_at=decision_snapshot.captured_at,
+                decision_reference_time=decision_snapshot.reference_time,
+                decision_price_history_len=len(decision_snapshot.price_history),
+                decision_tick_buffer_len=len(decision_snapshot.tick_buffer),
+                decision_market_timestamp=decision_snapshot.market_timestamp,
+                decision_sub_interval=decision_snapshot.sub_interval,
+                seconds_into_sub_interval=decision_snapshot.seconds_into_sub_interval,
+                trade_window_label=decision_snapshot.trade_window_label,
+            )
+            rec.reject(
+                "executor_enqueue_exception",
+                f"{type(exc).__name__}: {exc}",
+            )
+
+    def _raise_decision_executor_enqueue_error(
+        self,
+        *,
+        decision_snapshot: DecisionInputSnapshot,
+        strategy_observation_mode: str,
+        exc: Exception,
+    ) -> None:
+        self._record_decision_executor_enqueue_exception(
+            decision_snapshot=decision_snapshot,
+            strategy_observation_mode=strategy_observation_mode,
+            exc=exc,
+        )
+        raise DecisionExecutorEnqueueError("decision executor enqueue failed") from exc
+
+    def _capture_locked_decision_state(self, reference_time: datetime) -> Dict[str, Any]:
+        market_meta = dict(self._current_market_metadata())
+        tick_buffer = tuple(
+            DecisionTickSnapshot(ts=tick["ts"], price=tick["price"])
+            for tick in self._tick_buffer
+        )
+        return {
+            "captured_at": datetime.now(timezone.utc),
+            "reference_time": reference_time,
+            "price_history": tuple(self.price_history),
+            "tick_buffer": tick_buffer,
+            "yes_bid_ask": self._last_bid_ask,
+            "no_bid_ask": self._last_no_bid_ask,
+            "stable_tick_count": self._stable_tick_count,
+            "market_slug": market_meta.get("slug"),
+            "condition_id": market_meta.get("condition_id"),
+            "yes_token_id": market_meta.get("yes_token_id"),
+            "no_token_id": market_meta.get("no_token_id"),
+            "market_start_time": market_meta.get("start_time"),
+            "market_end_time": market_meta.get("end_time"),
+            "cached_yes_token_id": self._yes_token_id,
+            "instrument_id": self.instrument_id,
+            "yes_instrument_id": getattr(self, "_yes_instrument_id", None),
+            "no_instrument_id": getattr(self, "_no_instrument_id", None),
         }
-        if no_token_id not in (None, ""):
-            metadata["no_token_id"] = no_token_id
-        metadata["yes_order_book"] = await asyncio.to_thread(
-            self.orderbook_processor.fetch_order_book,
-            yes_token_id,
+
+    def _decision_snapshot_from_state(
+        self,
+        *,
+        current_price: Decimal,
+        decision_id: str,
+        state: Dict[str, Any],
+        market_timestamp: Optional[float] = None,
+        sub_interval: Optional[int] = None,
+        seconds_into_sub_interval: Optional[float] = None,
+        trade_window_label: Optional[str] = None,
+    ) -> DecisionInputSnapshot:
+        return DecisionInputSnapshot(
+            decision_id=decision_id,
+            captured_at=state["captured_at"],
+            reference_time=state["reference_time"],
+            current_price=current_price,
+            price_history=state["price_history"],
+            tick_buffer=state["tick_buffer"],
+            yes_bid_ask=state["yes_bid_ask"],
+            no_bid_ask=state["no_bid_ask"],
+            stable_tick_count=state["stable_tick_count"],
+            market_slug=state["market_slug"],
+            condition_id=state["condition_id"],
+            yes_token_id=state["yes_token_id"],
+            no_token_id=state["no_token_id"],
+            market_start_time=state["market_start_time"],
+            market_end_time=state["market_end_time"],
+            cached_yes_token_id=state["cached_yes_token_id"],
+            instrument_id=state["instrument_id"],
+            yes_instrument_id=state["yes_instrument_id"],
+            no_instrument_id=state["no_instrument_id"],
+            market_timestamp=market_timestamp,
+            sub_interval=sub_interval,
+            seconds_into_sub_interval=seconds_into_sub_interval,
+            trade_window_label=trade_window_label,
         )
-        if no_token_id not in (None, ""):
-            metadata["no_order_book"] = await asyncio.to_thread(
-                self.orderbook_processor.fetch_order_book,
-                no_token_id,
+
+    def _capture_decision_input_snapshot(
+        self,
+        current_price: Decimal,
+        decision_id: str,
+        *,
+        market_timestamp: Optional[float] = None,
+        sub_interval: Optional[int] = None,
+        seconds_into_sub_interval: Optional[float] = None,
+        trade_window_label: Optional[str] = None,
+    ) -> DecisionInputSnapshot:
+        """Capture local mutable market state once for this decision."""
+        with self._decision_state_lock:
+            state = self._capture_locked_decision_state(datetime.now(timezone.utc))
+            return self._decision_snapshot_from_state(
+                current_price=current_price,
+                decision_id=decision_id,
+                state=state,
+                market_timestamp=market_timestamp,
+                sub_interval=sub_interval,
+                seconds_into_sub_interval=seconds_into_sub_interval,
+                trade_window_label=trade_window_label,
             )
 
-        # --- Real sentiment: Fear & Greed Index via NewsSocialDataSource ---
-        try:
-            from data_sources.news_social.adapter import NewsSocialDataSource
-            news_source = NewsSocialDataSource()
-            await news_source.connect()
-            fg = await news_source.get_fear_greed_index()
-            await news_source.disconnect()
-            if fg and "value" in fg:
-                metadata["sentiment_score"] = float(fg["value"])
-                metadata["sentiment_classification"] = fg.get("classification", "")
-                logger.info(
-                    f"Fear & Greed: {metadata['sentiment_score']:.0f} "
-                    f"({metadata['sentiment_classification']})"
-                )
-            else:
-                logger.warning("Fear & Greed fetch returned no data — sentiment processor skipped")
-        except Exception as e:
-            logger.warning(f"Could not fetch Fear & Greed index: {e} — sentiment processor skipped")
-
-        # --- Real spot price: Coinbase BTC-USD REST API ---
-        try:
-            from data_sources.coinbase.adapter import CoinbaseDataSource
-            coinbase = CoinbaseDataSource()
-            await coinbase.connect()
-            spot = await coinbase.get_current_price()
-            await coinbase.disconnect()
-            if spot:
-                metadata["spot_price"] = float(spot)
-                logger.info(f"Coinbase spot price: ${float(spot):,.2f}")
-            else:
-                logger.warning("Coinbase price fetch returned None — divergence processor skipped")
-        except Exception as e:
-            logger.warning(f"Could not fetch Coinbase spot price: {e} — divergence processor skipped")
-
-        logger.info(
-            f"Market context — deviation={deviation:.2%}, "
-            f"momentum={momentum:.2%}, volatility={volatility:.4f}, "
-            f"sentiment={'%.0f' % metadata['sentiment_score'] if 'sentiment_score' in metadata else 'N/A'}, "
-            f"spot=${'%.2f' % metadata['spot_price'] if 'spot_price' in metadata else 'N/A'}"
+    async def _fetch_market_context(
+        self,
+        snapshot: DecisionInputSnapshot,
+        *,
+        observation_only: bool = False,
+    ) -> dict:
+        orderbook_processor = (
+            self._shadow_orderbook_processor if observation_only else self.orderbook_processor
         )
-        return metadata
+        return await fetch_market_context_for_snapshot(
+            snapshot,
+            orderbook_processor,
+            logger,
+        )
+
+    def _decision_snapshot_age_seconds(self, decision_snapshot: DecisionInputSnapshot) -> Decimal:
+        return self._reference_time_age_seconds(decision_snapshot.reference_time)
+
+    def _reference_time_age_seconds(self, reference_time: datetime) -> Decimal:
+        if reference_time.tzinfo is None or reference_time.utcoffset() is None:
+            raise RuntimeError("decision snapshot reference_time must be timezone-aware")
+        age_seconds = Decimal(
+            str((datetime.now(timezone.utc) - reference_time).total_seconds())
+        )
+        if age_seconds < Decimal("0"):
+            raise RuntimeError("decision snapshot reference_time cannot be in the future")
+        return age_seconds
+
+    def _live_order_reference_time_is_fresh(
+        self,
+        reference_time: datetime,
+        checked_at: datetime,
+        decision_record: DecisionRecord,
+        *,
+        context: str,
+        gate_suffix: str,
+    ) -> bool:
+        if reference_time.tzinfo is None or reference_time.utcoffset() is None:
+            raise RuntimeError("decision snapshot reference_time must be timezone-aware")
+        if checked_at.tzinfo is None or checked_at.utcoffset() is None:
+            raise RuntimeError("decision snapshot freshness check time must be timezone-aware")
+        age_seconds = Decimal(str((checked_at - reference_time).total_seconds()))
+        if age_seconds < Decimal("0"):
+            raise RuntimeError("decision snapshot reference_time cannot be in the future")
+        max_age_seconds = get_max_decision_snapshot_age_seconds_for_live()
+        decision_record.update(
+            decision_snapshot_age_seconds=age_seconds,
+            max_decision_snapshot_age_seconds=max_age_seconds,
+        )
+        if age_seconds <= max_age_seconds:
+            return True
+        gate = f"decision_snapshot_stale_{gate_suffix}"
+        reason = (
+            f"decision_snapshot_age_seconds={age_seconds} > "
+            f"MAX_DECISION_SNAPSHOT_AGE_SECONDS={max_age_seconds}"
+        )
+        logger.error(
+            f"LIVE ORDER BLOCKED: decision snapshot stale before {context} "
+            f"({reason})"
+        )
+        decision_record.reject(gate, reason)
+        return False
+
+    def _live_decision_snapshot_is_fresh(
+        self,
+        decision_snapshot: DecisionInputSnapshot,
+        rec: DecisionRecord,
+        *,
+        gate_suffix: str,
+    ) -> bool:
+        max_age_seconds = get_max_decision_snapshot_age_seconds_for_live()
+        age_seconds = self._decision_snapshot_age_seconds(decision_snapshot)
+        rec.update(
+            decision_snapshot_age_seconds=age_seconds,
+            max_decision_snapshot_age_seconds=max_age_seconds,
+        )
+        if age_seconds <= max_age_seconds:
+            return True
+        gate = f"decision_snapshot_stale_{gate_suffix}"
+        reason = (
+            f"decision_snapshot_age_seconds={age_seconds} > "
+            f"MAX_DECISION_SNAPSHOT_AGE_SECONDS={max_age_seconds}"
+        )
+        logger.error(f"LIVE ORDER BLOCKED: {reason}")
+        rec.reject(gate, reason)
+        return False
 
     async def _make_trading_decision(
         self,
-        current_price: Decimal,
+        decision_snapshot: DecisionInputSnapshot,
         trade_key=None,
         strategy_observation_mode: Optional[str] = None,
     ) -> bool:
@@ -4699,35 +5119,47 @@ class IntegratedBTCStrategy(Strategy):
         ``return False``; the positive path calls ``rec.decided(...)`` before
         delegating to the simulation/live executor.
         """
-        # --- Mode check ---
-        if strategy_observation_mode == "shadow_policy":
-            is_simulation = False
-            observation_mode = "shadow_policy"
-        else:
-            is_simulation = await self.check_simulation_mode()
-            observation_mode = (
-                strategy_observation_mode
-                if strategy_observation_mode is not None
-                else "simulation" if is_simulation else "live_gate"
-            )
-        observation_only = observation_mode == "shadow_policy"
+        current_price = decision_snapshot.current_price
 
         with DecisionRecord(
             current_price=current_price,
-            strategy_observation_mode=observation_mode,
+            strategy_observation_mode="mode_check_pending",
+            decision_id=decision_snapshot.decision_id,
         ) as rec:
+            # --- Mode check ---
+            if strategy_observation_mode == "shadow_policy":
+                is_simulation = False
+                observation_mode = "shadow_policy"
+            else:
+                is_simulation = await self.check_simulation_mode()
+                observation_mode = (
+                    strategy_observation_mode
+                    if strategy_observation_mode is not None
+                    else "simulation" if is_simulation else "live_gate"
+                )
+            observation_only = observation_mode == "shadow_policy"
+            rec.update(
+                strategy_observation_mode=observation_mode,
+            )
             return await self._make_trading_decision_body(
-                current_price, trade_key, is_simulation, rec, observation_only=observation_only
+                decision_snapshot, trade_key, is_simulation, rec, observation_only=observation_only
             )
 
     async def _make_trading_decision_body(
         self,
-        current_price: Decimal,
+        decision_snapshot: DecisionInputSnapshot,
         trade_key,
         is_simulation: bool,
         rec: DecisionRecord,
         observation_only: bool = False,
     ) -> bool:
+        current_price = decision_snapshot.current_price
+        rec.update(
+            decision_snapshot_at=decision_snapshot.captured_at,
+            decision_reference_time=decision_snapshot.reference_time,
+            decision_price_history_len=len(decision_snapshot.price_history),
+            decision_tick_buffer_len=len(decision_snapshot.tick_buffer),
+        )
         logger.info(f"Mode: {'SIMULATION' if is_simulation else 'LIVE TRADING'}")
         order_config = (
             validate_shadow_policy_observation_config()
@@ -4750,57 +5182,77 @@ class IntegratedBTCStrategy(Strategy):
                     f"{len(unresolved)} unresolved item(s)",
                 )
                 return False
-        if self._stable_tick_count < quote_stability_required:
+        if decision_snapshot.stable_tick_count < quote_stability_required:
             logger.error(
                 "ORDER BLOCKED: quote stability below configured threshold "
-                f"({self._stable_tick_count} < {quote_stability_required})"
+                f"({decision_snapshot.stable_tick_count} < {quote_stability_required})"
             )
             rec.reject(
                 "quote_stability_below_configured_threshold",
-                f"stable_tick_count={self._stable_tick_count} < required={quote_stability_required}",
+                f"stable_tick_count={decision_snapshot.stable_tick_count} < required={quote_stability_required}",
             )
             return False
 
         # --- Minimum history guard ---
-        if len(self.price_history) < 20:
-            logger.warning(f"Not enough price history ({len(self.price_history)}/20)")
+        if len(decision_snapshot.price_history) < 20:
+            logger.warning(f"Not enough price history ({len(decision_snapshot.price_history)}/20)")
             rec.reject(
                 "history_too_short",
-                f"len(price_history)={len(self.price_history)} < 20",
+                f"len(price_history)={len(decision_snapshot.price_history)} < 20",
             )
             return False
 
         logger.info(f"Current price: ${float(current_price):,.4f}")
 
+        if not is_simulation and not observation_only:
+            if not self._live_decision_snapshot_is_fresh(
+                decision_snapshot,
+                rec,
+                gate_suffix="before_context",
+            ):
+                return False
+
         # --- Build real metadata for processors ---
-        metadata = await self._fetch_market_context(current_price)
-        market_meta = self._require_current_market_metadata("trading decision")
+        metadata = await self._fetch_market_context(
+            decision_snapshot,
+            observation_only=observation_only,
+        )
+        if not is_simulation and not observation_only:
+            if not self._live_decision_snapshot_is_fresh(
+                decision_snapshot,
+                rec,
+                gate_suffix="before_signals",
+            ):
+                return False
         rec.update(
-            slug=market_meta.get("slug"),
-            condition_id=market_meta.get("condition_id"),
-            yes_token_id=market_meta.get("yes_token_id"),
-            no_token_id=market_meta.get("no_token_id"),
-            market_end_time=market_meta.get("end_time"),
+            context_sma20_deviation=metadata["context_sma20_deviation"],
+            context_momentum=metadata["momentum"],
+            context_volatility=metadata["volatility"],
+        )
+        market_meta = decision_snapshot.market_metadata()
+        rec.update(
+            slug=decision_snapshot.market_slug,
+            condition_id=decision_snapshot.condition_id,
+            yes_token_id=decision_snapshot.yes_token_id,
+            no_token_id=decision_snapshot.no_token_id,
+            market_end_time=decision_snapshot.market_end_time,
         )
 
         # --- Timing/price-band observability ---
-        market_end_iso = market_meta.get("end_time")
-        end_dt = self._parse_utc_datetime(market_end_iso) if market_end_iso else None
-        if end_dt is not None:
-            now_utc = datetime.now(timezone.utc)
-            # The 15-min sub-interval started 900 seconds before the close.
-            sub_interval_start = end_dt - timedelta(seconds=900)
-            seconds_into = (now_utc - sub_interval_start).total_seconds()
-            rec.update(
-                seconds_into_sub_interval=seconds_into,
-                trade_window_label=trade_window_label_for_seconds_into_sub_interval(
-                    seconds_into
-                ),
-            )
+        rec.update(
+            decision_market_timestamp=decision_snapshot.market_timestamp,
+            decision_sub_interval=decision_snapshot.sub_interval,
+            seconds_into_sub_interval=decision_snapshot.seconds_into_sub_interval,
+            trade_window_label=decision_snapshot.trade_window_label,
+        )
         rec.update(trend_price_band=trend_price_band_for(float(current_price)))
 
         # --- Run all three signal processors ---
-        signals = self._process_signals(current_price, metadata)
+        signals = self._process_signals(
+            decision_snapshot,
+            metadata,
+            observation_only=observation_only,
+        )
 
         if not signals:
             logger.info("No signals generated — no trade this interval")
@@ -4820,13 +5272,16 @@ class IntegratedBTCStrategy(Strategy):
                     "direction": str(getattr(sig.direction, "value", sig.direction)),
                     "score": float(getattr(sig, "score", 0.0)),
                     "confidence": float(getattr(sig, "confidence", 0.0)),
+                    "metadata": sig.metadata,
                 }
                 for sig in signals
             ]
         )
 
         # --- Fuse signals into one consensus ---
-        fused = self.fusion_engine.fuse_signals(signals, min_signals=2, min_score=55.0)
+        fusion_engine = self._fusion_engine_for_decision(observation_only)
+        with self._signal_processing_lock:
+            fused = fusion_engine.fuse_signals(signals, min_signals=2, min_score=55.0)
         if not fused:
             logger.info("Fusion produced no actionable signal — no trade this interval")
             rec.reject("fusion_no_consensus", "fusion_engine.fuse_signals returned None")
@@ -4915,8 +5370,8 @@ class IntegratedBTCStrategy(Strategy):
                 )
                 return False
 
-        last_tick = getattr(self, "_last_bid_ask", None)
-        if not last_tick:
+        last_tick = decision_snapshot.yes_bid_ask
+        if last_tick is None:
             logger.warning("SKIP: no executable YES quote cached")
             rec.reject("no_yes_quote", "self._last_bid_ask is None")
             return False
@@ -4928,8 +5383,8 @@ class IntegratedBTCStrategy(Strategy):
             side_token_id = market_meta.get("yes_token_id")
             selected_order_book_key = "yes_order_book"
         else:
-            no_tick = getattr(self, "_last_no_bid_ask", None)
-            if not no_tick:
+            no_tick = decision_snapshot.no_bid_ask
+            if no_tick is None:
                 logger.warning("SKIP: no executable NO ask cached")
                 rec.reject("no_no_quote", "self._last_no_bid_ask is None")
                 return False
@@ -4967,17 +5422,17 @@ class IntegratedBTCStrategy(Strategy):
                 )
                 return False
             if direction == "long":
-                if not hasattr(self, "_yes_instrument_id") or self._yes_instrument_id is None:
+                if decision_snapshot.yes_instrument_id is None:
                     logger.warning("SKIP: YES token instrument unavailable for LIMIT_IOC")
                     rec.reject("limit_ioc_no_yes_instrument", "_yes_instrument_id is None")
                     return False
-                trade_instrument_id = self._yes_instrument_id
+                trade_instrument_id = decision_snapshot.yes_instrument_id
             else:
-                if not hasattr(self, "_no_instrument_id") or self._no_instrument_id is None:
+                if decision_snapshot.no_instrument_id is None:
                     logger.warning("SKIP: NO token instrument unavailable for LIMIT_IOC")
                     rec.reject("limit_ioc_no_no_instrument", "_no_instrument_id is None")
                     return False
-                trade_instrument_id = self._no_instrument_id
+                trade_instrument_id = decision_snapshot.no_instrument_id
             instrument = self.cache.instrument(trade_instrument_id)
             if not instrument:
                 logger.error(f"SKIP: instrument not in cache for LIMIT_IOC: {trade_instrument_id}")
@@ -5062,6 +5517,14 @@ class IntegratedBTCStrategy(Strategy):
             )
             return True
 
+        if not is_simulation:
+            if not self._live_decision_snapshot_is_fresh(
+                decision_snapshot,
+                rec,
+                gate_suffix="before_execution",
+            ):
+                return False
+
         # Risk engine tracks submitted orders plus filled markets until settlement.
         is_valid, error = self.risk_engine.validate_new_position(
             size=POSITION_SIZE_USD,
@@ -5079,45 +5542,33 @@ class IntegratedBTCStrategy(Strategy):
         )
 
         # --- Liquidity guard: don't place if market has no real depth ---
-        # The current bid/ask come from the last processed quote tick.
+        # The bid/ask values come from the frozen decision snapshot.
         # If ask <= 0.02 or bid <= 0.02, the orderbook is essentially empty
         # and a FAK (IOC market) order will be rejected immediately.
-        last_tick = getattr(self, '_last_bid_ask', None)
-        if last_tick:
-            last_bid, last_ask = last_tick
-            MIN_LIQUIDITY = Decimal("0.02")
-            if direction == "long" and last_ask <= MIN_LIQUIDITY:
+        MIN_LIQUIDITY = Decimal("0.02")
+        if direction == "long":
+            if yes_ask <= MIN_LIQUIDITY:
                 logger.warning(
-                    f"⚠ Skipping UP/YES trade: YES ask=${float(last_ask):.4f} "
+                    f"⚠ Skipping UP/YES trade: YES ask=${float(yes_ask):.4f} "
                     f"is at or below the ${float(MIN_LIQUIDITY):.2f} liquidity floor. "
                     "Market is too thin/extreme; will retry next tick."
                 )
                 rec.reject(
                     "liquidity_floor_yes_ask",
-                    f"YES ask={float(last_ask):.4f} <= {float(MIN_LIQUIDITY):.2f}",
+                    f"YES ask={float(yes_ask):.4f} <= {float(MIN_LIQUIDITY):.2f}",
                 )
                 return False
-            if direction == "short":
-                no_tick = getattr(self, "_last_no_bid_ask", None)
-                if not no_tick:
-                    logger.warning(
-                        "⚠ Skipping DOWN/NO trade: no direct NO quote available yet. "
-                        "Waiting for NO ask; will retry next tick."
-                    )
-                    rec.reject("no_no_quote_at_liquidity_check", "_last_no_bid_ask is None")
-                    return False
-                no_bid, no_ask = no_tick
-                if no_ask <= MIN_LIQUIDITY:
-                    logger.warning(
-                        f"⚠ Skipping DOWN/NO trade: NO ask=${float(no_ask):.4f} "
-                        f"is at or below the ${float(MIN_LIQUIDITY):.2f} liquidity floor. "
-                        "Market is too thin/extreme; will retry next tick."
-                    )
-                    rec.reject(
-                        "liquidity_floor_no_ask",
-                        f"NO ask={float(no_ask):.4f} <= {float(MIN_LIQUIDITY):.2f}",
-                    )
-                    return False
+        elif no_ask <= MIN_LIQUIDITY:
+            logger.warning(
+                f"⚠ Skipping DOWN/NO trade: NO ask=${float(no_ask):.4f} "
+                f"is at or below the ${float(MIN_LIQUIDITY):.2f} liquidity floor. "
+                "Market is too thin/extreme; will retry next tick."
+            )
+            rec.reject(
+                "liquidity_floor_no_ask",
+                f"NO ask={float(no_ask):.4f} <= {float(MIN_LIQUIDITY):.2f}",
+            )
+            return False
 
         # Positive decision — record before delegating to executor.
         rec.decided(direction=direction)
@@ -5132,14 +5583,21 @@ class IntegratedBTCStrategy(Strategy):
                 current_price,
                 direction,
                 order_type=order_type,
+                market_meta=market_meta,
+                quoted_price=top_of_book_entry,
+                price_source=entry_source,
+                decision_stable_tick_count=decision_snapshot.stable_tick_count,
+                decision_reference_time=decision_snapshot.reference_time,
+                decision_record=rec,
                 accepted_limit_price=accepted_limit_price,
                 submitted_limit_price=submitted_limit_price,
                 limit_order_token_qty=limit_order_token_qty,
             )
         if not placed:
-            # Reject reason tracked at the executor layer; surface a generic
-            # late-stage rejection so the record still reflects the outcome.
-            rec.reject("executor_returned_false", "place_real_order or paper_trade returned False")
+            if rec.fields["rejected_at_gate"] is None:
+                # Reject reason tracked at the executor layer; surface a generic
+                # late-stage rejection so the record still reflects the outcome.
+                rec.reject("executor_returned_false", "place_real_order or paper_trade returned False")
         if placed and trade_key is not None:
             self.last_trade_time = trade_key
         return placed
@@ -5394,14 +5852,16 @@ class IntegratedBTCStrategy(Strategy):
         direction,
         *,
         order_type: str,
+        market_meta: Dict[str, Any],
+        quoted_price: Decimal,
+        price_source: str,
+        decision_stable_tick_count: int,
+        decision_reference_time: datetime,
+        decision_record: DecisionRecord,
         accepted_limit_price: Optional[Decimal] = None,
         submitted_limit_price: Optional[Decimal] = None,
         limit_order_token_qty: Optional[Decimal] = None,
     ) -> bool:
-        if not self.instrument_id:
-            logger.error("No instrument available")
-            return False
-
         runtime_sizing_mode = get_sizing_mode_for_live()
         pct_of_free_collateral = None
         fixed_market_buy_usd = None
@@ -5473,10 +5933,10 @@ class IntegratedBTCStrategy(Strategy):
             )
             return False
         quote_stability_required = runtime_order_config["quote_stability_required"]
-        if self._stable_tick_count < quote_stability_required:
+        if decision_stable_tick_count < quote_stability_required:
             logger.error(
                 "LIVE ORDER BLOCKED: quote stability below configured threshold "
-                f"({self._stable_tick_count} < {quote_stability_required})"
+                f"({decision_stable_tick_count} < {quote_stability_required})"
             )
             return False
         limit_ioc_fill_policy = runtime_order_config["limit_ioc_fill_policy"]
@@ -5523,21 +5983,21 @@ class IntegratedBTCStrategy(Strategy):
             side = OrderSide.BUY
 
             if direction == "long":
-                if not hasattr(self, "_yes_instrument_id") or self._yes_instrument_id is None:
+                trade_instrument_id = market_meta.get("yes_instrument_id")
+                if trade_instrument_id is None:
                     logger.warning(
                         "YES token instrument not found for this market — skipping trade."
                     )
                     return False
-                trade_instrument_id = self._yes_instrument_id
                 trade_label = "YES (UP)"
             else:
-                if not hasattr(self, "_no_instrument_id") or self._no_instrument_id is None:
+                trade_instrument_id = market_meta.get("no_instrument_id")
+                if trade_instrument_id is None:
                     logger.warning(
                         "NO token instrument not found for this market — "
                         "cannot bet DOWN. Skipping trade."
                     )
                     return False
-                trade_instrument_id = self._no_instrument_id
                 trade_label = "NO (DOWN)"
 
             instrument = self.cache.instrument(trade_instrument_id)
@@ -5548,28 +6008,17 @@ class IntegratedBTCStrategy(Strategy):
             logger.info(f"Buying {trade_label} token: {trade_instrument_id}")
 
             max_usd_amount = float(position_size)
-            last_tick = getattr(self, "_last_bid_ask", None)
-            if not last_tick:
-                logger.warning("YES quote is unavailable at order placement; skipping")
-                return False
-            last_bid, last_ask = last_tick
-            if direction == "long":
-                quoted_price = last_ask
-                price_source = "YES ask"
-            else:
-                no_tick = getattr(self, "_last_no_bid_ask", None)
-                if not no_tick:
-                    logger.warning("NO ask is unavailable at order placement; skipping")
-                    return False
-                _, no_ask = no_tick
-                quoted_price = no_ask
-                price_source = "NO ask"
-
             timestamp_ms = int(time.time() * 1000)
             unique_id = f"BTC-15MIN-${max_usd_amount:.0f}-{timestamp_ms}"
             submitted_order_id = unique_id
-            submitted_at = datetime.now(timezone.utc)
-            market_meta = self._require_current_market_metadata("live order placement")
+            expiry_checked_at = datetime.now(timezone.utc)
+            active_market_meta = self._require_current_market_metadata("live order placement active market check")
+            if active_market_meta.get("condition_id") != market_meta.get("condition_id"):
+                logger.error(
+                    "Live order rejected: active market condition_id no longer matches decision snapshot "
+                    f"({active_market_meta.get('condition_id')} != {market_meta.get('condition_id')})"
+                )
+                return False
             market_slug = market_meta.get("slug")
             condition_id = market_meta.get("condition_id")
             if market_slug in (None, "") or condition_id in (None, ""):
@@ -5583,6 +6032,12 @@ class IntegratedBTCStrategy(Strategy):
                     f"Live order rejected: missing/invalid market_end_time for {market_slug}"
                 )
                 return False
+            if expiry_checked_at >= market_end_time:
+                logger.error(
+                    "Live order rejected: decision snapshot market expired before submit "
+                    f"({expiry_checked_at.isoformat()} >= {market_end_time.isoformat()})"
+                )
+                return False
             token_id = (
                 market_meta.get("yes_token_id")
                 if direction == "long"
@@ -5590,7 +6045,18 @@ class IntegratedBTCStrategy(Strategy):
             )
             if token_id in (None, ""):
                 logger.error(
-                    f"Live order rejected: current market metadata missing token_id for {trade_label}"
+                    f"Live order rejected: decision snapshot metadata missing token_id for {trade_label}"
+                )
+                return False
+            active_token_id = (
+                active_market_meta.get("yes_token_id")
+                if direction == "long"
+                else active_market_meta.get("no_token_id")
+            )
+            if active_token_id != token_id:
+                logger.error(
+                    "Live order rejected: active market token_id no longer matches decision snapshot "
+                    f"({active_token_id} != {token_id})"
                 )
                 return False
             instrument_identity = self._extract_polymarket_instrument_identity(
@@ -5694,29 +6160,6 @@ class IntegratedBTCStrategy(Strategy):
             else:
                 raise RuntimeError(f"unexpected ORDER_TYPE after validation: {order_type!r}")
 
-            submitted_meta = {
-                "entry_price": entry_price_for_intent,
-                "size": position_size,
-                "direction": direction,
-                "trade_label": trade_label,
-                "estimated_tokens": estimated_tokens_for_intent,
-                "order_type": order_type,
-                "quote_quantity": quote_quantity,
-                "quantity_mode": quantity_mode,
-                "limit_ioc_fill_policy": limit_ioc_fill_policy,
-                "accepted_limit_price": accepted_limit_price,
-                "submitted_limit_price": submitted_price_for_intent,
-                "instrument_id": str(trade_instrument_id),
-                "token_id": token_id,
-                "slug": market_slug,
-                "condition_id": condition_id,
-                "market_start_time": self._jsonable(market_meta.get("start_time")),
-                "market_end_time": market_end_time.isoformat(),
-                "submitted_at": submitted_at,
-                "signal_score": getattr(signal, "score", 0.0),
-                "signal_confidence": getattr(signal, "confidence", 0.0),
-            }
-
             with self._settlement_lock:
                 unresolved = self._unresolved_settlement_unknowns()
                 if unresolved:
@@ -5726,6 +6169,43 @@ class IntegratedBTCStrategy(Strategy):
                         f"unresolved ledger state in {LIVE_TRADE_LEDGER_PATH.name}."
                     )
                     return False
+                submitted_at = datetime.now(timezone.utc)
+                if submitted_at >= market_end_time:
+                    logger.error(
+                        "LIVE ORDER BLOCKED: decision snapshot market expired before intent persistence "
+                        f"({submitted_at.isoformat()} >= {market_end_time.isoformat()})"
+                    )
+                    return False
+                if not self._live_order_reference_time_is_fresh(
+                    decision_reference_time,
+                    submitted_at,
+                    decision_record,
+                    context="intent persistence",
+                    gate_suffix="before_intent_persistence",
+                ):
+                    return False
+                submitted_meta = {
+                    "entry_price": entry_price_for_intent,
+                    "size": position_size,
+                    "direction": direction,
+                    "trade_label": trade_label,
+                    "estimated_tokens": estimated_tokens_for_intent,
+                    "order_type": order_type,
+                    "quote_quantity": quote_quantity,
+                    "quantity_mode": quantity_mode,
+                    "limit_ioc_fill_policy": limit_ioc_fill_policy,
+                    "accepted_limit_price": accepted_limit_price,
+                    "submitted_limit_price": submitted_price_for_intent,
+                    "instrument_id": str(trade_instrument_id),
+                    "token_id": token_id,
+                    "slug": market_slug,
+                    "condition_id": condition_id,
+                    "market_start_time": self._jsonable(market_meta.get("start_time")),
+                    "market_end_time": market_end_time.isoformat(),
+                    "submitted_at": submitted_at,
+                    "signal_score": getattr(signal, "score", 0.0),
+                    "signal_confidence": getattr(signal, "confidence", 0.0),
+                }
                 self._persist_submitted_order_intent_locked(
                     order_id=unique_id,
                     meta=submitted_meta,
@@ -5781,74 +6261,108 @@ class IntegratedBTCStrategy(Strategy):
     # Signal processing
     # ------------------------------------------------------------------
 
-    def _process_signals(self, current_price, metadata=None):
-        signals = []
-        if metadata is None:
-            metadata = {}
+    def _fusion_engine_for_decision(self, observation_only: bool) -> SignalFusionEngine:
+        return self._shadow_fusion_engine if observation_only else self.fusion_engine
 
-        processed_metadata = {}
-        for key, value in metadata.items():
-            if isinstance(value, float):
-                processed_metadata[key] = Decimal(str(value))
-            else:
-                processed_metadata[key] = value
+    def _process_signals(
+        self,
+        decision_snapshot: DecisionInputSnapshot,
+        metadata=None,
+        *,
+        observation_only: bool = False,
+    ):
+        with self._signal_processing_lock:
+            signals = []
+            if metadata is None:
+                metadata = {}
+            current_price = decision_snapshot.current_price
+            historical_prices = decision_snapshot.price_history
+            spike_detector = (
+                self._shadow_spike_detector if observation_only else self.spike_detector
+            )
+            sentiment_processor = (
+                self._shadow_sentiment_processor if observation_only else self.sentiment_processor
+            )
+            divergence_processor = (
+                self._shadow_divergence_processor if observation_only else self.divergence_processor
+            )
+            orderbook_processor = (
+                self._shadow_orderbook_processor if observation_only else self.orderbook_processor
+            )
+            tick_velocity_processor = (
+                self._shadow_tick_velocity_processor
+                if observation_only
+                else self.tick_velocity_processor
+            )
+            deribit_pcr_processor = (
+                self._shadow_deribit_pcr_processor
+                if observation_only
+                else self.deribit_pcr_processor
+            )
 
-        spike_signal = self.spike_detector.process(
-            current_price=current_price,
-            historical_prices=self.price_history,
-            metadata=processed_metadata,
-        )
-        if spike_signal:
-            signals.append(spike_signal)
+            processed_metadata = {}
+            for key, value in metadata.items():
+                if isinstance(value, float):
+                    processed_metadata[key] = Decimal(str(value))
+                else:
+                    processed_metadata[key] = value
 
-        if 'sentiment_score' in processed_metadata:
-            sentiment_signal = self.sentiment_processor.process(
+            spike_signal = spike_detector.process(
                 current_price=current_price,
-                historical_prices=self.price_history,
+                historical_prices=historical_prices,
                 metadata=processed_metadata,
             )
-            if sentiment_signal:
-                signals.append(sentiment_signal)
+            if spike_signal:
+                signals.append(spike_signal)
 
-        if 'spot_price' in processed_metadata:
-            divergence_signal = self.divergence_processor.process(
+            if 'sentiment_score' in processed_metadata:
+                sentiment_signal = sentiment_processor.process(
+                    current_price=current_price,
+                    historical_prices=historical_prices,
+                    metadata=processed_metadata,
+                )
+                if sentiment_signal:
+                    signals.append(sentiment_signal)
+
+            if 'spot_price' in processed_metadata:
+                divergence_signal = divergence_processor.process(
+                    current_price=current_price,
+                    historical_prices=historical_prices,
+                    metadata=processed_metadata,
+                )
+                if divergence_signal:
+                    signals.append(divergence_signal)
+
+            # --- Order Book Imbalance (real-time Polymarket CLOB depth) ---
+            if processed_metadata.get('yes_token_id'):
+                ob_signal = orderbook_processor.process(
+                    current_price=current_price,
+                    historical_prices=historical_prices,
+                    metadata=processed_metadata,
+                )
+                if ob_signal:
+                    signals.append(ob_signal)
+
+            # --- Tick Velocity (last 60s of Polymarket probability movement) ---
+            if processed_metadata.get('tick_buffer'):
+                tv_signal = tick_velocity_processor.process(
+                    current_price=current_price,
+                    historical_prices=historical_prices,
+                    metadata=processed_metadata,
+                )
+                if tv_signal:
+                    signals.append(tv_signal)
+
+            # --- Deribit Put/Call Ratio (institutional options sentiment) ---
+            pcr_signal = deribit_pcr_processor.process(
                 current_price=current_price,
-                historical_prices=self.price_history,
+                historical_prices=historical_prices,
                 metadata=processed_metadata,
             )
-            if divergence_signal:
-                signals.append(divergence_signal)
+            if pcr_signal:
+                signals.append(pcr_signal)
 
-        # --- Order Book Imbalance (real-time Polymarket CLOB depth) ---
-        if processed_metadata.get('yes_token_id'):
-            ob_signal = self.orderbook_processor.process(
-                current_price=current_price,
-                historical_prices=self.price_history,
-                metadata=processed_metadata,
-            )
-            if ob_signal:
-                signals.append(ob_signal)
-
-        # --- Tick Velocity (last 60s of Polymarket probability movement) ---
-        if processed_metadata.get('tick_buffer'):
-            tv_signal = self.tick_velocity_processor.process(
-                current_price=current_price,
-                historical_prices=self.price_history,
-                metadata=processed_metadata,
-            )
-            if tv_signal:
-                signals.append(tv_signal)
-
-        # --- Deribit Put/Call Ratio (institutional options sentiment) ---
-        pcr_signal = self.deribit_pcr_processor.process(
-            current_price=current_price,
-            historical_prices=self.price_history,
-            metadata=processed_metadata,
-        )
-        if pcr_signal:
-            signals.append(pcr_signal)
-
-        return signals
+            return signals
 
     # ------------------------------------------------------------------
     # Order events
@@ -7946,6 +8460,8 @@ def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, tes
 
     order_config = validate_live_order_config()
     sizing_config = validate_live_sizing_config() if not simulation else None
+    if not simulation:
+        get_max_decision_snapshot_age_seconds_for_live()
     nautilus_log_dir = get_nautilus_log_dir()
 
     if not quote_warning_patch_applied:
@@ -8189,6 +8705,7 @@ def main():
         # Live gate (1): explicit sizing and balance-freshness configuration
         validate_live_sizing_config()
         validate_live_order_config()
+        get_max_decision_snapshot_age_seconds_for_live()
 
         # Live gate (2): interactive LIVE confirmation unless --confirm-live
         if args.confirm_live:
