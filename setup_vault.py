@@ -24,36 +24,75 @@ PUBLIC_PROFILE_URL = "https://gamma-api.polymarket.com/public-profile"
 API_CREDENTIAL_ACTIONS = frozenset({"create", "derive"})
 
 
+def _print_input_error(message: str) -> None:
+    print(f"Error: {message}")
+
+
 def _prompt_text(label: str) -> str:
-    value = input(f"{label}: ").strip()
-    if value == "":
-        raise ValueError(f"{label} cannot be empty")
-    return value
+    while True:
+        value = input(f"{label}: ").strip()
+        if value != "":
+            return value
+        _print_input_error(f"{label} cannot be empty")
 
 
 def _prompt_secret(label: str) -> str:
-    value = getpass(f"{label}: ").strip()
-    if value == "":
-        raise ValueError(f"{label} cannot be empty")
-    return value
+    while True:
+        value = getpass(f"{label}: ").strip()
+        if value != "":
+            return value
+        _print_input_error(f"{label} cannot be empty")
+
+
+def _prompt_private_key() -> str:
+    while True:
+        try:
+            return verify_private_key(_prompt_secret("POLYMARKET_PK"))
+        except ValueError as exc:
+            _print_input_error(str(exc))
 
 
 def _prompt_signature_type() -> int:
-    raw = _prompt_text("POLYMARKET_SIGNATURE_TYPE (0, 1, 2, or 3)")
-    try:
-        signature_type = int(raw)
-    except ValueError as exc:
-        raise ValueError("POLYMARKET_SIGNATURE_TYPE must be an integer") from exc
-    if signature_type not in {0, 1, 2, 3}:
-        raise ValueError("POLYMARKET_SIGNATURE_TYPE must be 0, 1, 2, or 3")
-    return signature_type
+    while True:
+        raw = _prompt_text("POLYMARKET_SIGNATURE_TYPE (0, 1, 2, or 3)")
+        try:
+            signature_type = int(raw)
+        except ValueError:
+            _print_input_error("POLYMARKET_SIGNATURE_TYPE must be an integer")
+            continue
+        if signature_type not in {0, 1, 2, 3}:
+            _print_input_error("POLYMARKET_SIGNATURE_TYPE must be 0, 1, 2, or 3")
+            continue
+        return signature_type
 
 
 def _prompt_api_credential_action() -> str:
-    action = _prompt_text("CLOB API credential action (create or derive)").lower()
-    if action not in API_CREDENTIAL_ACTIONS:
-        raise ValueError("CLOB API credential action must be create or derive")
-    return action
+    while True:
+        action = _prompt_text("CLOB API credential action (create or derive)").lower()
+        if action in API_CREDENTIAL_ACTIONS:
+            return action
+        _print_input_error("CLOB API credential action must be create or derive")
+
+
+def _validate_address(address: str, label: str) -> str:
+    if not address.startswith("0x"):
+        raise ValueError(f"{label} must start with 0x")
+    if len(address) != 42:
+        raise ValueError(f"{label} must be 42 characters")
+    try:
+        int(address[2:], 16)
+    except ValueError as exc:
+        raise ValueError(f"{label} must contain only hex characters") from exc
+    return address
+
+
+def _prompt_funder() -> str:
+    while True:
+        funder = _prompt_text("POLYMARKET_FUNDER")
+        try:
+            return _validate_address(funder, "POLYMARKET_FUNDER")
+        except ValueError as exc:
+            _print_input_error(str(exc))
 
 
 def _public_profile(owner_address: str) -> dict[str, object]:
@@ -82,11 +121,12 @@ def _resolve_funder(private_key: str, signature_type: int) -> str:
         deposit_wallet = payload["proxyWallet"]
         if not isinstance(deposit_wallet, str) or deposit_wallet.strip() == "":
             raise RuntimeError(f"Polymarket profile returned invalid proxyWallet: {payload}")
+        deposit_wallet = _validate_address(deposit_wallet.strip(), "Polymarket proxyWallet")
         print(f"Signer address: {signer_address}")
         print(f"Deposit wallet: {deposit_wallet}")
-        return deposit_wallet.strip()
+        return deposit_wallet
     print(f"Signer address: {signer_address}")
-    return _prompt_text("POLYMARKET_FUNDER")
+    return _prompt_funder()
 
 
 def _request_clob_credentials(
@@ -121,11 +161,16 @@ def _request_clob_credentials(
 
 
 def _prompt_password() -> str:
-    password = validate_vault_password(getpass("New vault password: "))
-    confirm = validate_vault_password(getpass("Confirm vault password: "))
-    if password != confirm:
-        raise ValueError("vault passwords do not match")
-    return password
+    while True:
+        try:
+            password = validate_vault_password(getpass("New vault password: "))
+            confirm = validate_vault_password(getpass("Confirm vault password: "))
+        except ValueError as exc:
+            _print_input_error(str(exc))
+            continue
+        if password == confirm:
+            return password
+        _print_input_error("vault passwords do not match")
 
 
 def parse_args() -> argparse.Namespace:
@@ -150,7 +195,7 @@ def main() -> int:
     print(f"Vault path: {args.vault}")
     print()
 
-    private_key = verify_private_key(_prompt_secret("POLYMARKET_PK"))
+    private_key = _prompt_private_key()
     signature_type = _prompt_signature_type()
     polygon_rpc_url = _prompt_secret("POLYGON_RPC_URL")
     funder = _resolve_funder(private_key, signature_type)
