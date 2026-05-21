@@ -21,8 +21,30 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
 
-from sops_plaintext_env_guard import is_live_invocation, refuse_plaintext_env_in_live_mode
-refuse_plaintext_env_in_live_mode(repo_root=project_root)
+def is_live_invocation(argv: list[str] | None = None) -> bool:
+    args = list(sys.argv if argv is None else argv)
+    if "--live" in args:
+        return True
+    live_mode = os.getenv("BOT_LIVE_MODE")
+    return live_mode is not None and live_mode.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_vault_secret_env_key(key: str) -> bool:
+    return key == "POLYGON_RPC_URL" or key.startswith("POLYMARKET_")
+
+
+def _refuse_live_secret_environment_before_imports() -> None:
+    for key in sorted(os.environ):
+        if _is_vault_secret_env_key(key):
+            raise RuntimeError(
+                f"Live mode refuses secret key {key} in process environment before imports. "
+                "Move Polymarket credentials and Polygon RPC URL into "
+                "credentials/encrypted_credentials.json."
+            )
+
+
+if is_live_invocation():
+    _refuse_live_secret_environment_before_imports()
 
 
 try:
@@ -85,8 +107,28 @@ from execution.risk_engine import get_risk_engine
 from monitoring.performance_tracker import get_performance_tracker
 from monitoring.grafana_exporter import get_grafana_exporter
 from feedback.learning_engine import get_learning_engine
-if not is_live_invocation():
-    load_dotenv(dotenv_path=project_root / ".env")
+
+from vault_store import (
+    DEFAULT_VAULT_FILE,
+    load_vault_from_prompt,
+    refuse_secret_dotenv_keys,
+    refuse_secret_environment_keys,
+)
+
+
+repo_env_path = project_root / ".env"
+
+
+def prepare_live_environment() -> None:
+    refuse_secret_dotenv_keys(repo_env_path)
+    load_dotenv(dotenv_path=repo_env_path)
+    refuse_secret_environment_keys()
+
+
+if is_live_invocation():
+    prepare_live_environment()
+else:
+    load_dotenv(dotenv_path=repo_env_path)
 from patch_market_orders import (
     apply_market_order_patch,
     register_actual_fill_handler,
@@ -283,14 +325,6 @@ def init_redis():
         return None
 
 
-def get_required_env(name: str, description: str) -> str:
-    """Read a required environment variable without logging secret values."""
-    value = os.getenv(name)
-    if value:
-        return value
-    raise RuntimeError(f"Environment variable '{name}' not set. {description}")
-
-
 def get_optional_env(name: str, default: str) -> str:
     """Read an optional environment variable, treating empty strings as unset."""
     value = os.getenv(name)
@@ -318,45 +352,7 @@ def get_polymarket_runtime_credentials(simulation: bool) -> dict[str, str | int]
             "signature_type": signature_type,
         }
 
-    return {
-        "private_key": get_required_env(
-            "POLYMARKET_PK",
-            "Set this to the private key for the wallet that signs Polymarket orders.",
-        ),
-        "funder": get_required_env(
-            "POLYMARKET_FUNDER",
-            "Set this to the public wallet/deposit address that holds funds on Polymarket.",
-        ),
-        "api_key": get_required_env(
-            "POLYMARKET_API_KEY",
-            "Set this to your Polymarket CLOB API key.",
-        ),
-        "api_secret": get_required_env(
-            "POLYMARKET_API_SECRET",
-            "Set this to your Polymarket CLOB API secret.",
-        ),
-        "passphrase": get_required_env(
-            "POLYMARKET_PASSPHRASE",
-            "Set this to your Polymarket CLOB API passphrase.",
-        ),
-        "signature_type": get_polymarket_signature_type(),
-    }
-
-
-def get_polymarket_signature_type() -> int:
-    """Read the Polymarket signature type from the environment."""
-    raw_value = get_required_env(
-        "POLYMARKET_SIGNATURE_TYPE",
-        "Use 0 for a normal MetaMask/EOA wallet, 1 for an existing Polymarket proxy wallet, "
-        "2 for a Gnosis Safe wallet, or 3 for a deposit wallet.",
-    )
-    try:
-        signature_type = int(raw_value)
-    except ValueError as exc:
-        raise RuntimeError("POLYMARKET_SIGNATURE_TYPE must be an integer: 0, 1, 2, or 3") from exc
-    if signature_type not in {0, 1, 2, 3}:
-        raise RuntimeError("POLYMARKET_SIGNATURE_TYPE must be 0, 1, 2, or 3")
-    return signature_type
+    return load_vault_from_prompt(DEFAULT_VAULT_FILE).to_runtime_credentials()
 
 
 def get_market_buy_usd() -> Decimal:
@@ -8452,6 +8448,8 @@ def ensure_live_market_order_patch() -> None:
 
 def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, test_mode: bool = False):
     """Run the integrated BTC 15-min trading bot - LOADS ALL BTC MARKETS FOR THE DAY"""
+    if not simulation:
+        prepare_live_environment()
     
     print("=" * 80)
     print("INTEGRATED POLYMARKET BTC 15-MIN TRADING BOT")

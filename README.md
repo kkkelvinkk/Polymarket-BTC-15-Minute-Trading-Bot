@@ -105,23 +105,25 @@ source venv/bin/activate
 bash
 pip install -r requirements.txt
 ```
-## 4. Configure Environment Variables
+## 4. Configure Runtime Settings And Vault
 
-Repo-root plaintext `.env` is for local simulation/test-mode runs only. Live
-deployments must use SOPS through `/opt/polybot/secrets/.env.sops.yaml`; follow
-[deploy/README.md](deploy/README.md) for live first-run setup.
+Live Polymarket credentials are stored in the encrypted local vault:
 
-For local simulation, create or edit `.env` with non-production credentials:
+```bash
+python setup_vault.py
+```
+
+That writes `credentials/encrypted_credentials.json` with owner-only file mode.
+For signature type `3`, setup discovers the Polymarket deposit wallet and
+prompts whether to `create` or `derive` wallet-backed CLOB API credentials. The
+bot prompts for the vault password when live mode starts.
+
+Create or edit `.env` for non-secret runtime settings:
+
+Live startup rejects `POLYMARKET_*` keys and `POLYGON_RPC_URL` in both
+`.env` and the inherited process environment.
 
 ```env
-# Polymarket API Credentials (local simulation/test-mode only)
-POLYMARKET_PK=your_private_key_here
-POLYMARKET_FUNDER=your_deposit_or_wallet_address_here
-POLYMARKET_SIGNATURE_TYPE=3
-POLYMARKET_API_KEY=wallet_derived_api_key_here
-POLYMARKET_API_SECRET=wallet_derived_api_secret_here
-POLYMARKET_PASSPHRASE=wallet_derived_passphrase_here
-
 # Redis Configuration
 REDIS_HOST=localhost
 REDIS_PORT=6379
@@ -147,7 +149,6 @@ EV_SPREAD_BUFFER=0.01
 LIVE_SETTLEMENT_GRACE_SECONDS=3600
 REQUIRE_AUTO_REDEEM_TOKEN_HINT=true
 LIVE_TRADE_LEDGER_PATH=live_trades.json
-POLYGON_RPC_URL=https://your-polygon-rpc.example
 
 # Live sizing. fixed uses MARKET_BUY_USD. percent uses
 # PCT_OF_FREE_COLLATERAL_PER_TRADE and rejects, rather than clamps, if the
@@ -390,19 +391,22 @@ edge after buffers, are computed only on records that also have executable-entry
 and estimated-cost fields. This is the calibration gate; the estimator above is
 only a quick inspection tool.
 
-For Polymarket's current deposit-wallet flow, `POLYMARKET_PK` is the private key for the signer wallet and `POLYMARKET_FUNDER` is the Polymarket deposit wallet address. Do not guess the funder address from MetaMask; discover it from Polymarket:
+For Polymarket's current deposit-wallet flow, `setup_vault.py` discovers the
+deposit wallet and stores it as the vault funder. To refresh the stored deposit
+wallet later:
 
 ```bash
 venv/bin/python configure_polymarket_deposit_wallet.py
 ```
 
-Then derive and record the wallet-derived CLOB API credentials:
+To refresh existing wallet-derived CLOB API credentials in the vault:
 
 ```bash
 venv/bin/python derive_polymarket_api_creds.py
 ```
 
-Do not use Builder or Relayer API keys for `POLYMARKET_API_KEY`; the bot expects wallet-derived CLOB API credentials.
+Do not use Builder or Relayer API keys as Polymarket CLOB API credentials; the
+bot expects wallet-derived CLOB API credentials.
 
 Check the CLOB balance seen by the bot. This is the number the live trading adapter will use:
 
@@ -410,11 +414,14 @@ Check the CLOB balance seen by the bot. This is the number the live trading adap
 venv/bin/python check_polymarket_balance.py --sync
 ```
 
-For older direct MetaMask/EOA trading only, set `POLYMARKET_FUNDER` to the same public address shown in MetaMask and `POLYMARKET_SIGNATURE_TYPE=0`. If that wallet has Polygon USDC.e but CLOB allowances are `0`, approve the spender contracts from the MetaMask EOA wallet:
+For older direct MetaMask/EOA trading only, set the vault funder to the same
+public address shown in MetaMask and set vault signature type to `0`. If that
+wallet has Polygon USDC.e but CLOB allowances are `0`, approve the spender
+contracts from the MetaMask EOA wallet:
 
 ```bash
-POLYGON_RPC_URL=https://your-polygon-rpc.example venv/bin/python approve_polymarket_clob.py
-POLYGON_RPC_URL=https://your-polygon-rpc.example venv/bin/python approve_polymarket_clob.py --execute
+venv/bin/python approve_polymarket_clob.py
+venv/bin/python approve_polymarket_clob.py --execute
 venv/bin/python check_polymarket_balance.py --sync
 ```
 ## 5. Start Redis
@@ -438,7 +445,7 @@ bash
 python bot.py --test-mode
 
 # Live trading mode (REAL MONEY!)
-# Use deploy/README.md and SOPS; repo-root plaintext .env is refused in live.
+# Requires credentials/encrypted_credentials.json and prompts for its password.
 python bot.py --live --confirm-live
 ```
 ## ⚙️ Configuration Options

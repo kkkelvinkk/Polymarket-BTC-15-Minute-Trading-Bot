@@ -14,8 +14,8 @@
 # guarantee. After a failure, the operator must inspect the journal, reconcile
 # any unresolved ledger state, and then ``systemctl start polybot`` explicitly.
 #
-# Live mode refuses repo-root plaintext .env before dotenv loading. Keep live
-# credentials in the SOPS file referenced by ExecStart.
+# Live mode decrypts credentials/encrypted_credentials.json. The service asks
+# systemd for the vault password as root, then runs bot.py as the polybot user.
 
 [Unit]
 Description=Polymarket BTC 15-Min Trading Bot
@@ -24,18 +24,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=polybot
-Group=polybot
 WorkingDirectory=/opt/polybot/Polymarket-BTC-15-Minute-Trading-Bot
-
-# Plaintext .env launches are blocked in live mode. Do not enable
-# EnvironmentFile=/opt/polybot/Polymarket-BTC-15-Minute-Trading-Bot/.env
 
 Environment=LIVE_TRADE_LEDGER_PATH=/opt/polybot/ledger/live_trades.json
 Environment=NAUTILUS_LOG_DIR=/opt/polybot/logs/nautilus
 Environment=DECISION_LOG_PATH=/opt/polybot/ledger/decisions.jsonl
 
-ExecStart=/usr/local/bin/sops exec-env /opt/polybot/secrets/.env.sops.yaml '/opt/polybot/venv/bin/python bot.py --live --confirm-live'
+ExecStart=/bin/sh -c 'systemd-ask-password "Polymarket credentials vault password:" | /usr/sbin/runuser --preserve-environment -u polybot -- /opt/polybot/venv/bin/python bot.py --live --confirm-live'
 
 Restart=no
 
@@ -53,7 +48,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/polybot/ledger /opt/polybot/logs
+ReadWritePaths=/opt/polybot/ledger /opt/polybot/logs /run/systemd/ask-password
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

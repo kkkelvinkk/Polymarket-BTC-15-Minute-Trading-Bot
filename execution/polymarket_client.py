@@ -1,14 +1,22 @@
-"""
-Polymarket Client - Production Implementation
-Real API integration with Polymarket CLOB
-"""
-import os
+"""Legacy Polymarket CLOB client wrapper."""
+
+import hashlib
+import json
 from decimal import Decimal
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, Dict, Any, List
 from loguru import logger
 
 from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import ApiCreds, AssetType, BalanceAllowanceParams
+from py_clob_client_v2 import ApiCreds as V2ApiCreds
+from py_clob_client_v2 import AssetType as V2AssetType
+from py_clob_client_v2 import BalanceAllowanceParams as V2BalanceAllowanceParams
+from py_clob_client_v2 import ClobClient as V2ClobClient
+from py_clob_client_v2.clob_types import OrderPayload as V2OrderPayload
+from clob_units import parse_clob_units
+from vault_store import DEFAULT_VAULT_FILE, PolymarketVault, load_vault_from_prompt
 POLYMARKET_AVAILABLE = True
 
 
@@ -29,6 +37,8 @@ class PolymarketClient:
         api_key: Optional[str] = None,
         api_secret: Optional[str] = None,
         api_passphrase: Optional[str] = None,
+        funder: Optional[str] = None,
+        signature_type: int = 1,
         chain_id: int = 137,  # Polygon mainnet
         testnet: bool = False,
     ):
@@ -43,17 +53,18 @@ class PolymarketClient:
             chain_id: 137 for Polygon mainnet, 80002 for Amoy testnet
             testnet: Use testnet mode
         """
-        # Load from environment if not provided
-        self.private_key = private_key or os.getenv("POLYMARKET_PK")
-        self.api_key = api_key or os.getenv("POLYMARKET_API_KEY")
-        self.api_secret = api_secret or os.getenv("POLYMARKET_API_SECRET")
-        self.api_passphrase = api_passphrase or os.getenv("POLYMARKET_PASSPHRASE")
+        self.private_key = private_key
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.api_passphrase = api_passphrase
+        self.funder = funder
+        self.signature_type = signature_type
         
         self.chain_id = chain_id
         self.testnet = testnet
         
         # Client instance
-        self.client: Optional[ClobClient] = None
+        self.client: Optional[object] = None
         self._connected = False
         
         # Market cache
@@ -66,9 +77,9 @@ class PolymarketClient:
         
         # Validate credentials
         if not self.private_key:
-            logger.error("POLYMARKET_PK not found in environment")
+            logger.error("Polymarket private key was not provided")
         if not self.api_key:
-            logger.error("POLYMARKET_API_KEY not found in environment")
+            logger.error("Polymarket API key was not provided")
         
         mode = "TESTNET" if testnet else "MAINNET"
         logger.info(f"Initialized Polymarket Client [{mode}] Chain ID: {chain_id}")
@@ -84,28 +95,19 @@ class PolymarketClient:
             logger.error("Cannot connect: SDK not installed")
             return False
         
-        if not self.private_key or not self.api_key:
+        if (
+            not self.private_key
+            or not self.api_key
+            or not self.api_secret
+            or not self.api_passphrase
+        ):
             logger.error("Cannot connect: Missing credentials")
             return False
         
+        self._connected = False
+        self.client = None
         try:
-            # Initialize CLOB client
-            self.client = ClobClient(
-                host="https://clob.polymarket.com" if not self.testnet else "https://clob-testnet.polymarket.com",
-                key=self.private_key,
-                chain_id=self.chain_id,
-                signature_type=1,  # EOA signature
-                funder=os.getenv("POLYMARKET_FUNDER"),  # Optional funder address
-            )
-            
-            # Set API credentials for authenticated endpoints
-            self.client.set_api_creds(
-                api_key=self.api_key,
-                api_secret=self.api_secret,
-                api_passphrase=self.api_passphrase,
-            )
-            
-            # Test connection
+            self.client = self._build_clob_client()
             balance = await self._get_balance_internal()
             
             if balance is not None:
@@ -115,13 +117,55 @@ class PolymarketClient:
                 return True
             else:
                 logger.error("Failed to verify connection")
+                self.client = None
                 return False
                 
         except Exception as e:
+            self.client = None
             logger.error(f"Failed to connect to Polymarket: {e}")
             import traceback
             traceback.print_exc()
             return False
+
+    def _host(self) -> str:
+        if self.testnet:
+            return "https://clob-testnet.polymarket.com"
+        return "https://clob.polymarket.com"
+
+    def _build_clob_client(self) -> object:
+        if self.signature_type == 3:
+            return V2ClobClient(
+                self._host(),
+                key=self.private_key,
+                chain_id=self.chain_id,
+                signature_type=self.signature_type,
+                funder=self.funder,
+                creds=V2ApiCreds(
+                    api_key=self.api_key,
+                    api_secret=self.api_secret,
+                    api_passphrase=self.api_passphrase,
+                ),
+            )
+        return ClobClient(
+            self._host(),
+            key=self.private_key,
+            chain_id=self.chain_id,
+            signature_type=self.signature_type,
+            funder=self.funder,
+            creds=ApiCreds(
+                api_key=self.api_key,
+                api_secret=self.api_secret,
+                api_passphrase=self.api_passphrase,
+            ),
+        )
+
+    def _collateral_balance_params(self) -> object:
+        if self.signature_type == 3:
+            return V2BalanceAllowanceParams(asset_type=V2AssetType.COLLATERAL)
+        return BalanceAllowanceParams(
+            asset_type=AssetType.COLLATERAL,
+            signature_type=self.signature_type,
+        )
     
     async def disconnect(self) -> None:
         """Disconnect from API."""
@@ -141,19 +185,9 @@ class PolymarketClient:
             return None
         
         try:
-            # Search for BTC markets
-            # Note: You'll need to find the specific market ID for your BTC price prediction
-            # This is a placeholder - update with actual market ID
-            
-            # Example: Get market by condition ID
-            # markets = self.client.get_markets()
-            
-            # For now, return a mock structure
-            # TODO: Implement actual market search
             logger.warning("BTC market lookup not fully implemented")
-            
             return {
-                "condition_id": "BTC_PRICE_PREDICTION",  # Replace with real ID
+                "condition_id": "BTC_PRICE_PREDICTION",
                 "market_id": "btc_market",
                 "question": "Will BTC be above $65000?",
                 "end_date": "2026-03-01",
@@ -173,23 +207,14 @@ class PolymarketClient:
         Returns:
             Current price (0-1 for binary markets)
         """
-        if not self.client:
+        if not self.is_connected:
+            raise RuntimeError("Polymarket client must be connected before reading prices")
+
+        book = self.client.get_order_book(token_id)
+        bids, _asks = self._orderbook_entries(book)
+        if len(bids) == 0:
             return None
-        
-        try:
-            # Get order book
-            book = self.client.get_order_book(token_id)
-            
-            if book and "bids" in book and len(book["bids"]) > 0:
-                # Best bid price
-                best_bid = Decimal(str(book["bids"][0]["price"]))
-                return best_bid
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"Error fetching market price: {e}")
-            return None
+        return Decimal(str(self._order_summary_value(bids[0], "price")))
     
     async def get_orderbook(self, token_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -201,34 +226,33 @@ class PolymarketClient:
         Returns:
             Order book with bids and asks
         """
-        if not self.client:
-            return None
-        
-        try:
-            book = self.client.get_order_book(token_id)
-            
-            return {
-                "timestamp": datetime.now(),
-                "token_id": token_id,
-                "bids": [
-                    {
-                        "price": Decimal(str(bid["price"])),
-                        "size": Decimal(str(bid["size"])),
-                    }
-                    for bid in book.get("bids", [])
-                ],
-                "asks": [
-                    {
-                        "price": Decimal(str(ask["price"])),
-                        "size": Decimal(str(ask["size"])),
-                    }
-                    for ask in book.get("asks", [])
-                ],
-            }
-            
-        except Exception as e:
-            logger.error(f"Error fetching orderbook: {e}")
-            return None
+        if not self.is_connected:
+            raise RuntimeError("Polymarket client must be connected before reading order books")
+
+        book = self.client.get_order_book(token_id)
+        bids, asks = self._orderbook_entries(book)
+        return {
+            "timestamp": datetime.now(),
+            "token_id": token_id,
+            "bids": [self._normalize_order_summary(bid) for bid in bids],
+            "asks": [self._normalize_order_summary(ask) for ask in asks],
+        }
+
+    def _orderbook_entries(self, book: object) -> tuple[list, list]:
+        if self.signature_type == 3:
+            return book["bids"], book["asks"]
+        return book.bids, book.asks
+
+    def _normalize_order_summary(self, summary: object) -> Dict[str, Decimal]:
+        return {
+            "price": Decimal(str(self._order_summary_value(summary, "price"))),
+            "size": Decimal(str(self._order_summary_value(summary, "size"))),
+        }
+
+    def _order_summary_value(self, summary: object, key: str) -> str:
+        if self.signature_type == 3:
+            return summary[key]
+        return getattr(summary, key)
     
     async def place_order(
         self,
@@ -266,21 +290,25 @@ class PolymarketClient:
         Returns:
             True if cancelled successfully
         """
-        if not self.client:
-            return False
-        
-        try:
-            response = self.client.cancel_order(order_id)
-            
-            if response:
-                logger.info(f"Order cancelled: {order_id}")
-                return True
-            
-            return False
-            
-        except Exception as e:
-            logger.error(f"Error cancelling order: {e}")
-            return False
+        if not self.is_connected:
+            raise RuntimeError("Polymarket client must be connected before cancelling orders")
+        if self.signature_type == 3:
+            response = self.client.cancel_order(V2OrderPayload(orderID=str(order_id)))
+        else:
+            response = self.client.cancel(order_id)
+        if self._cancel_response_succeeded(response, str(order_id)):
+            logger.info(f"Order cancelled: {order_id}")
+            return True
+        return False
+
+    def _cancel_response_succeeded(self, response: object, order_id: str) -> bool:
+        if not isinstance(response, dict):
+            raise RuntimeError(f"unexpected cancel response type: {type(response).__name__}")
+        canceled = response["canceled"]
+        not_canceled = response["not_canceled"]
+        if not isinstance(canceled, list) or not isinstance(not_canceled, dict):
+            raise RuntimeError(f"unexpected cancel response shape: {response!r}")
+        return order_id in canceled and order_id not in not_canceled
     
     async def get_open_orders(self) -> List[Dict[str, Any]]:
         """
@@ -289,30 +317,24 @@ class PolymarketClient:
         Returns:
             List of open orders
         """
-        if not self.client:
-            return []
-        
-        try:
+        if not self.is_connected:
+            raise RuntimeError("Polymarket client must be connected before listing open orders")
+        if self.signature_type == 3:
+            orders = self.client.get_open_orders()
+        else:
             orders = self.client.get_orders()
-            
-            open_orders = []
-            for order in orders:
-                if order.get("status") == "live":
-                    open_orders.append({
-                        "order_id": order["id"],
-                        "token_id": order["token_id"],
-                        "side": order["side"],
-                        "price": Decimal(str(order["price"])),
-                        "size": Decimal(str(order["size"])),
-                        "filled": Decimal(str(order.get("size_matched", 0))),
-                        "timestamp": datetime.fromisoformat(order["created_at"]),
-                    })
-            
-            return open_orders
-            
-        except Exception as e:
-            logger.error(f"Error fetching open orders: {e}")
-            return []
+        return [self._normalize_open_order(order) for order in orders]
+
+    def _normalize_open_order(self, order: dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "order_id": order["id"],
+            "token_id": order["asset_id"],
+            "side": order["side"],
+            "price": Decimal(str(order["price"])),
+            "size": Decimal(str(order["original_size"])),
+            "filled": Decimal(str(order["size_matched"])),
+            "timestamp": datetime.fromtimestamp(int(order["created_at"])),
+        }
     
     async def get_positions(self) -> List[Dict[str, Any]]:
         """
@@ -321,27 +343,10 @@ class PolymarketClient:
         Returns:
             List of positions
         """
-        if not self.client:
-            return []
-        
-        try:
-            # Get balance of outcome tokens
-            balances = self.client.get_balances()
-            
-            positions = []
-            for token_id, balance in balances.items():
-                if token_id != "USDC" and float(balance) > 0:
-                    positions.append({
-                        "token_id": token_id,
-                        "size": Decimal(str(balance)),
-                        "timestamp": datetime.now(),
-                    })
-            
-            return positions
-            
-        except Exception as e:
-            logger.error(f"Error fetching positions: {e}")
-            return []
+        raise RuntimeError(
+            "Legacy PolymarketClient position lookup is disabled; "
+            "use bot.py live position accounting"
+        )
     
     async def _get_balance_internal(self) -> Optional[Dict[str, Decimal]]:
         """Internal method to get balance."""
@@ -349,12 +354,11 @@ class PolymarketClient:
             return None
         
         try:
-            balances = self.client.get_balances()
-            
-            return {
-                token: Decimal(str(amount))
-                for token, amount in balances.items()
-            }
+            response = self.client.get_balance_allowance(
+                self._collateral_balance_params(),
+            )
+            balance_units = parse_clob_units(response["balance"], "balance", response)
+            return {"USDC": Decimal(balance_units) / Decimal("1000000")}
             
         except Exception as e:
             logger.error(f"Error fetching balance: {e}")
@@ -411,10 +415,45 @@ class PolymarketClient:
 
 # Singleton instance
 _polymarket_client_instance = None
+_polymarket_client_cache_key = None
+_polymarket_client_source_path = None
+
+
+def _client_cache_key(vault: PolymarketVault, testnet: bool) -> tuple[bool, str]:
+    credential_shape = json.dumps(
+        {
+            "private_key": vault.private_key,
+            "api_key": vault.api_key,
+            "api_secret": vault.api_secret,
+            "passphrase": vault.passphrase,
+            "funder": vault.funder,
+            "signature_type": vault.signature_type,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return (
+        testnet,
+        hashlib.sha256(credential_shape.encode("utf-8")).hexdigest(),
+    )
+
+
+def _client_from_vault(vault: PolymarketVault, testnet: bool) -> PolymarketClient:
+    return PolymarketClient(
+        private_key=vault.private_key,
+        api_key=vault.api_key,
+        api_secret=vault.api_secret,
+        api_passphrase=vault.passphrase,
+        funder=vault.funder,
+        signature_type=vault.signature_type,
+        testnet=testnet,
+    )
 
 def get_polymarket_client(
     testnet: bool = False,
     force_new: bool = False,
+    vault: Optional[PolymarketVault] = None,
+    vault_path=DEFAULT_VAULT_FILE,
 ) -> PolymarketClient:
     """
     Get singleton Polymarket client.
@@ -422,10 +461,36 @@ def get_polymarket_client(
     Args:
         testnet: Use testnet mode
         force_new: Force creation of new instance
+        vault: Preloaded encrypted-vault credentials
+        vault_path: Vault path to load when vault is not provided
     """
-    global _polymarket_client_instance
-    
-    if _polymarket_client_instance is None or force_new:
-        _polymarket_client_instance = PolymarketClient(testnet=testnet)
+    global _polymarket_client_instance, _polymarket_client_cache_key, _polymarket_client_source_path
+
+    source_path = Path(vault_path).expanduser().resolve(strict=False)
+    if (
+        vault is None
+        and not force_new
+        and _polymarket_client_instance is not None
+        and _polymarket_client_source_path == source_path
+        and _polymarket_client_instance.testnet == testnet
+    ):
+        return _polymarket_client_instance
+
+    selected_vault = vault
+    if selected_vault is None:
+        selected_vault = load_vault_from_prompt(source_path)
+    else:
+        source_path = None
+
+    cache_key = _client_cache_key(selected_vault, testnet)
+    if (
+        _polymarket_client_instance is None
+        or force_new
+        or cache_key != _polymarket_client_cache_key
+        or source_path != _polymarket_client_source_path
+    ):
+        _polymarket_client_instance = _client_from_vault(selected_vault, testnet)
+        _polymarket_client_cache_key = cache_key
+        _polymarket_client_source_path = source_path
     
     return _polymarket_client_instance

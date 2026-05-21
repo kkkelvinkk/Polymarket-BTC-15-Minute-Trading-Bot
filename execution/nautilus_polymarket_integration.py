@@ -8,7 +8,13 @@ from loguru import logger
 from dotenv import load_dotenv
 
 from execution.btc_market_slugs import current_btc_15m_slug, get_next_btc_15m_markets
-from sops_plaintext_env_guard import refuse_plaintext_env_in_live_mode
+from vault_store import (
+    DEFAULT_VAULT_PATH,
+    PolymarketVault,
+    load_vault_from_prompt,
+    refuse_secret_dotenv_keys,
+    refuse_secret_environment_keys,
+)
 
 from nautilus_trader.adapters.polymarket import POLYMARKET
 from nautilus_trader.adapters.polymarket import (
@@ -68,10 +74,14 @@ class PolymarketBTCIntegration:
         """
         self.simulation_mode = simulation_mode
         self.btc_market_condition_id = btc_market_condition_id
+        self._live_vault: Optional[PolymarketVault] = None
         if self.simulation_mode:
             load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
         else:
-            refuse_plaintext_env_in_live_mode(repo_root=PROJECT_ROOT, argv=("--live",))
+            refuse_secret_dotenv_keys(PROJECT_ROOT / ".env")
+            load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
+            refuse_secret_environment_keys()
+            self._live_vault = load_vault_from_prompt(PROJECT_ROOT / DEFAULT_VAULT_PATH)
         
         # Nautilus components
         self.node: Optional[TradingNode] = None
@@ -157,21 +167,41 @@ class PolymarketBTCIntegration:
         
         logger.info(f"Loading BTC 15-min markets: {btc_markets}")
         
+        if self.simulation_mode:
+            private_key = os.getenv("POLYMARKET_PK")
+            api_key = os.getenv("POLYMARKET_API_KEY")
+            api_secret = os.getenv("POLYMARKET_API_SECRET")
+            passphrase = os.getenv("POLYMARKET_PASSPHRASE")
+            extra_auth_config: dict[str, object] = {}
+        else:
+            if self._live_vault is None:
+                raise RuntimeError("live vault was not loaded")
+            private_key = self._live_vault.private_key
+            api_key = self._live_vault.api_key
+            api_secret = self._live_vault.api_secret
+            passphrase = self._live_vault.passphrase
+            extra_auth_config = {
+                "signature_type": self._live_vault.signature_type,
+                "funder": self._live_vault.funder,
+            }
+
         # Polymarket data client config
         poly_data_cfg = PolymarketDataClientConfig(
-            private_key=os.getenv("POLYMARKET_PK"),
-            api_key=os.getenv("POLYMARKET_API_KEY"),
-            api_secret=os.getenv("POLYMARKET_API_SECRET"),
-            passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
+            private_key=private_key,
+            api_key=api_key,
+            api_secret=api_secret,
+            passphrase=passphrase,
+            **extra_auth_config,
             instrument_config=instrument_cfg,
         )
         
         # Polymarket execution client config
         poly_exec_cfg = PolymarketExecClientConfig(
-            private_key=os.getenv("POLYMARKET_PK"),
-            api_key=os.getenv("POLYMARKET_API_KEY"),
-            api_secret=os.getenv("POLYMARKET_API_SECRET"),
-            passphrase=os.getenv("POLYMARKET_PASSPHRASE"),
+            private_key=private_key,
+            api_key=api_key,
+            api_secret=api_secret,
+            passphrase=passphrase,
+            **extra_auth_config,
             instrument_config=instrument_cfg,
         )
         

@@ -26,7 +26,7 @@ This document lays out the full sequence of fixes and enhancements before the ne
 | 4.5 strategy timing / price-band evaluation | **SHADOW OBSERVATION SHIPPED; DATA PENDING** | `bot.py` now records live-gate fields and runs `shadow_policy` candidate windows/bands without order submission, risk reservation, or ledger writes. Needs accumulated observations and an analysis report before any live policy change. |
 | 5A market-depth estimator helpers + EV-gate WIRING | **SHIPPED + WIRED** | `depth_estimator.py` + 22 tests; EV-gate now uses `_compute_depth_aware_entry` to compute VWAP via `estimate_market_ioc_fill` on the SELECTED token's asks (YES book for long, NO book for short). Fail-closed on missing token id, fetch error, empty asks, invalid book level, or book too thin. 5 new wiring tests covering each fail-closed branch. |
 | 5B LIMIT_IOC depth integration | **SHIPPED + WIRED; LIVE SMOKE PENDING** | `estimate_limit_ioc_fill(...)` is wired through `_make_trading_decision_body` / `_compute_depth_aware_entry_details` for `ORDER_TYPE=limit_ioc`, including partial-ok depth behavior, no-liquidity rejection, and all-or-nothing fail-closed behavior. Remaining item is live smoke verification. |
-| 6 SOPS credential management | **WIRED FOR LIVE SOPS; OPERATOR VALIDATION PENDING** | `bot.py` refuses plaintext `.env` before dotenv in live mode and skips `load_dotenv()` in live; simulation still loads the explicit repo `.env`. SOPS templates and deploy docs remain aligned. |
+| 6 encrypted credential vault | **VAULT WIRING SHIPPED; OPERATOR VALIDATION PENDING** | `bot.py` loads live Polymarket credentials from `credentials/encrypted_credentials.json`; `.env` is non-secret runtime config. |
 | 7 live env reload | **DECIDED — Option C** | "Don't implement"; restart-driven config workflow documented in `README.md` + `deploy/README.md`. Effort: 0 days per plan |
 | 7.5 multi-asset evaluation | **EVALUATION TEMPLATE SHIPPED** | `deploy/multi_asset_evaluation_template.md` — operator fills in asset selection + topology + per-asset calibration decision; follow-up implementation effort sized in the template by topology choice |
 | 8 Linux deployment | **TEMPLATES + LOG DIR WIRING SHIPPED; LIVE DEPLOY VERIFY PENDING** | `deploy/polybot.service` + `deploy/polybot.logrotate` + `deploy/polybot-ledger-backup.cron` + `deploy/README.md` are shipped, and Nautilus logging now honors required `NAUTILUS_LOG_DIR`. Operator still verifies on the target server. |
@@ -1131,9 +1131,11 @@ Important distinction: these are read **from the running process's environment**
 | `MAX_POSITIONS` | `RiskEngine.__init__` | Restart required |
 | `MAX_DRAWDOWN_PCT` | `RiskEngine.__init__` | Restart required |
 | `MAX_LOSS_PER_DAY` | `RiskEngine.__init__` | Restart required |
-| `POLYMARKET_*` | once during node construction | Restart required |
 | `REDIS_*` | `init_redis()` | Restart required |
-| `POLYGON_RPC_URL` | only by `approve_polymarket_clob.py` | N/A to bot |
+
+Live Polymarket credentials and `POLYGON_RPC_URL` are read from
+`credentials/encrypted_credentials.json` when the live process or vault-aware
+admin helper starts.
 
 ### Listed in docs but NOT wired
 
@@ -2411,37 +2413,58 @@ Historical implementation estimate: 1 day. Remaining work: one minimum `$5.51` l
 
 ---
 
-## Phase 6 — SOPS Credential Management (Live Bot Wiring Shipped)
+## Phase 6 — Encrypted Credential Vault (Live Bot Wiring Shipped)
 
-**Status:** Guard module, live bot wiring, tests, templates, service variant, and deploy docs are shipped. Operator validation on the target SOPS launch path is still pending. No phase-numbered SOPS source filename remains.
+**Status:** Vault crypto, live bot wiring, admin helper wiring, tests, service
+template, and deploy docs are shipped. Operator validation on the target vault
+launch path is still pending.
 
 ### Motivation
 
-Plaintext `.env` is a known risk. SOPS-encrypted credentials decrypted into process environment at runtime is the standard pattern.
+Plaintext `.env` is a known risk, and external secret-management tooling is too
+difficult for the intended operator flow. Live Polymarket credentials now live
+in one password-encrypted local vault:
+
+```text
+credentials/encrypted_credentials.json
+```
 
 ### Approach
 
 ```bash
-sops exec-env .env.sops.yaml 'venv/bin/python bot.py --live'
+python setup_vault.py
+python bot.py --live --confirm-live
 ```
 
 ### Shipped assets and live wiring
 
 Current shipped assets:
 
-- `sops_plaintext_env_guard.py` implements Pattern A: refuse plaintext `.env` in live mode before dotenv loading.
-- `bot.py` calls `refuse_plaintext_env_in_live_mode(repo_root=project_root)` before any dotenv load and skips `load_dotenv()` entirely for live invocations.
-- `execution/nautilus_polymarket_integration.py` uses the same live guard and only loads the explicit repo `.env` in simulation mode.
-- `tests/test_sops_plaintext_env_guard.py` covers the guard behavior.
-- `deploy/.env.sops.yaml.example` documents the encrypted credential shape.
-- `deploy/polybot.service` includes the SOPS `exec-env` variant.
-- `deploy/README.md` documents the SOPS workflow.
+- `vault_crypto.py` implements the Argon2id + Fernet JSON vault format.
+- `vault_store.py` defines the Polymarket vault payload and live runtime loader.
+- `setup_vault.py` creates `credentials/encrypted_credentials.json` with mode
+  `0600` and requires the operator to choose either `create` or `derive` for
+  CLOB API credentials.
+- `bot.py` loads non-secret `.env` runtime settings for live invocations,
+  rejects `POLYMARKET_*` keys and `POLYGON_RPC_URL` in `.env` and inherited environment
+  variables, and loads Polymarket live credentials from the encrypted vault.
+- `execution/nautilus_polymarket_integration.py` uses the same vault in live
+  mode, rejects vault-secret keys, then loads non-secret repo `.env` runtime
+  settings before decrypting the vault.
+- `derive_polymarket_api_creds.py`, `configure_polymarket_deposit_wallet.py`,
+  `check_polymarket_balance.py`, and `approve_polymarket_clob.py` read or update
+  the encrypted vault instead of plaintext `.env` credentials.
+- `deploy/polybot.service` uses `systemd-ask-password` to request the vault
+  password at service startup.
+- `deploy/README.md` documents the encrypted-vault workflow.
 
-Remaining operational work: validate the target server's key-management path and confirm `sops exec-env` injects the required Polymarket credentials before `bot.py --live` starts.
+Remaining operational work: create the target vault, verify the password prompt
+path on the target host, and complete one live smoke trade after the vault is in
+place.
 
 ### Effort
 
-Remaining effort is operator validation on the target launch path and key-management provider.
+Remaining effort is operator validation on the target launch path.
 
 ---
 
@@ -2466,7 +2489,7 @@ Option B — **Redis-backed config:**
 - Risk limits and other tunable config live in Redis hashes.
 - Bot polls Redis every N seconds or subscribes via pub-sub.
 - Already have Redis infrastructure for mode switching.
-- Cleaner separation from credentials (which stay in env).
+- Cleaner separation from credentials (which stay in `credentials/encrypted_credentials.json`).
 
 Option C — **Don't implement.** Operator restarts the bot to change risk limits. Document this clearly.
 
@@ -2474,12 +2497,10 @@ Option C — **Don't implement.** Operator restarts the bot to change risk limit
 
 **Option C for now.** The bot has 90-minute auto-restart anyway. No code change needed.
 
-**Operator workflow depends on which credential mode is active:**
-
-- **Before Phase 6 (plaintext `.env`):** operator edits `.env`, kills the bot, waits <90s for the wrapper to restart it, new values are live.
-- **After Phase 6 (SOPS adopted):** operator edits the encrypted `.env.sops.yaml`, kills the bot, the wrapper restart re-invokes `sops exec-env` which decrypts fresh values into the process environment. **Plaintext `.env` editing no longer applies** — Phase 6 refuses to start in live mode with plaintext `.env` present.
-
-This resolves the prior Phase 6/7 wording conflict. Phase 7's "edit and restart" workflow always refers to the configured credential source, whether plaintext or SOPS.
+**Operator workflow:** edit non-secret runtime settings in `.env`, update live
+Polymarket credentials through `setup_vault.py` or the dedicated vault-aware
+admin helper, then restart the process. The wrapper restart re-reads `.env` and
+the live bot prompts for the vault password before decrypting credentials.
 
 If operator wants finer-grained control later, Option B (Redis-backed risk config) is the right design — same pattern as the existing simulation_mode switch.
 
@@ -2532,7 +2553,7 @@ Phase 0 (lost-fill reconciliation + fill guards) ─────┐
                                        Phase 8 (Linux deployment: systemd, backups, monitoring) ── NEW
                                                       │
                                                       ▼
-                                       Phase 6 (SOPS bot wiring shipped; operator validation pending)
+                                       Phase 6 (encrypted vault wiring shipped; operator validation pending)
                                        Phase 7 (live reload — recommend: don't implement)
 ```
 
@@ -2624,15 +2645,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=polybot
-Group=polybot
 WorkingDirectory=/opt/polybot/Polymarket-BTC-15-Minute-Trading-Bot
 
-# Live mode refuses repo-root plaintext .env before dotenv loading.
 Environment=LIVE_TRADE_LEDGER_PATH=/opt/polybot/ledger/live_trades.json
 Environment=NAUTILUS_LOG_DIR=/opt/polybot/logs/nautilus
 Environment=DECISION_LOG_PATH=/opt/polybot/ledger/decisions.jsonl
-ExecStart=/usr/local/bin/sops exec-env /opt/polybot/secrets/.env.sops.yaml '/opt/polybot/venv/bin/python bot.py --live --confirm-live'
+ExecStart=/bin/sh -c 'systemd-ask-password "Polymarket credentials vault password:" | /usr/sbin/runuser --preserve-environment -u polybot -- /opt/polybot/venv/bin/python bot.py --live --confirm-live'
 
 Restart=no
 
@@ -2650,7 +2668,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/polybot/ledger /opt/polybot/logs
+ReadWritePaths=/opt/polybot/ledger /opt/polybot/logs /run/systemd/ask-password
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
@@ -2663,8 +2681,8 @@ Critical notes:
 
 - **`Restart=no`.** The bot's Phase 0 design fail-stops on durable-write failure. systemd must not automatically restart after fail-stop because restart would weaken the manual-reconciliation guarantee. If the operator later wants automatic restart for non-ledger crashes, add exact exit-code separation and get explicit approval before changing this unit.
 - **No `Restart=always` or `Restart=on-failure`.** Those would clear or weaken the fail-stop guarantee.
-- **`User=polybot`, not root.** Containment in case of a compromise.
-- **`ProtectSystem=strict` + `ReadWritePaths`.** The bot can only write to ledger and logs directories. This requires `LIVE_TRADE_LEDGER_PATH` and `NAUTILUS_LOG_DIR` to point inside the writable service paths.
+- **Root launcher, `polybot` Python process.** The unit starts as root only to publish the system-wide `systemd-ask-password` query, then immediately execs the Python bot as `polybot` through `/usr/sbin/runuser`.
+- **`ProtectSystem=strict` + `ReadWritePaths`.** The bot can write only to ledger/log directories, and the root launcher can publish the password query under `/run/systemd/ask-password`. This requires `LIVE_TRADE_LEDGER_PATH` and `NAUTILUS_LOG_DIR` to point inside the writable service paths.
 - **`MemoryMax=1G`.** The bot's working set is small; a runaway memory leak would be killed before exhausting the host.
 
 ### Redis dependency
@@ -2732,8 +2750,10 @@ operator → ssh server
 
 ### Security checklist
 
-- Live Polymarket credentials live in `/opt/polybot/secrets/.env.sops.yaml` and are decrypted by `sops exec-env`. Never commit plaintext credentials to git.
-- `/opt/polybot/secrets/.env.sops.yaml` file mode `0600 polybot:polybot`; repo-root plaintext `.env` is simulation-only and must not exist on live servers.
+- Live Polymarket credentials live in `credentials/encrypted_credentials.json`.
+  Never commit plaintext credentials or the vault password to git.
+- `credentials/encrypted_credentials.json` file mode `0600 polybot:polybot`;
+  repo-root `.env` contains non-secret runtime settings only.
 - Bot user has no shell (`/usr/sbin/nologin` in `/etc/passwd`) — operator interacts via systemctl, journalctl, and the admin tool only.
 - Firewall: outbound to `clob.polymarket.com:443`, `gamma-api.polymarket.com:443`, `data-api.polymarket.com:443`, Polygon RPC endpoint, Redis (if remote). No inbound except SSH (operator) and Grafana port if remote-monitored.
 - The `mark_settlement_resolved.py` tool requires shell access to the server. Restrict ssh accordingly.
@@ -2776,7 +2796,7 @@ operator → ssh server
 | 3. ORDER_TYPE + quote stability | 3 days | Code | Shipped + wired; live smoke pending |
 | 5B. LIMIT_IOC depth integration | 0.5 day | Code | Shipped + wired; live smoke pending |
 | **7.5. Multi-asset evaluation (NEW)** | **Operator-driven, no code** | **Decision** | **No (gates deployment scope)** |
-| 6. SOPS | Live bot wiring shipped; operator validation pending | Code + ops | No; guard/templates/docs shipped |
+| 6. Encrypted credential vault | Live bot wiring shipped; operator validation pending | Code + ops | No; vault/docs shipped |
 | **8. Linux deployment (NEW)** | **1 day operator** | **Ops scaffolding + shipped log-dir wiring** | **No (production deploy)** |
 | 7. Live reload | 0 days (Option C) | Docs only | No |
 
@@ -2797,7 +2817,7 @@ operator → ssh server
 5. **`QUOTE_STABILITY_REQUIRED` for live mode.** Live mode requires an explicit positive integer. Normal live config is `QUOTE_STABILITY_REQUIRED=3`; changing it is an operator decision because it directly affects whether a submitted limit price was computed from a stable quote stream.
 6. **`LIMIT_IOC` partial-fill policy.** For the currently verified FAK wire behavior, routine live resume requires `LIMIT_IOC_FILL_POLICY=partial_ok`; `all_or_nothing` remains fail-closed until a deliberate FOK submission path is implemented and wire-format tested. There is no plan default.
 7. **Strategy timing/price-band policy.** After Phase 4.5 reports the baseline vs candidate windows/bands, operator must explicitly approve either "keep current `13_14` + `0.60/0.40`" or one exact replacement policy. No automatic switch based on analysis output.
-8. **SOPS adoption timeline.** Code wiring is shipped; the operator still needs to validate the selected key-management path on the target host.
+8. **Encrypted vault rollout.** Code wiring is shipped; the operator still needs to create the target vault and validate the password prompt path on the target host.
 
 ---
 

@@ -5,12 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import time
 import urllib.request
 from decimal import Decimal
+from pathlib import Path
 
-from dotenv import load_dotenv
 from eth_account import Account
 from py_clob_client.client import ApiCreds
 from py_clob_client.client import ClobClient
@@ -18,16 +17,11 @@ from py_clob_client.clob_types import AssetType
 from py_clob_client.clob_types import BalanceAllowanceParams
 from py_clob_client.constants import POLYGON
 
+from vault_store import DEFAULT_VAULT_FILE, load_vault_from_prompt
+
 
 USDC_DECIMALS = Decimal("1000000")
 MAX_UINT256 = 2**256 - 1
-
-
-def required_env(name: str) -> str:
-    value = os.getenv(name)
-    if not value:
-        raise RuntimeError(f"{name} is missing from .env")
-    return value.strip()
 
 
 def normalize_private_key(private_key: str) -> str:
@@ -149,17 +143,12 @@ def parse_args() -> argparse.Namespace:
         help="Broadcast the approval transaction. Without this flag the script only prints a dry run.",
     )
     parser.add_argument(
-        "--rpc-url",
-        help="Polygon RPC URL. Required unless POLYGON_RPC_URL is set.",
+        "--vault",
+        type=Path,
+        default=DEFAULT_VAULT_FILE,
+        help="Encrypted credentials vault path.",
     )
     return parser.parse_args()
-
-
-def resolve_rpc_url(args: argparse.Namespace) -> str:
-    rpc_url = args.rpc_url or os.getenv("POLYGON_RPC_URL")
-    if not rpc_url:
-        raise RuntimeError("Set --rpc-url or POLYGON_RPC_URL; no public RPC fallback is used")
-    return rpc_url.strip()
 
 
 def choose_spenders(client: ClobClient, spender_arg: str) -> list[tuple[str, str]]:
@@ -187,12 +176,12 @@ def choose_clob_api_spenders(client: ClobClient, signature_type: int) -> list[tu
 
 def main() -> int:
     args = parse_args()
-    load_dotenv(dotenv_path=".env", override=True)
+    vault = load_vault_from_prompt(args.vault)
 
-    private_key = normalize_private_key(required_env("POLYMARKET_PK"))
+    private_key = normalize_private_key(vault.private_key)
     signer_address = Account.from_key(private_key).address
-    funder = normalize_address(required_env("POLYMARKET_FUNDER"))
-    signature_type = int(required_env("POLYMARKET_SIGNATURE_TYPE"))
+    funder = normalize_address(vault.funder)
+    signature_type = vault.signature_type
 
     if signature_type != 0:
         raise RuntimeError("This approval helper is only for MetaMask EOA mode: POLYMARKET_SIGNATURE_TYPE=0")
@@ -200,9 +189,9 @@ def main() -> int:
         raise RuntimeError("For EOA mode, POLYMARKET_FUNDER must match the POLYMARKET_PK address")
 
     creds = ApiCreds(
-        api_key=required_env("POLYMARKET_API_KEY"),
-        api_secret=required_env("POLYMARKET_API_SECRET"),
-        api_passphrase=required_env("POLYMARKET_PASSPHRASE"),
+        api_key=vault.api_key,
+        api_secret=vault.api_secret,
+        api_passphrase=vault.passphrase,
     )
 
     client = ClobClient(
@@ -214,7 +203,7 @@ def main() -> int:
         creds=creds,
     )
 
-    rpc_url = resolve_rpc_url(args)
+    rpc_url = vault.polygon_rpc_url
     chain_id_result = rpc_call(rpc_url, "eth_chainId", [])
     chain_id = int(str(chain_id_result), 16)
     if chain_id != POLYGON:
@@ -243,7 +232,7 @@ def main() -> int:
         approval_label = f"{units_to_usdc(approval_units):.6f} USDC.e"
 
     print(f"Wallet: {signer_address}")
-    print(f"Polygon RPC: {rpc_url}")
+    print("Polygon RPC: configured")
     print(f"Collateral token: {collateral}")
     print(f"Wallet collateral balance: {units_to_usdc(owner_balance):.6f} USDC.e")
     print(f"Wallet POL gas balance: {Decimal(gas_balance) / Decimal(10**18):.8f} POL")

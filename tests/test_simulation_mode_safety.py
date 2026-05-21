@@ -10,12 +10,26 @@ import unittest
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT_RESOLVED = REPO_ROOT.resolve()
 _STUBBED_MODULE_NAMES = []
 _DOTENV_CALLS = []
+
+
+def _stub_dotenv_values(path):
+    values = {}
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped == "" or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key = stripped.split("=", 1)[0].strip()
+        if key.startswith("export"):
+            key = key.removeprefix("export").strip()
+        values[key] = stripped.split("=", 1)[1].strip()
+    return values
 
 
 class _DummyLogger:
@@ -183,6 +197,7 @@ def _install_bot_dependency_stubs():
     _install_module(
         "dotenv",
         load_dotenv=lambda *args, **kwargs: _DOTENV_CALLS.append((args, kwargs)),
+        dotenv_values=_stub_dotenv_values,
     )
     _install_module("loguru", logger=_DummyLogger())
     _install_module("redis", Redis=_DummyRedis)
@@ -404,6 +419,8 @@ class SimulationModeSafetyTests(unittest.TestCase):
         captured = {}
         original_init_redis = self.bot.init_redis
         original_trading_node = self.bot.TradingNode
+        original_load_vault = self.bot.load_vault_from_prompt
+        original_prepare_live_environment = self.bot.prepare_live_environment
         required_env = {
             "POLYMARKET_PK": "0x" + "1" * 64,
             "POLYMARKET_FUNDER": "0x" + "2" * 40,
@@ -448,9 +465,24 @@ class SimulationModeSafetyTests(unittest.TestCase):
                 captured["disposed"] = True
 
         try:
-            os.environ.update(required_env)
+            if simulation:
+                os.environ.update(required_env)
+            else:
+                for key in required_env:
+                    os.environ.pop(key, None)
             self.bot.init_redis = lambda: redis_client
             self.bot.TradingNode = _RecordingNode
+            self.bot.prepare_live_environment = lambda: None
+            self.bot.load_vault_from_prompt = lambda _path: types.SimpleNamespace(
+                to_runtime_credentials=lambda: {
+                    "private_key": "0x" + "1" * 64,
+                    "funder": "0x" + "2" * 40,
+                    "signature_type": 0,
+                    "api_key": "test-api-key",
+                    "api_secret": "test-api-secret",
+                    "passphrase": "test-passphrase",
+                },
+            )
             self.bot.run_integrated_bot(
                 simulation=simulation,
                 enable_grafana=False,
@@ -459,6 +491,8 @@ class SimulationModeSafetyTests(unittest.TestCase):
         finally:
             self.bot.init_redis = original_init_redis
             self.bot.TradingNode = original_trading_node
+            self.bot.load_vault_from_prompt = original_load_vault
+            self.bot.prepare_live_environment = original_prepare_live_environment
             for key, value in original_env.items():
                 if value is None:
                     os.environ.pop(key, None)
@@ -554,6 +588,41 @@ class SimulationModeSafetyTests(unittest.TestCase):
         args = self.bot.parse_runtime_args(["--live", "--confirm-live"])
         self.assertTrue(args.live)
         self.assertTrue(args.confirm_live)
+
+    def test_bot_live_import_rejects_inherited_secret_env(self):
+        import vault_store
+
+        original_argv = sys.argv
+        original_bot = sys.modules.get("bot")
+        original_dotenv_guard = vault_store.refuse_secret_dotenv_keys
+
+        try:
+            sys.argv = ["bot.py", "--live"]
+            sys.modules.pop("bot", None)
+            vault_store.refuse_secret_dotenv_keys = lambda _path: None
+            with mock.patch.dict(os.environ, {"POLYMARKET_PK": "0xreal"}, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "POLYMARKET_PK"):
+                    importlib.import_module("bot")
+        finally:
+            sys.argv = original_argv
+            vault_store.refuse_secret_dotenv_keys = original_dotenv_guard
+            sys.modules.pop("bot", None)
+            if original_bot is not None:
+                sys.modules["bot"] = original_bot
+
+    def test_run_integrated_bot_live_rejects_inherited_secret_env(self):
+        original_dotenv_guard = self.bot.refuse_secret_dotenv_keys
+        try:
+            self.bot.refuse_secret_dotenv_keys = lambda _path: None
+            with mock.patch.dict(os.environ, {"POLYMARKET_API_PASSPHRASE": "secret"}, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "POLYMARKET_API_PASSPHRASE"):
+                    self.bot.run_integrated_bot(
+                        simulation=False,
+                        enable_grafana=False,
+                        test_mode=False,
+                    )
+        finally:
+            self.bot.refuse_secret_dotenv_keys = original_dotenv_guard
 
     def test_main_forces_cli_process_exit_after_run_returns(self):
         class _ExitCalled(Exception):
@@ -1423,36 +1492,61 @@ class SimulationModeSafetyTests(unittest.TestCase):
             )
         )
 
-    def test_legacy_nautilus_integration_env_wiring(self):
+    def test_live_dotenv_secret_key_guard_rejects_polymarket_credentials(self):
+        path = self._test_ledger_path.parent / "secret-live.env"
+        path.write_text("export POLYMARKET_PK=0xreal\n", encoding="utf-8")
+        try:
+            with self.assertRaisesRegex(RuntimeError, "POLYMARKET_PK"):
+                self.bot.refuse_secret_dotenv_keys(path)
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_legacy_nautilus_integration_vault_wiring(self):
         sys.modules["execution"].__path__ = [str(REPO_ROOT / "execution")]
         sys.modules.pop("execution.nautilus_polymarket_integration", None)
         module = importlib.import_module("execution.nautilus_polymarket_integration")
         dotenv_calls = []
-        guard_calls = []
+        vault_calls = []
         original_load_dotenv = module.load_dotenv
-        original_guard = module.refuse_plaintext_env_in_live_mode
+        original_load_vault = module.load_vault_from_prompt
+        original_refuse_secret_keys = module.refuse_secret_dotenv_keys
+        original_refuse_environment_keys = module.refuse_secret_environment_keys
         original_log_dir = os.environ.get("NAUTILUS_LOG_DIR")
+
+        def _recording_vault_loader(path):
+            vault_calls.append(path)
+            return types.SimpleNamespace(
+                private_key="0x" + "1" * 64,
+                funder="0x" + "2" * 40,
+                signature_type=0,
+                api_key="test-api-key",
+                api_secret="test-api-secret",
+                passphrase="test-passphrase",
+            )
+
         try:
             module.load_dotenv = lambda *args, **kwargs: dotenv_calls.append((args, kwargs))
-            module.refuse_plaintext_env_in_live_mode = (
-                lambda **kwargs: guard_calls.append(kwargs)
-            )
+            module.load_vault_from_prompt = _recording_vault_loader
+            module.refuse_secret_dotenv_keys = lambda _path: None
+            module.refuse_secret_environment_keys = lambda: None
             module.PolymarketBTCIntegration(simulation_mode=True)
             live_integration = module.PolymarketBTCIntegration(simulation_mode=False)
             os.environ["NAUTILUS_LOG_DIR"] = "/tmp/nautilus-legacy"
             config = live_integration._create_nautilus_config()
         finally:
             module.load_dotenv = original_load_dotenv
-            module.refuse_plaintext_env_in_live_mode = original_guard
+            module.load_vault_from_prompt = original_load_vault
+            module.refuse_secret_dotenv_keys = original_refuse_secret_keys
+            module.refuse_secret_environment_keys = original_refuse_environment_keys
             if original_log_dir is None:
                 os.environ.pop("NAUTILUS_LOG_DIR", None)
             else:
                 os.environ["NAUTILUS_LOG_DIR"] = original_log_dir
 
         self.assertEqual(dotenv_calls[0][1]["dotenv_path"], REPO_ROOT / ".env")
-        self.assertEqual(len(dotenv_calls), 1)
-        self.assertEqual(guard_calls[0]["repo_root"], REPO_ROOT)
-        self.assertEqual(tuple(guard_calls[0]["argv"]), ("--live",))
+        self.assertEqual(dotenv_calls[1][1]["dotenv_path"], REPO_ROOT / ".env")
+        self.assertEqual(len(dotenv_calls), 2)
+        self.assertEqual(vault_calls[0], REPO_ROOT / module.DEFAULT_VAULT_PATH)
         self.assertEqual(
             config.kwargs["logging"].kwargs["log_directory"],
             "/tmp/nautilus-legacy",
@@ -1464,15 +1558,48 @@ class SimulationModeSafetyTests(unittest.TestCase):
         self.assertNotIn("instrument_provider", data_config.kwargs)
         self.assertNotIn("instrument_provider", exec_config.kwargs)
 
+    def test_legacy_nautilus_live_environment_guard_rejects_secret_env(self):
+        sys.modules["execution"].__path__ = [str(REPO_ROOT / "execution")]
+        sys.modules.pop("execution.nautilus_polymarket_integration", None)
+        module = importlib.import_module("execution.nautilus_polymarket_integration")
+        original_load_dotenv = module.load_dotenv
+        original_load_vault = module.load_vault_from_prompt
+        original_refuse_secret_keys = module.refuse_secret_dotenv_keys
+
+        try:
+            module.refuse_secret_dotenv_keys = lambda _path: None
+            module.load_dotenv = lambda *args, **kwargs: None
+            module.load_vault_from_prompt = lambda _path: None
+            with mock.patch.dict(os.environ, {"POLYMARKET_PK": "0xreal"}, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "POLYMARKET_PK"):
+                    module.PolymarketBTCIntegration(simulation_mode=False)
+        finally:
+            module.load_dotenv = original_load_dotenv
+            module.load_vault_from_prompt = original_load_vault
+            module.refuse_secret_dotenv_keys = original_refuse_secret_keys
+
     def _legacy_live_integration(self):
         sys.modules["execution"].__path__ = [str(REPO_ROOT / "execution")]
         module = importlib.import_module("execution.nautilus_polymarket_integration")
-        original_guard = module.refuse_plaintext_env_in_live_mode
+        original_load_vault = module.load_vault_from_prompt
+        original_refuse_secret_keys = module.refuse_secret_dotenv_keys
+        original_refuse_environment_keys = module.refuse_secret_environment_keys
         try:
-            module.refuse_plaintext_env_in_live_mode = lambda **_kwargs: None
+            module.refuse_secret_dotenv_keys = lambda _path: None
+            module.refuse_secret_environment_keys = lambda: None
+            module.load_vault_from_prompt = lambda _path: types.SimpleNamespace(
+                private_key="0x" + "1" * 64,
+                funder="0x" + "2" * 40,
+                signature_type=0,
+                api_key="test-api-key",
+                api_secret="test-api-secret",
+                passphrase="test-passphrase",
+            )
             integration = module.PolymarketBTCIntegration(simulation_mode=False)
         finally:
-            module.refuse_plaintext_env_in_live_mode = original_guard
+            module.load_vault_from_prompt = original_load_vault
+            module.refuse_secret_dotenv_keys = original_refuse_secret_keys
+            module.refuse_secret_environment_keys = original_refuse_environment_keys
         return module, integration
 
     def test_legacy_nautilus_live_order_submission_disabled(self):

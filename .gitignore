@@ -11,7 +11,6 @@
 *.env
 # Explicit exception so the documented example can be committed
 !.env.example
-!deploy/.env.sops.yaml.example
 
 # Any file with "secret", "private", "key", "credential" in the name
 *secret*
