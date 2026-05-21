@@ -9,6 +9,9 @@
 
 A production-grade algorithmic trading bot for **Polymarket's 15-minute BTC price prediction markets**. Built with a 7-phase architecture combining multiple signal sources, professional risk management, and self-learning capabilities.
 
+For a detailed explanation of the active decision pipeline, signal processors,
+fusion weights, trend filter, tunable variables, and replay dataset needs, see
+[Strategy Algorithm Inventory](docs/STRATEGY_ALGORITHM_INVENTORY.md).
 
 ---
 
