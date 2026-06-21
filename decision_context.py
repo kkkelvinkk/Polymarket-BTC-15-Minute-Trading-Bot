@@ -25,11 +25,14 @@ async def fetch_market_context_for_snapshot(
 
     current_price_float = float(snapshot.current_price)
 
-    recent_prices = [float(p) for p in snapshot.price_history[-20:]]
+    # Beta-1: price_history elements are PriceHistoryEntry; ``.value`` is the
+    # numeric component. RP12-extended static check enforces this access path.
+    recent_prices = [float(p.value) for p in snapshot.price_history[-20:]]
     sma_20 = sum(recent_prices) / len(recent_prices)
     context_sma20_deviation = (current_price_float - sma_20) / sma_20
     momentum = (
-        (current_price_float - float(snapshot.price_history[-5])) / float(snapshot.price_history[-5])
+        (current_price_float - float(snapshot.price_history[-5].value))
+        / float(snapshot.price_history[-5].value)
     )
     variance = sum((p - sma_20) ** 2 for p in recent_prices) / len(recent_prices)
     volatility = math.sqrt(variance)

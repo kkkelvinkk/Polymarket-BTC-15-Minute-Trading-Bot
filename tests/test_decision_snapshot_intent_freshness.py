@@ -18,6 +18,8 @@ class TestDecisionSnapshotIntentFreshness(DecisionSnapshotTestCase):
         )
         strategy._stable_tick_count = 3
         strategy.price_history = [Decimal("0.70")] * 20
+        strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+        strategy._price_history_ts = [None] * len(strategy.price_history)
         strategy._last_bid_ask = (Decimal("0.60"), Decimal("0.62"))
         base = datetime(2030, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
         snapshot = replace(
@@ -93,10 +95,12 @@ class TestDecisionSnapshotIntentFreshness(DecisionSnapshotTestCase):
         )
         strategy._fetch_market_context = _fetch_market_context
         strategy._process_signals = (
-            lambda _snapshot, _metadata, *, observation_only=False: [fused]
+            lambda _snapshot, _metadata, *, observation_only=False, now=None: [fused]
         )
         strategy.fusion_engine = types.SimpleNamespace(
-            fuse_signals=lambda _signals, min_signals, min_score: fused
+            fuse_signals=lambda _signals, **_kw: fused,
+            weights={},
+            recency_window_seconds=300,
         )
         strategy._resolve_position_size_usd = lambda is_simulation, rec: Decimal("5.51")
         strategy._compute_depth_aware_entry_details = _depth_entry

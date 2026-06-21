@@ -68,25 +68,49 @@ class _DummyStrategy:
 
 
 class _DummyProcessor:
+    """Beta-4: ``effective_params()`` is required by ``build_effective_decision_config``."""
+
     def __init__(self, *args, **kwargs):
         pass
 
+    def effective_params(self):
+        return {}
+
+    def last_drop_counters(self):
+        return {}
+
+    def reset_drop_counters(self):
+        return None
+
 
 class _DummyFusion:
-    def __init__(self):
-        self.weights = {}
+    """Beta-5 dummy: accepts the new REQUIRED kwargs ``weights`` and
+    ``recency_window_seconds``; ``set_weight()`` is no longer callable
+    post-construction."""
 
-    def set_weight(self, name, value):
-        self.weights[name] = value
+    def __init__(self, *, weights=None, recency_window_seconds=None, **_):
+        self.weights = dict(weights) if weights else {}
+        self.recency_window_seconds = recency_window_seconds
 
 
 class _DummyRiskEngine:
+    """Beta-8 dummy: every now-aware risk-engine method accepts the new
+    REQUIRED ``now=`` kwarg via ``**_kwargs`` so the bot's caller updates
+    flow through harmlessly."""
+
     def __init__(self):
         self._positions = {}
         self.realized_pnl = []
         self.restored_daily_stats = None
+        # Beta-6: effective_decision_config consumes several limits fields;
+        # the stub exposes all of them with sane defaults.
         self.limits = types.SimpleNamespace(
-            max_position_size=Decimal(os.getenv("MAX_POSITION_SIZE", "5.51"))
+            max_position_size=Decimal(os.getenv("MAX_POSITION_SIZE", "5.51")),
+            max_total_exposure=Decimal(os.getenv("MAX_TOTAL_EXPOSURE", "10.0")),
+            max_positions=int(os.getenv("MAX_POSITIONS", "5")),
+            max_drawdown_pct=float(os.getenv("MAX_DRAWDOWN_PCT", "0.15")),
+            max_loss_per_day=Decimal(os.getenv("MAX_LOSS_PER_DAY", "5.0")),
+            max_leverage=1.0,
         )
 
     def add_position(self, position_id, size, entry_price, direction, **_kwargs):
@@ -96,7 +120,7 @@ class _DummyRiskEngine:
             "direction": direction,
         }
 
-    def adjust_position(self, position_id, size, entry_price, direction=None):
+    def adjust_position(self, position_id, size, entry_price, direction=None, **_kwargs):
         position_id = str(position_id)
         if position_id not in self._positions:
             self.add_position(position_id, size, entry_price, direction or "buy")
@@ -109,7 +133,7 @@ class _DummyRiskEngine:
     def release_position(self, position_id):
         return self._positions.pop(str(position_id), None) is not None
 
-    def remove_position(self, position_id, exit_price):
+    def remove_position(self, position_id, exit_price, **_kwargs):
         position = self._positions.pop(str(position_id), None)
         if not position:
             return None
@@ -121,7 +145,7 @@ class _DummyRiskEngine:
     def record_realized_pnl(self, pnl, **_kwargs):
         self.realized_pnl.append(Decimal(str(pnl)))
 
-    def restore_daily_stats(self, daily_pnl, daily_trades):
+    def restore_daily_stats(self, daily_pnl, daily_trades, **_kwargs):
         self.restored_daily_stats = (Decimal(str(daily_pnl)), daily_trades)
 
     def validate_new_position(self, **_kwargs):
@@ -183,7 +207,7 @@ def _install_bot_dependency_stubs():
     )
     _install_module(
         "patch_market_orders",
-        apply_market_order_patch=lambda: True,
+        apply_market_order_patch=lambda **_kw: True,
         register_actual_fill_handler=lambda _handler: None,
         register_auto_redeem_handler=lambda _handler: None,
         unregister_actual_fill_handler=lambda _handler: None,
@@ -265,16 +289,20 @@ def _install_bot_dependency_stubs():
     _install_module(
         "core.strategy_brain.fusion_engine.signal_fusion",
         SignalFusionEngine=_DummyFusion,
-        get_fusion_engine=_DummyFusion,
     )
     _install_module(
         "execution.risk_engine",
-        get_risk_engine=lambda: _DummyRiskEngine(),
+        get_risk_engine=lambda **_kw: _DummyRiskEngine(),
         RiskEngine=_DummyRiskEngine,
     )
     _install_module("monitoring.performance_tracker", get_performance_tracker=lambda: _DummyPerformanceTracker())
     _install_module("monitoring.grafana_exporter", get_grafana_exporter=lambda: object())
-    _install_module("feedback.learning_engine", get_learning_engine=lambda: object())
+    # Beta-5: LearningEngine is now constructed with a required fusion_engine
+    # injection (no singleton). The stub accepts and ignores the kwarg.
+    _install_module(
+        "feedback.learning_engine",
+        LearningEngine=lambda **_kw: object(),
+    )
     _install_module(
         "core.strategy_brain.signal_processors.base_processor",
         SignalDirection=types.SimpleNamespace(BULLISH="BULLISH", BEARISH="BEARISH"),
@@ -1629,13 +1657,15 @@ class SimulationModeSafetyTests(unittest.TestCase):
         sys.modules.pop("execution.execution_engine", None)
         module = importlib.import_module("execution.execution_engine")
 
+        # Beta-8 / review-cycle: now= is now REQUIRED on the constructor.
+        _now = datetime.now(timezone.utc)
         with self.assertRaisesRegex(
             RuntimeError,
             "Legacy ExecutionEngine live mode is disabled",
         ):
-            engine = module.ExecutionEngine(dry_run=False)
+            engine = module.ExecutionEngine(dry_run=False, now=_now)
 
-        engine = module.ExecutionEngine(dry_run=True)
+        engine = module.ExecutionEngine(dry_run=True, now=_now)
         engine.dry_run = False
         with self.assertRaisesRegex(
             RuntimeError,
@@ -2125,10 +2155,14 @@ class SimulationModeSafetyTests(unittest.TestCase):
             def as_decimal(self):
                 return self.value
 
+        # Review-cycle fix: ts_event required per Beta-1.
+        _epoch_ns = int(datetime.now(timezone.utc).timestamp() * 1_000_000_000)
+
         class _Tick:
             instrument_id = "yes-instrument"
             bid_price = _Price("0.60")
             ask_price = _Price("0.62")
+            ts_event = _epoch_ns
 
         original = os.environ.get("QUOTE_STABILITY_REQUIRED")
         try:
@@ -2954,6 +2988,8 @@ class SimulationModeSafetyTests(unittest.TestCase):
         )
         strategy._stable_tick_count = 3
         strategy.price_history = [Decimal("0.70")] * 20
+        strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+        strategy._price_history_ts = [None] * len(strategy.price_history)
         strategy.instrument_id = "yes-instrument"
         strategy._yes_instrument_id = "yes-instrument"
         strategy._yes_token_id = "yes-token"
@@ -2977,10 +3013,12 @@ class SimulationModeSafetyTests(unittest.TestCase):
             metadata={"test_signal": "limit_ioc"},
         )
         strategy._process_signals = (
-            lambda _snapshot, _metadata, *, observation_only=False: [fused]
+            lambda _snapshot, _metadata, *, observation_only=False, now=None: [fused]
         )
         strategy.fusion_engine = types.SimpleNamespace(
-            fuse_signals=lambda _signals, min_signals, min_score: fused
+            fuse_signals=lambda _signals, **_kw: fused,
+            weights={},
+            recency_window_seconds=300,
         )
 
         async def _market_context(_snapshot, *, observation_only=False):
@@ -3079,6 +3117,8 @@ class SimulationModeSafetyTests(unittest.TestCase):
         )
         strategy._stable_tick_count = 3
         strategy.price_history = [Decimal("0.70")] * 20
+        strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+        strategy._price_history_ts = [None] * len(strategy.price_history)
         strategy.instrument_id = "yes-instrument"
         strategy._yes_instrument_id = "yes-instrument"
         strategy._yes_token_id = "yes-token"
@@ -3102,10 +3142,12 @@ class SimulationModeSafetyTests(unittest.TestCase):
             metadata={"test_signal": "missing_depth_cost"},
         )
         strategy._process_signals = (
-            lambda _snapshot, _metadata, *, observation_only=False: [fused]
+            lambda _snapshot, _metadata, *, observation_only=False, now=None: [fused]
         )
         strategy.fusion_engine = types.SimpleNamespace(
-            fuse_signals=lambda _signals, min_signals, min_score: fused
+            fuse_signals=lambda _signals, **_kw: fused,
+            weights={},
+            recency_window_seconds=300,
         )
 
         async def _market_context(_snapshot, *, observation_only=False):
@@ -3193,6 +3235,8 @@ class SimulationModeSafetyTests(unittest.TestCase):
         )
         strategy._stable_tick_count = 3
         strategy.price_history = [Decimal("0.70")] * 20
+        strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+        strategy._price_history_ts = [None] * len(strategy.price_history)
         strategy.instrument_id = "yes-instrument"
         strategy._yes_instrument_id = "yes-instrument"
         strategy._yes_token_id = "yes-token"
@@ -3206,10 +3250,12 @@ class SimulationModeSafetyTests(unittest.TestCase):
             metadata={"test_signal": "shadow_policy"},
         )
         strategy._process_signals = (
-            lambda _snapshot, _metadata, *, observation_only=False: [fused]
+            lambda _snapshot, _metadata, *, observation_only=False, now=None: [fused]
         )
         strategy._shadow_fusion_engine = types.SimpleNamespace(
-            fuse_signals=lambda _signals, min_signals, min_score: fused
+            fuse_signals=lambda _signals, **_kw: fused,
+            weights={},
+            recency_window_seconds=300,
         )
 
         async def _market_context(_snapshot, *, observation_only=False):
@@ -3353,6 +3399,8 @@ class SimulationModeSafetyTests(unittest.TestCase):
         )
         strategy._stable_tick_count = 3
         strategy.price_history = [Decimal("0.70")] * 20
+        strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+        strategy._price_history_ts = [None] * len(strategy.price_history)
         strategy.instrument_id = "yes-instrument"
         strategy._yes_instrument_id = "yes-instrument"
         strategy._yes_token_id = "yes-token"
@@ -3366,10 +3414,12 @@ class SimulationModeSafetyTests(unittest.TestCase):
             metadata={"test_signal": "shadow_percent"},
         )
         strategy._process_signals = (
-            lambda _snapshot, _metadata, *, observation_only=False: [fused]
+            lambda _snapshot, _metadata, *, observation_only=False, now=None: [fused]
         )
         strategy._shadow_fusion_engine = types.SimpleNamespace(
-            fuse_signals=lambda _signals, min_signals, min_score: fused
+            fuse_signals=lambda _signals, **_kw: fused,
+            weights={},
+            recency_window_seconds=300,
         )
 
         async def _market_context(_snapshot, *, observation_only=False):
@@ -3518,6 +3568,8 @@ class SimulationModeSafetyTests(unittest.TestCase):
     def test_fetch_market_context_uses_market_metadata_yes_token_for_order_book(self):
         strategy = self._new_strategy()
         strategy.price_history = [Decimal("0.60")] * 20
+        strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+        strategy._price_history_ts = [None] * len(strategy.price_history)
         strategy._yes_token_id = None
         now = datetime.now(timezone.utc)
         strategy.all_btc_instruments = [
@@ -3596,6 +3648,8 @@ class SimulationModeSafetyTests(unittest.TestCase):
     def test_fetch_market_context_fails_closed_on_cached_yes_token_mismatch(self):
         strategy = self._new_strategy()
         strategy.price_history = [Decimal("0.60")] * 20
+        strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+        strategy._price_history_ts = [None] * len(strategy.price_history)
         strategy._yes_token_id = "cached-yes-token"
         now = datetime.now(timezone.utc)
         strategy.all_btc_instruments = [
@@ -3680,7 +3734,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
         original_patch_applied = self.bot.patch_applied
         original_apply_market_order_patch = self.bot.apply_market_order_patch
         self.bot.patch_applied = False
-        self.bot.apply_market_order_patch = lambda: False
+        self.bot.apply_market_order_patch = lambda **_kw: False
         try:
             with self.assertRaises(RuntimeError):
                 self._run_bot_with_fake_node(simulation=False, redis_client=_SeededRedis())
@@ -3692,7 +3746,7 @@ class SimulationModeSafetyTests(unittest.TestCase):
         original_patch_applied = self.bot.patch_applied
         original_apply_market_order_patch = self.bot.apply_market_order_patch
         self.bot.patch_applied = False
-        self.bot.apply_market_order_patch = lambda: False
+        self.bot.apply_market_order_patch = lambda **_kw: False
         try:
             captured = self._run_bot_with_fake_node(simulation=True, redis_client=None)
         finally:
@@ -3745,6 +3799,28 @@ class SimulationModeSafetyTests(unittest.TestCase):
 
         self.assertEqual(redis_client.values["btc_trading:simulation_mode"], "0")
         self.assertFalse(captured["strategy"].current_simulation_mode)
+
+    def test_live_startup_scopes_nautilus_reconciliation_lookback(self):
+        class _SeededRedis:
+            def __init__(self):
+                self.values = {}
+
+            def set(self, key, value):
+                self.values[key] = value
+
+            def get(self, key):
+                return self.values.get(key)
+
+        captured = self._run_bot_with_fake_node(
+            simulation=False,
+            redis_client=_SeededRedis(),
+        )
+
+        exec_engine = captured["config"].kwargs["exec_engine"]
+        lookback_mins = exec_engine.kwargs["reconciliation_lookback_mins"]
+
+        self.assertGreaterEqual(lookback_mins, (2 * self.bot.MARKET_INTERVAL_SECONDS) // 60)
+        self.assertLessEqual(lookback_mins, (3 * self.bot.MARKET_INTERVAL_SECONDS) // 60)
 
     def test_trading_node_uses_short_shutdown_timeouts(self):
         captured = self._run_bot_with_fake_node(simulation=True, redis_client=None)

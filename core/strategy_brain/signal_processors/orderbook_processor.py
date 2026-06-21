@@ -1,38 +1,15 @@
 """
 Order Book Imbalance Signal Processor
-Reads the Polymarket CLOB order book for the current YES token and
-detects when buy-side or sell-side pressure is heavily skewed.
+Reads the Polymarket CLOB and detects buy/sell pressure skew.
 
-WHY THIS WORKS:
-  The Polymarket CLOB (Central Limit Order Book) shows exactly how many
-  dollars are queued to buy "Up" vs sell "Up" at various price levels.
-
-  If $800 is sitting on the bid (buy side) and only $200 on the ask
-  (sell side), someone large expects BTC to go UP → follow them BULLISH.
-
-  This is real-time, forward-looking information that reflects what
-  sophisticated market participants are actually doing RIGHT NOW —
-  not a lagging indicator.
-
-API USED:
-  GET https://clob.polymarket.com/book?token_id=<YES_token_id>
-
-  Returns:
-    {
-      "bids": [{"price": "0.52", "size": "150"}, ...],  ← buyers of YES
-      "asks": [{"price": "0.54", "size": "80"},  ...],  ← sellers of YES
-    }
-
-SIGNAL LOGIC:
-  imbalance = (bid_volume - ask_volume) / (bid_volume + ask_volume)
-  Range: -1.0 (all sellers) to +1.0 (all buyers)
-
-  imbalance > +0.30  → BULLISH  (heavy buy pressure)
-  imbalance < -0.30  → BEARISH  (heavy sell pressure)
-  |imbalance| < 0.30 → no signal (balanced book)
-
-  We also check WALL detection: a single order > 20% of total book
-  volume indicates a large player taking a strong position.
+Beta-2/3/4 + §3.D rows 5-8 contract:
+  - ``name`` REQUIRED kwarg in __init__.
+  - ``now``, ``decision_id`` REQUIRED kwargs on process().
+  - Malformed levels → DROP with ``orderbook_level_malformed_dropped``.
+  - process() top exception → DROP with
+    ``orderbook_process_exception_dropped``.
+  - fetch_order_book HTTP failure → DROP with ``orderbook_fetch_dropped``.
+  - No silent substitution; no fallbacks.
 """
 import httpx
 from decimal import Decimal
@@ -56,25 +33,17 @@ CLOB_BASE = "https://clob.polymarket.com"
 
 
 class OrderBookImbalanceProcessor(BaseSignalProcessor):
-    """
-    Detects order book imbalance on the Polymarket CLOB.
-
-    Wired into the strategy by passing the YES token_id via metadata:
-      metadata['yes_token_id'] = <token id string>
-
-    This is set once per market in _load_all_btc_instruments and stored
-    on the strategy as self._yes_token_id.
-    """
-
     def __init__(
         self,
-        imbalance_threshold: float = 0.30,   # 30% skew to signal
-        wall_threshold: float = 0.20,         # single order > 20% of book = wall
-        min_book_volume: float = 50.0,        # ignore books with < $50 total (illiquid)
+        *,
+        name: str,
+        imbalance_threshold: float = 0.30,
+        wall_threshold: float = 0.20,
+        min_book_volume: float = 50.0,
         min_confidence: float = 0.55,
-        top_levels: int = 10,                 # how many price levels to consider
+        top_levels: int = 10,
     ):
-        super().__init__("OrderBookImbalance")
+        super().__init__(name)
 
         self.imbalance_threshold = imbalance_threshold
         self.wall_threshold = wall_threshold
@@ -82,7 +51,6 @@ class OrderBookImbalanceProcessor(BaseSignalProcessor):
         self.min_confidence = min_confidence
         self.top_levels = top_levels
 
-        # HTTP client created fresh per request (synchronous, safe in Nautilus event loop)
         self._cache: Optional[Dict] = None
 
         logger.info(
@@ -92,12 +60,29 @@ class OrderBookImbalanceProcessor(BaseSignalProcessor):
             f"min_book_volume=${min_book_volume:.0f}"
         )
 
+    def effective_params(self) -> Dict[str, Any]:
+        return dict(sorted({
+            "name": self.name,
+            "imbalance_threshold": self.imbalance_threshold,
+            "wall_threshold": self.wall_threshold,
+            "min_book_volume": self.min_book_volume,
+            "min_confidence": self.min_confidence,
+            "top_levels": self.top_levels,
+        }.items()))
+
     def _get_client(self) -> httpx.Client:
-        """Return a synchronous httpx client (safe inside NautilusTrader's event loop)."""
         return httpx.Client(timeout=5.0)
 
     def fetch_order_book(self, token_id: str) -> Optional[Dict]:
-        """Fetch order book from Polymarket CLOB synchronously."""
+        """
+        §3.D row-5 DROP on HTTP failure; caller increments
+        ``orderbook_fetch_dropped`` and proceeds without this signal.
+
+        Review-cycle fix: narrowed to ``httpx.HTTPError`` (covers network,
+        timeout, HTTP-status, and decode failures from the httpx layer)
+        plus ``ValueError`` (covers ``resp.json()`` failures on invalid
+        JSON). Logic bugs (``NameError``, ``AttributeError``) propagate.
+        """
         try:
             with self._get_client() as client:
                 resp = client.get(
@@ -106,34 +91,42 @@ class OrderBookImbalanceProcessor(BaseSignalProcessor):
                 )
                 resp.raise_for_status()
                 return resp.json()
-        except Exception as e:
+        except (httpx.HTTPError, ValueError) as e:
             logger.warning(f"OrderBook fetch failed for {token_id[:16]}…: {e}")
+            self._increment_drop("orderbook_fetch_dropped")
             return None
 
     def _parse_levels(self, levels: List[Dict]) -> float:
-        """Sum total volume across price levels (returns USD volume)."""
+        """Sum total USD volume; §3.D row-6 DROP malformed levels.
+
+        Review-cycle fix: direct-index ``level["price"]`` / ``level["size"]``
+        so a missing key raises ``KeyError`` and is caught by the malformed
+        drop branch (the prior ``.get(..., 0)`` defaults silently produced
+        zero-priced levels rather than dropping them, defeating §3.D).
+        """
         total = 0.0
         for level in levels[:self.top_levels]:
             try:
-                price = float(level.get("price", 0))
-                size = float(level.get("size", 0))
-                total += price * size   # USD value at each level
-            except (ValueError, TypeError):
+                price = float(level["price"])
+                size = float(level["size"])
+                total += price * size
+            except (ValueError, TypeError, KeyError):
+                self._increment_drop("orderbook_level_malformed_dropped")
                 continue
         return total
 
     def _detect_wall(self, levels: List[Dict], total_volume: float) -> Optional[float]:
-        """Return the size of the largest single order if it's a wall, else None."""
         if total_volume <= 0:
             return None
         for level in levels[:self.top_levels]:
             try:
-                price = float(level.get("price", 0))
-                size = float(level.get("size", 0))
+                price = float(level["price"])
+                size = float(level["size"])
                 order_usd = price * size
                 if order_usd / total_volume >= self.wall_threshold:
                     return order_usd
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, KeyError):
+                self._increment_drop("orderbook_level_malformed_dropped")
                 continue
         return None
 
@@ -141,9 +134,13 @@ class OrderBookImbalanceProcessor(BaseSignalProcessor):
         self,
         current_price: Decimal,
         historical_prices: list,
-        metadata: Dict[str, Any] = None,
+        metadata: Dict[str, Any],
+        *,
+        now: datetime,
+        decision_id: str,
     ) -> Optional[TradingSignal]:
-        """Generate a signal from the caller-provided decision-cycle book snapshot."""
+        self._reset_signal_ordinal()
+
         if not self.is_enabled or not metadata:
             return None
 
@@ -213,13 +210,14 @@ class OrderBookImbalanceProcessor(BaseSignalProcessor):
                 return None
 
             signal = TradingSignal(
-                timestamp=datetime.now(),
+                timestamp=now,
                 source=self.name,
                 signal_type=SignalType.VOLUME_SURGE,
                 direction=direction,
                 strength=strength,
                 confidence=confidence,
                 current_price=current_price,
+                signal_id=self._next_signal_id(decision_id),
                 metadata={
                     "bid_volume_usd": round(bid_volume, 2),
                     "ask_volume_usd": round(ask_volume, 2),
@@ -233,10 +231,16 @@ class OrderBookImbalanceProcessor(BaseSignalProcessor):
             self._record_signal(signal)
             logger.info(
                 f"Generated {direction.value.upper()} signal (OrderBook): "
-                f"imbalance={imbalance:+.3f}, confidence={confidence:.2%}, score={signal.score:.1f}"
+                f"imbalance={imbalance:+.3f}, confidence={confidence:.2%}, "
+                f"score={signal.score:.1f}"
             )
             return signal
 
-        except Exception as e:
+        except (ValueError, TypeError, KeyError, AttributeError, ArithmeticError) as e:
+            # §3.D row-8: narrow exception classes (review-cycle fix:
+            # was bare `except Exception` which would swallow NameError /
+            # logic bugs / etc.). DROP the whole orderbook signal for
+            # this decision; increment the counter; never substitute.
             logger.warning(f"OrderBookImbalance process error: {e}")
+            self._increment_drop("orderbook_process_exception_dropped")
             return None

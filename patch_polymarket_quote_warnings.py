@@ -9,7 +9,7 @@ We replace the two PolymarketDataClient methods that emit the noisy warning with
 copies that omit just those log calls. Everything else (other WARN/INFO from the
 data client, and the quote-drop behaviour itself) is unchanged.
 
-NOTE: pinned to nautilus_trader's Polymarket adapter as of 1.227.0. If that
+NOTE: pinned to nautilus_trader's Polymarket adapter as of 1.228.0. If that
 adapter is updated, re-verify the two methods here still match upstream.
 """
 
@@ -17,7 +17,7 @@ from __future__ import annotations
 
 
 _PATCH_APPLIED = False
-_PINNED_NAUTILUS_VERSION = "1.227.0"
+_PINNED_NAUTILUS_VERSION = "1.228.0"
 
 
 def apply_polymarket_quote_warning_patch() -> bool:
@@ -81,6 +81,7 @@ def apply_polymarket_quote_warning_patch() -> bool:
         deltas = ws_message.parse_to_snapshot(instrument=instrument, ts_init=now_ns)
 
         if deltas is None:
+            # Skip empty snapshots (can occur near market resolution)
             return
 
         if instrument.id in self._pending_snapshot_after_tick_change:
@@ -138,6 +139,7 @@ def apply_polymarket_quote_warning_patch() -> bool:
         deltas = OrderBookDeltas(instrument.id, [delta])
 
         if instrument.id not in self._local_books:
+            # Skip this quote if we're not subscribed to anything for this instrument
             if (
                 instrument.id not in self.subscribed_quote_ticks()
                 and instrument.id not in self.subscribed_order_book_deltas()
@@ -156,11 +158,14 @@ def apply_polymarket_quote_warning_patch() -> bool:
             bid_size = local_book.best_bid_size()
             ask_size = local_book.best_ask_size()
 
+            # Handle missing bid/ask prices (can occur near market resolution)
             if bid_price is None or ask_price is None:
                 if self._config.drop_quotes_missing_side:
                     # Original emits a WARN here; suppressed (see module docstring).
                     return
                 else:
+                    # Use boundary prices with zero volume for missing sides
+                    # POLYMARKET_MIN_PRICE = 0.001, POLYMARKET_MAX_PRICE = 0.999
                     if bid_price is None:
                         bid_price = instrument.make_price(POLYMARKET_MIN_PRICE)
                         bid_size = instrument.make_qty(0.0)
@@ -186,7 +191,7 @@ def apply_polymarket_quote_warning_patch() -> bool:
                 and quote.bid_size == last_quote.bid_size
                 and quote.ask_size == last_quote.ask_size
             ):
-                return
+                return  # No top-of-book change
 
             self._last_quotes[instrument.id] = quote
             self._handle_data(quote)

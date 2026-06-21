@@ -14,3 +14,18 @@
     create 0640 polybot polybot
     sharedscripts
 }
+
+# Theta-2 — Raw decision snapshot corpus rotation.
+# The recorder writes ``raw_decisions_<YYYYMMDD>.jsonl`` per UTC day under
+# ``RAW_DECISION_SNAPSHOT_DIR``. Rotate daily, keep 30 days, compress
+# (mirrors the decisions.jsonl rotation cadence).
+/opt/polybot/raw_decision_snapshots/raw_decisions_*.jsonl {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 polybot polybot
+    sharedscripts
+}

@@ -1,6 +1,6 @@
 """Patch Polymarket reconciliation hooks without overriding market submit.
 
-Nautilus 1.227.0 has the required market-order implementation for quote
+Nautilus 1.228.0 has the required market-order implementation for quote
 quantity buys: it builds MarketOrderArgsV2, passes the USDC balance, computes
 the base quantity from the signed order, and calls _post_signed_order with the
 expected venue order id. This module must not replace that submit path.
@@ -14,6 +14,7 @@ import re
 logger = logging.getLogger(__name__)
 
 _patch_applied = False
+_patch_market_interval_seconds = None
 _auto_redeem_handlers = []
 _actual_fill_handlers = []
 
@@ -117,6 +118,7 @@ def _dispatch_actual_fill(client_order_id, payload):
 
 
 _uuid_guard_applied = False
+_uuid_guard_market_interval_seconds = None
 
 
 def _datetime_now_iso():
@@ -125,19 +127,26 @@ def _datetime_now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-_UUID_GUARD_PINNED_NAUTILUS_VERSION = "1.227.0"
+_UUID_GUARD_PINNED_NAUTILUS_VERSION = "1.228.0"
 
 
-def apply_uuid_fallback_guard_patch():
+def apply_uuid_fallback_guard_patch(*, market_interval_seconds: int):
     """Replace the 3 ClientOrderId-via-UUID4 fallback sites
-    in nautilus_trader 1.227.0 ``PolymarketExecutionClient`` with structured
+    in nautilus_trader 1.228.0 ``PolymarketExecutionClient`` with structured
     fail-closed dispatches.
 
-    Affected sites (installed 1.227.0 source):
+    Affected sites (installed 1.228.0 source):
       - ``generate_order_status_reports`` active-order loop (line ~431).
       - ``generate_order_status_reports`` ``generate_order_history_from_trades``
         branch (line ~534).
       - ``_parse_trades_response_object`` (line ~879).
+
+    The patch also scopes aggregate order-status and fill-report generation
+    to cached Polymarket market IDs before decoding rows. Nautilus asks for
+    startup mass status with ``instrument_id=None``; the upstream adapter
+    turns that into account-wide ``get_open_orders`` / ``get_trades``
+    requests, so unrelated account history can fail schema decode before
+    loaded-instrument filters run.
 
     Each replacement: when ``self._cache.client_order_id(venue_order_id)``
     returns ``None``, dispatch ``_dispatch_actual_fill(None, payload)`` with
@@ -150,7 +159,7 @@ def apply_uuid_fallback_guard_patch():
     ``verify_no_nautilus_client_order_id_uuid_fallback`` so the verify reads
     the patched source (no UUID4 marker) and lets live startup proceed.
 
-    Two intentional deviations from upstream 1.227.0 source:
+    Two intentional deviations from upstream 1.228.0 source:
 
     1. **Site 2 cache lookup (history-from-trades branch).** Upstream
        unconditionally synthesizes a UUID at this site; the patch consults the
@@ -172,9 +181,22 @@ def apply_uuid_fallback_guard_patch():
     match the upstream API.
     """
     global _uuid_guard_applied
+    global _uuid_guard_market_interval_seconds
 
     if _uuid_guard_applied:
+        if _uuid_guard_market_interval_seconds != market_interval_seconds:
+            raise RuntimeError(
+                "UUID-fallback guard patch already applied with "
+                f"market_interval_seconds={_uuid_guard_market_interval_seconds}, "
+                f"refusing reapply with {market_interval_seconds}"
+            )
         return True
+
+    if not isinstance(market_interval_seconds, int) or market_interval_seconds <= 0:
+        raise RuntimeError(
+            "apply_uuid_fallback_guard_patch requires a positive integer "
+            "market_interval_seconds"
+        )
 
     try:
         import nautilus_trader
@@ -189,7 +211,7 @@ def apply_uuid_fallback_guard_patch():
             f"{_UUID_GUARD_PINNED_NAUTILUS_VERSION}, but installed version is "
             f"{installed_version}. Re-run the clean-env Nautilus audit "
             "before bumping the pin: the patched method bodies are verbatim "
-            "copies of the 1.227.0 source and may have drifted upstream."
+            "copies of the 1.228.0 source and may have drifted upstream."
         )
 
     import asyncio  # noqa: F401  -- re-imported for clarity inside the patch
@@ -204,6 +226,7 @@ def apply_uuid_fallback_guard_patch():
         get_polymarket_token_id,
     )
     from nautilus_trader.adapters.polymarket.execution import PolymarketExecutionClient
+    from nautilus_trader.common.enums import LogLevel
     from nautilus_trader.core.uuid import UUID4
     from nautilus_trader.execution.messages import (
         GenerateFillReports,
@@ -219,82 +242,195 @@ def apply_uuid_fallback_guard_patch():
         TimeInForce,
     )
     from nautilus_trader.model.identifiers import ClientOrderId, TradeId, VenueOrderId
-    # Mirror upstream nautilus_trader 1.227.0 import path verbatim (re-export
+    # Mirror upstream nautilus_trader 1.228.0 import path verbatim (re-export
     # via py_clob_client_v2.client; canonical class lives in clob_types).
     from py_clob_client_v2.client import OpenOrderParams
+    from py_clob_client_v2.clob_types import TradeParams
+
+    def _timestamp_to_ns(ts):
+        return int(ts.timestamp() * 1_000_000_000)
+
+    def _reconciliation_window_ns(self, command):
+        if command.start is None:
+            raise RuntimeError(
+                "Polymarket aggregate reconciliation requires command.start "
+                "to scope loaded-market queries"
+            )
+        start_ns = _timestamp_to_ns(command.start)
+        if command.end is None:
+            end_ns = self._clock.timestamp_ns()
+        else:
+            end_ns = _timestamp_to_ns(command.end)
+        if end_ns < start_ns:
+            raise RuntimeError(
+                "Polymarket aggregate reconciliation command.end is earlier "
+                "than command.start"
+            )
+        return start_ns, end_ns
+
+    def _market_window_ns_from_slug(instrument):
+        # The Polymarket BTC 15-min slug encodes the market START as a trailing
+        # Unix-seconds timestamp (e.g. "btc-updown-15m-1718900000"); the market
+        # closes market_interval_seconds later. instrument.expiration_ns is
+        # parsed from Gamma's DATE-only endDateIso, which collapses to midnight
+        # UTC and is wrong for intraday markets — using it here drops every
+        # market from the reconciliation window. Derive the window from the slug
+        # exactly as bot.py _load_all_btc_instruments does.
+        info = instrument.info
+        if not info:
+            raise RuntimeError(
+                "Polymarket aggregate reconciliation: instrument "
+                f"{instrument.id} carries no info to derive its market slug"
+            )
+        slug = info.get("market_slug")
+        if not slug:
+            raise RuntimeError(
+                "Polymarket aggregate reconciliation: instrument "
+                f"{instrument.id} carries no market_slug to derive its window"
+            )
+        slug_tail = str(slug).rsplit("-", 1)[-1]
+        try:
+            market_start_seconds = int(slug_tail)
+        except ValueError as exc:
+            raise RuntimeError(
+                "Polymarket aggregate reconciliation: instrument "
+                f"{instrument.id} slug {slug!r} has no trailing Unix-seconds "
+                "timestamp to derive its market window"
+            ) from exc
+        market_start_ns = market_start_seconds * 1_000_000_000
+        market_end_ns = market_start_ns + market_interval_seconds * 1_000_000_000
+        return market_start_ns, market_end_ns
+
+    def _loaded_polymarket_reconciliation_instruments(self, command):
+        start_ns, end_ns = _reconciliation_window_ns(self, command)
+        scoped = []
+        for instrument in self._instrument_provider.list_all():
+            market_start_ns, market_end_ns = _market_window_ns_from_slug(instrument)
+            if market_end_ns < start_ns or market_start_ns > end_ns:
+                continue
+            scoped.append(
+                (
+                    get_polymarket_condition_id(instrument.id),
+                    get_polymarket_token_id(instrument.id),
+                    instrument.id,
+                )
+            )
+        if not scoped:
+            raise RuntimeError(
+                "Polymarket aggregate reconciliation found no provider-loaded "
+                "instruments overlapping command.start/command.end"
+            )
+        return scoped
+
+    def _loaded_polymarket_condition_ids(self, command):
+        condition_ids = []
+        seen = set()
+        for condition_id, _token_id, _instrument_id in (
+            _loaded_polymarket_reconciliation_instruments(self, command)
+        ):
+            if condition_id in seen:
+                continue
+            seen.add(condition_id)
+            condition_ids.append(condition_id)
+        return condition_ids
+
+    async def _ensure_polymarket_provider_initialized(self):
+        await self._instrument_provider.initialize()
 
     async def _patched_generate_order_status_reports(self, command):
-        # Verbatim copy of nautilus_trader 1.227.0
+        # Verbatim copy of nautilus_trader 1.228.0
         # PolymarketExecutionClient.generate_order_status_reports EXCEPT the
         # two ClientOrderId-via-UUID4 fallbacks are replaced with
         # _dispatch_actual_fill failure callbacks.
         self._log.debug("Requesting OrderStatusReports...")
+        await _ensure_polymarket_provider_initialized(self)
         reports = []
 
         if command.instrument_id is not None:
             condition_id = get_polymarket_condition_id(command.instrument_id)
             asset_id = get_polymarket_token_id(command.instrument_id)
-            params = OpenOrderParams(market=condition_id, asset_id=asset_id)
+            scoped_open_order_requests = [
+                (
+                    OpenOrderParams(market=condition_id, asset_id=asset_id),
+                    [command.instrument_id],
+                )
+            ]
         else:
-            params = None
+            scoped_open_order_requests = [
+                (
+                    OpenOrderParams(market=condition_id, asset_id=token_id),
+                    [instrument_id],
+                )
+                for condition_id, token_id, instrument_id in (
+                    _loaded_polymarket_reconciliation_instruments(self, command)
+                )
+            ]
 
-        retry_manager = await self._retry_manager_pool.acquire()
-        try:
-            response = await retry_manager.run(
-                "generate_order_status_reports",
-                [command.instrument_id],
-                asyncio.to_thread,
-                self._http_client.get_open_orders,
-                params=params,
-            )
+        seen_open_venue_order_ids = set()
+        for params, details in scoped_open_order_requests:
+            retry_manager = await self._retry_manager_pool.acquire()
+            try:
+                response = await retry_manager.run(
+                    "generate_order_status_reports",
+                    details,
+                    asyncio.to_thread,
+                    self._http_client.get_open_orders,
+                    params=params,
+                )
 
-            if response:
-                for json_obj in response:
-                    raw = msgspec.json.encode(json_obj)
-                    polymarket_order = self._decoder_order_report.decode(raw)
+                if response:
+                    for json_obj in response:
+                        raw = msgspec.json.encode(json_obj)
+                        polymarket_order = self._decoder_order_report.decode(raw)
 
-                    instrument_id = get_polymarket_instrument_id(
-                        polymarket_order.market,
-                        polymarket_order.asset_id,
-                    )
-                    instrument = self._cache.instrument(instrument_id)
-                    if instrument is None:
-                        self._log.warning(
-                            f"Cannot handle order report: instrument {instrument_id} not found "
-                            f"(market={polymarket_order.market}, asset_id={polymarket_order.asset_id})",
+                        instrument_id = get_polymarket_instrument_id(
+                            polymarket_order.market,
+                            polymarket_order.asset_id,
                         )
-                        continue
+                        instrument = self._instrument_provider.find(instrument_id)
+                        if instrument is None:
+                            self._log.warning(
+                                f"Cannot handle order report: instrument {instrument_id} not found "
+                                f"(market={polymarket_order.market}, asset_id={polymarket_order.asset_id})",
+                            )
+                            continue
 
-                    venue_order_id = polymarket_order.get_venue_order_id()
-                    client_order_id = self._cache.client_order_id(venue_order_id)
-                    if client_order_id is None:
-                        # UUID-fallback guard (site 1 of 3): no
-                        # synthetic client_order_id. Dispatch failure callback
-                        # and skip this report.
-                        _dispatch_actual_fill(
-                            None,
-                            {
-                                "status": "failed",
-                                "reason": "unmapped_venue_order_id",
-                                "venue_order_id": str(venue_order_id),
-                                "raw_status_report": json_obj,
-                                "report_source": "generate_order_status_reports.active_order_loop",
-                                "report_received_at": _datetime_now_iso(),
-                            },
+                        venue_order_id = polymarket_order.get_venue_order_id()
+                        if venue_order_id in seen_open_venue_order_ids:
+                            continue
+                        seen_open_venue_order_ids.add(venue_order_id)
+                        client_order_id = self._cache.client_order_id(venue_order_id)
+                        if client_order_id is None:
+                            # UUID-fallback guard (site 1 of 3): no
+                            # synthetic client_order_id. Dispatch failure callback
+                            # and skip this report.
+                            _dispatch_actual_fill(
+                                None,
+                                {
+                                    "status": "failed",
+                                    "reason": "unmapped_venue_order_id",
+                                    "venue_order_id": str(venue_order_id),
+                                    "raw_status_report": json_obj,
+                                    "report_source": "generate_order_status_reports.active_order_loop",
+                                    "report_received_at": _datetime_now_iso(),
+                                },
+                            )
+                            continue
+
+                        report = polymarket_order.parse_to_order_status_report(
+                            account_id=self.account_id,
+                            instrument=instrument,
+                            client_order_id=client_order_id,
+                            ts_init=self._clock.timestamp_ns(),
                         )
-                        continue
-
-                    report = polymarket_order.parse_to_order_status_report(
-                        account_id=self.account_id,
-                        instrument=instrument,
-                        client_order_id=client_order_id,
-                        ts_init=self._clock.timestamp_ns(),
-                    )
-                    reports.append(report)
-        finally:
-            await self._retry_manager_pool.release(retry_manager)
+                        reports.append(report)
+            finally:
+                await self._retry_manager_pool.release(retry_manager)
 
         if self._config.generate_order_history_from_trades:
+            original_command_start = command.start
+            original_command_end = command.end
+            original_log_receipt_level = command.log_receipt_level
             self._log.warning(
                 "Experimental feature not currently recommended: generating order history from trades",
             )
@@ -303,7 +439,7 @@ def apply_uuid_fallback_guard_patch():
                 if order.client_order_id in reported_client_order_ids:
                     continue
 
-                # Mirror upstream Nautilus 1.227.0's variable shadowing exactly:
+                # Mirror upstream Nautilus 1.228.0's variable shadowing exactly:
                 # the `command` parameter is reassigned inside this loop, so the
                 # downstream `fill_command = GenerateFillReports(instrument_id=
                 # command.instrument_id, ...)` uses the LAST sub-command's
@@ -334,8 +470,8 @@ def apply_uuid_fallback_guard_patch():
             fill_command = GenerateFillReports(
                 instrument_id=command.instrument_id,
                 venue_order_id=None,
-                start=None,
-                end=None,
+                start=original_command_start,
+                end=original_command_end,
                 command_id=UUID4(),
                 ts_init=self._clock.timestamp_ns(),
             )
@@ -353,7 +489,7 @@ def apply_uuid_fallback_guard_patch():
 
             for venue_order_id, fr_list in venue_order_id_fill_reports.items():
                 # UUID-fallback guard (site 2 of 3): cache lookup is
-                # not in installed Nautilus's 1.227.0 source here — Nautilus
+                # not in installed Nautilus's 1.228.0 source here — Nautilus
                 # bypasses the cache entirely and synthesizes a UUID for every
                 # venue_order_id reconstructed from fills. Our guard refuses
                 # to fabricate a client id from venue data: dispatch the
@@ -375,7 +511,7 @@ def apply_uuid_fallback_guard_patch():
                     continue
 
                 first_fill = fr_list[0]
-                instrument = self._cache.instrument(first_fill.instrument_id)
+                instrument = self._instrument_provider.find(first_fill.instrument_id)
                 if instrument is None:
                     self._log.warning(
                         f"Cannot handle order report: instrument {first_fill.instrument_id} not found "
@@ -403,7 +539,7 @@ def apply_uuid_fallback_guard_patch():
                 else:
                     avg_px_float = 0.0
 
-                # Restored from upstream 1.227.0 source (reviewer #1 finding
+                # Restored from upstream 1.228.0 source (reviewer #1 finding
                 # #8): preserve the operator-facing debug breadcrumbs so log
                 # output of the patched method is identical to upstream.
                 self._log.warning(f"{venue_order_id=}")
@@ -436,14 +572,64 @@ def apply_uuid_fallback_guard_patch():
         self._log_report_receipt(
             len(reports),
             "OrderStatusReport",
-            command.log_receipt_level,
+            original_log_receipt_level
+            if self._config.generate_order_history_from_trades
+            else command.log_receipt_level,
         )
+        return reports
+
+    async def _patched_generate_fill_reports(self, command):
+        # Upstream-compatible PolymarketExecutionClient.generate_fill_reports,
+        # except aggregate commands are market-scoped before trade decode.
+        self._log.debug("Requesting FillReports...")
+        await _ensure_polymarket_provider_initialized(self)
+        reports = []
+
+        if command.instrument_id is not None:
+            condition_ids = [get_polymarket_condition_id(command.instrument_id)]
+        else:
+            condition_ids = _loaded_polymarket_condition_ids(self, command)
+
+        parsed_fill_keys = set()
+
+        for condition_id in condition_ids:
+            params = TradeParams()
+            params.market = condition_id
+
+            if command.start is not None:
+                params.after = int(command.start.timestamp())
+            if command.end is not None:
+                params.before = int(command.end.timestamp())
+
+            retry_manager = await self._retry_manager_pool.acquire()
+            try:
+                response = await retry_manager.run(
+                    "generate_fill_reports",
+                    [condition_id],
+                    asyncio.to_thread,
+                    self._http_client.get_trades,
+                    params=params,
+                )
+
+                if response:
+                    for json_obj in response:
+                        self._parse_trades_response_object(
+                            command=command,
+                            json_obj=json_obj,
+                            parsed_fill_keys=parsed_fill_keys,
+                            reports=reports,
+                        )
+            finally:
+                await self._retry_manager_pool.release(retry_manager)
+
+        self._log_report_receipt(len(reports), "FillReport", LogLevel.INFO)
+
         return reports
 
     def _patched_parse_trades_response_object(
         self, command, json_obj, parsed_fill_keys, reports
     ):
-        # Verbatim copy of nautilus_trader 1.227.0
+        # Verbatim copy of nautilus_trader 1.228.0
         # PolymarketExecutionClient._parse_trades_response_object EXCEPT the
         # ClientOrderId-via-UUID4 fallback is replaced with
         # _dispatch_actual_fill and a continue.
@@ -462,7 +648,7 @@ def apply_uuid_fallback_guard_patch():
             if command.instrument_id is not None and instrument_id != command.instrument_id:
                 continue
 
-            instrument = self._cache.instrument(instrument_id)
+            instrument = self._instrument_provider.find(instrument_id)
             if instrument is None:
                 self._log.warning(
                     f"Cannot handle trade report: instrument {instrument_id} not found "
@@ -514,12 +700,14 @@ def apply_uuid_fallback_guard_patch():
     PolymarketExecutionClient.generate_order_status_reports = (
         _patched_generate_order_status_reports
     )
+    PolymarketExecutionClient.generate_fill_reports = _patched_generate_fill_reports
     PolymarketExecutionClient._parse_trades_response_object = (
         _patched_parse_trades_response_object
     )
     _uuid_guard_applied = True
+    _uuid_guard_market_interval_seconds = market_interval_seconds
     logger.info(
-        "UUID-fallback guard patch applied (3 sites): "
+        "UUID-fallback guard patch applied (3 sites) with scoped startup reports: "
         "generate_order_status_reports active-order loop, "
         "generate_order_status_reports history-from-trades, "
         "_parse_trades_response_object"
@@ -527,11 +715,18 @@ def apply_uuid_fallback_guard_patch():
     return True
 
 
-def apply_market_order_patch():
+def apply_market_order_patch(*, market_interval_seconds: int):
     """Apply monkey patch to PolymarketExecutionClient."""
     global _patch_applied
+    global _patch_market_interval_seconds
 
     if _patch_applied:
+        if _patch_market_interval_seconds != market_interval_seconds:
+            raise RuntimeError(
+                "Market order patch already applied with "
+                f"market_interval_seconds={_patch_market_interval_seconds}, "
+                f"refusing reapply with {market_interval_seconds}"
+            )
         logger.info("Market order patch already applied")
         return True
 
@@ -541,7 +736,9 @@ def apply_market_order_patch():
 
         # Apply UUID-fallback guard FIRST so the verify reads the
         # patched method source.
-        apply_uuid_fallback_guard_patch()
+        apply_uuid_fallback_guard_patch(
+            market_interval_seconds=market_interval_seconds,
+        )
 
         verify_no_nautilus_client_order_id_uuid_fallback(PolymarketExecutionClient)
 
@@ -573,6 +770,7 @@ def apply_market_order_patch():
         # Apply the patch
         PolymarketExecutionClient._handle_ws_message = _patched_handle_ws_message
         _patch_applied = True
+        _patch_market_interval_seconds = market_interval_seconds
         logger.info(
             "Market order patch applied — Nautilus native market submit is preserved; "
             "auto_redeem websocket events are handled locally"

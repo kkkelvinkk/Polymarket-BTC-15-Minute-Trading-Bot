@@ -1,12 +1,22 @@
 """
 Base Signal Processor
-Abstract interface for all signal processors
+Abstract interface for all signal processors.
+
+Beta-2 / Beta-3 contract:
+  - ``process(..., *, now: datetime, decision_id: str)`` REQUIRED kwargs
+    on every subclass (M11; no defaults).
+  - ``__init__(*, name: str, ...)`` REQUIRED kwarg on every subclass.
+  - ``TradingSignal`` gains ``signal_id: str`` (required) per Beta-3
+    canonical scheme ``f"{decision_id}:{processor_name}:{ordinal}"``.
+  - Each processor maintains ``self._signal_ordinal`` reset to 0 at
+    the first line of every ``process()`` call and post-incremented
+    after each emitted ``TradingSignal``.
 """
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from enum import Enum
 
 
@@ -31,8 +41,8 @@ class SignalStrength(Enum):
 
 class SignalDirection(Enum):
     """Signal direction."""
-    BULLISH = "bullish"  # Expect price to go up
-    BEARISH = "bearish"  # Expect price to go down
+    BULLISH = "bullish"
+    BEARISH = "bearish"
     NEUTRAL = "neutral"
 
 
@@ -40,113 +50,131 @@ class SignalDirection(Enum):
 class TradingSignal:
     """
     Trading signal from a processor.
-    
-    Represents a trading opportunity detected by analysis.
     """
     timestamp: datetime
-    source: str  # Which processor generated this
+    source: str
     signal_type: SignalType
     direction: SignalDirection
     strength: SignalStrength
-    confidence: float  # 0.0 - 1.0
-    
-    # Price context
+    confidence: float
     current_price: Decimal
+    signal_id: str
+
     target_price: Optional[Decimal] = None
     stop_loss: Optional[Decimal] = None
-    
-    # Additional data
     metadata: Dict[str, Any] = None
-    
+
     def __post_init__(self):
         if self.metadata is None:
             self.metadata = {}
-    
+
     @property
     def score(self) -> float:
-        """
-        Calculate signal score (0-100).
-        
-        Combines strength and confidence.
-        """
-        strength_weight = self.strength.value / 4.0  # Normalize to 0-1
+        """Calculate signal score (0-100). Combines strength and confidence."""
+        strength_weight = self.strength.value / 4.0
         return (strength_weight * 0.5 + self.confidence * 0.5) * 100
 
 
 class BaseSignalProcessor(ABC):
     """
     Base class for all signal processors.
-    
-    Signal processors analyze market data and generate trading signals.
+
+    Subclasses MUST accept ``name`` as a REQUIRED kwarg in their own
+    ``__init__`` and forward it to ``super().__init__(name)``.
     """
-    
+
     def __init__(self, name: str):
-        """
-        Initialize signal processor.
-        
-        Args:
-            name: Processor name
-        """
         self.name = name
         self._enabled = True
-        
-        # Statistics
         self._signals_generated = 0
         self._last_signal: Optional[TradingSignal] = None
-    
+        # Beta-3: per-instance, per-call ordinal for signal_id construction.
+        self._signal_ordinal: int = 0
+        # §3.D drop counters local to this processor (recorder queries
+        # via ``last_drop_counters()`` and merges into the snapshot's
+        # top-level ``drop_counters`` block at __exit__).
+        self._drop_counters: Dict[str, int] = {}
+
     @abstractmethod
     def process(
         self,
         current_price: Decimal,
-        historical_prices: list[Decimal],
-        metadata: Dict[str, Any] = None,
+        historical_prices: list,
+        metadata: Dict[str, Any],
+        *,
+        now: datetime,
+        decision_id: str,
     ) -> Optional[TradingSignal]:
         """
         Process market data and generate signal if conditions met.
-        
-        Args:
-            current_price: Current market price
-            historical_prices: List of recent prices
-            metadata: Additional context (volume, sentiment, etc.)
-            
-        Returns:
-            TradingSignal if opportunity detected, None otherwise
+
+        Beta-2 / Beta-3: ``now`` and ``decision_id`` are REQUIRED kwargs
+        (M11; no defaults).
         """
-        pass
-    
+        raise NotImplementedError
+
     def enable(self) -> None:
-        """Enable this processor."""
         self._enabled = True
-    
+
     def disable(self) -> None:
-        """Disable this processor."""
         self._enabled = False
-    
+
     @property
     def is_enabled(self) -> bool:
-        """Check if processor is enabled."""
         return self._enabled
-    
+
     @property
     def signals_generated(self) -> int:
-        """Get total signals generated."""
         return self._signals_generated
-    
+
+    def _reset_signal_ordinal(self) -> None:
+        """Beta-3: call at first line of every ``process()``."""
+        self._signal_ordinal = 0
+
+    def _next_signal_id(self, decision_id: str) -> str:
+        """
+        Beta-3: build the canonical signal_id and post-increment the
+        ordinal. Call BEFORE constructing each TradingSignal.
+        """
+        sid = f"{decision_id}:{self.name}:{self._signal_ordinal}"
+        self._signal_ordinal += 1
+        return sid
+
     def _record_signal(self, signal: TradingSignal) -> None:
-        """Record that a signal was generated."""
         self._signals_generated += 1
         self._last_signal = signal
-    
+
+    def _increment_drop(self, drop_class: str) -> None:
+        """§3.D drop counter increment; closed-enum class names."""
+        self._drop_counters[drop_class] = self._drop_counters.get(drop_class, 0) + 1
+
+    def last_drop_counters(self) -> Dict[str, int]:
+        """Recorder reads this at end-of-body to merge into snapshot."""
+        return dict(self._drop_counters)
+
+    def reset_drop_counters(self) -> None:
+        """Recorder calls this at start-of-body so counters are per-decision."""
+        self._drop_counters = {}
+
+    def effective_params(self) -> Dict[str, Any]:
+        """
+        Beta-4: return every adjustable parameter for this processor as
+        a sorted dict (CSV-deterministic). Subclasses override.
+        """
+        return {"name": self.name}
+
     def get_stats(self) -> Dict[str, Any]:
-        """Get processor statistics."""
         return {
             "name": self.name,
             "enabled": self._enabled,
             "signals_generated": self._signals_generated,
-            "last_signal": {
-                "timestamp": self._last_signal.timestamp.isoformat(),
-                "type": self._last_signal.signal_type.value,
-                "direction": self._last_signal.direction.value,
-                "score": self._last_signal.score,
-            } if self._last_signal else None
+            "last_signal": (
+                {
+                    "timestamp": self._last_signal.timestamp.isoformat(),
+                    "type": self._last_signal.signal_type.value,
+                    "direction": self._last_signal.direction.value,
+                    "score": self._last_signal.score,
+                }
+                if self._last_signal else None
+            ),
         }

@@ -30,6 +30,34 @@ Environment=LIVE_TRADE_LEDGER_PATH=/opt/polybot/ledger/live_trades.json
 Environment=NAUTILUS_LOG_DIR=/opt/polybot/logs/nautilus
 Environment=DECISION_LOG_PATH=/opt/polybot/ledger/decisions.jsonl
 
+# Beta-8 + Beta-5 + Beta-7 + Beta-4 promoted-env constants. Operators
+# MUST set every value; the bot raises at startup if any is missing.
+# POLYBOT_ACKNOWLEDGE_UTC_DAILY_RESET=1 is the explicit operator
+# acknowledgement of the local-TZ → UTC daily-reset boundary shift
+# (G6 bullet b in docs/RAW_DECISION_SNAPSHOT_PLAN.md). Refusal to set
+# this env raises at startup with a pointer to the operations doc.
+Environment=POLYBOT_ACKNOWLEDGE_UTC_DAILY_RESET=1
+Environment=MAX_POSITION_SIZE=1.0
+Environment=MAX_TOTAL_EXPOSURE=10.0
+Environment=MAX_POSITIONS=5
+Environment=MAX_DRAWDOWN_PCT=0.15
+Environment=MAX_LOSS_PER_DAY=5.0
+Environment=LIQUIDITY_FLOOR=0.02
+Environment=FUSION_RECENCY_WINDOW_SECONDS=300
+Environment=FUSION_MIN_SIGNALS=2
+Environment=FUSION_MIN_SCORE=55.0
+Environment=TREND_UP_THRESHOLD=0.60
+Environment=TREND_DOWN_THRESHOLD=0.40
+Environment=DIVERGENCE_SPOT_HISTORY_MAX_LEN=100
+Environment=TICK_VELOCITY_TOLERANCE_SECONDS=5
+
+# Raw-decision-snapshot opt-in. Set both for capture; set neither for
+# capture-disabled (the bot logs "raw decision snapshot capture disabled"
+# at startup and the recorder __exit__ is a no-op write).
+# Environment=RAW_DECISION_SNAPSHOT_DIR=/opt/polybot/raw_decision_snapshots
+# Environment=POLYBOT_GIT_SHA=<set via wrapper at deploy time>
+# Environment=POLYBOT_REQUIRE_SEPARATE_RAW_CORPUS_FILESYSTEM=1
+
 ExecStart=/bin/sh -c 'systemd-ask-password "Polymarket credentials vault password:" | /usr/sbin/runuser --preserve-environment -u polybot -- /opt/polybot/venv/bin/python bot.py --live --confirm-live'
 
 Restart=no
@@ -48,7 +76,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/polybot/ledger /opt/polybot/logs /run/systemd/ask-password
+ReadWritePaths=/opt/polybot/ledger /opt/polybot/raw_decision_snapshots /opt/polybot/logs /run/systemd/ask-password
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

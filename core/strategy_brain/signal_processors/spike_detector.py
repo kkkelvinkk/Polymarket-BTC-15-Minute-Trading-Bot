@@ -1,17 +1,13 @@
 """
 Spike Detection Signal Processor
-Detects sudden price movements in Polymarket UP probability and generates signals.
+Detects sudden price movements and generates signals.
 
-FIX: Original threshold was 15% deviation, designed for dollar prices.
-     Polymarket prices are probabilities (0.0-1.0), so:
-       - "Normal" range at market open: 0.40-0.60
-       - A 15% deviation from MA of 0.50 = price must reach 0.575 or 0.425
-       - This rarely fires, making the detector useless at market open
-
-     New approach:
-       - Spike threshold: 5% deviation (not 15%) — meaningful for probabilities
-       - Also detect VELOCITY (fast moves in the last 3 ticks)
-       - Mean reversion logic is still correct: spike up → BEARISH, spike down → BULLISH
+Beta-2/3/4 contract:
+  - ``name`` REQUIRED kwarg in __init__.
+  - ``now``, ``decision_id`` REQUIRED kwargs on process().
+  - All internal ``datetime.now()`` reads replaced by injected ``now``.
+  - ``signal_id`` populated on every TradingSignal.
+  - ``effective_params()`` exposes parameters.
 """
 from decimal import Decimal
 from datetime import datetime
@@ -32,29 +28,16 @@ from core.strategy_brain.signal_processors.base_processor import (
 
 
 class SpikeDetectionProcessor(BaseSignalProcessor):
-    """
-    Detects price spikes in Polymarket UP probability.
-
-    Two detection modes:
-    1. MA DEVIATION: Price deviates >5% from 20-period MA → mean reversion
-    2. VELOCITY SPIKE: Price moves >3% in last 3 ticks → momentum continuation
-       (short bursts often continue briefly before reverting)
-
-    Direction logic:
-    - Deviation spike UP → expect reversion → BEARISH
-    - Deviation spike DOWN → expect reversion → BULLISH
-    - Velocity spike UP → momentum continuation → BULLISH (for first ~30s)
-    - Velocity spike DOWN → momentum continuation → BEARISH
-    """
-
     def __init__(
         self,
-        spike_threshold: float = 0.05,    # FIXED: was 0.15, now 0.05 for probability prices
+        *,
+        name: str,
+        spike_threshold: float = 0.05,
         lookback_periods: int = 20,
-        min_confidence: float = 0.55,     # FIXED: was 0.60, slightly lower for more signals
-        velocity_threshold: float = 0.03, # 3% move in 3 ticks = velocity spike
+        min_confidence: float = 0.55,
+        velocity_threshold: float = 0.03,
     ):
-        super().__init__("SpikeDetection")
+        super().__init__(name)
 
         self.spike_threshold = spike_threshold
         self.lookback_periods = lookback_periods
@@ -68,54 +51,73 @@ class SpikeDetectionProcessor(BaseSignalProcessor):
             f"lookback={lookback_periods}"
         )
 
+    def effective_params(self) -> Dict[str, Any]:
+        return dict(sorted({
+            "name": self.name,
+            "spike_threshold": self.spike_threshold,
+            "lookback_periods": self.lookback_periods,
+            "min_confidence": self.min_confidence,
+            "velocity_threshold": self.velocity_threshold,
+        }.items()))
+
     def process(
         self,
         current_price: Decimal,
         historical_prices: list,
-        metadata: Dict[str, Any] = None,
+        metadata: Dict[str, Any],
+        *,
+        now: datetime,
+        decision_id: str,
     ) -> Optional[TradingSignal]:
-        """
-        Detect probability spikes and generate mean-reversion or momentum signals.
-        """
+        self._reset_signal_ordinal()
+
         if not self.is_enabled:
             return None
-
         if len(historical_prices) < self.lookback_periods:
             return None
 
-        # --- Compute 20-period MA ---
+        # Beta-1: historical_prices is tuple[PriceHistoryEntry, ...]; ``.value``
+        # is the numeric component. RP12-extended static check enforces.
+        # Beta-1: historical_prices is tuple[PriceHistoryEntry, ...]; ``.value``
+        # is the numeric component. RP12-extended static check enforces.
         recent = historical_prices[-self.lookback_periods:]
-        ma = sum(float(p) for p in recent) / len(recent)
+        ma = sum(float(p.value) for p in recent) / len(recent)
         curr = float(current_price)
 
-        deviation = (curr - ma) / ma if ma > 0 else 0.0
+        # Review-cycle fix: a non-positive moving average is corruption
+        # (Polymarket probabilities are > 0); fail-stop rather than
+        # silently substituting 0.0 deviation.
+        if ma <= 0:
+            raise RuntimeError(
+                f"SpikeDetection: moving average {ma!r} is non-positive — corruption"
+            )
+        deviation = (curr - ma) / ma
         deviation_abs = abs(deviation)
 
-        # --- Check velocity (last 3 ticks) ---
         velocity = 0.0
         if len(historical_prices) >= 3:
-            prev3 = float(historical_prices[-3])
-            velocity = (curr - prev3) / prev3 if prev3 > 0 else 0.0
+            prev3 = float(historical_prices[-3].value)
+            if prev3 <= 0:
+                raise RuntimeError(
+                    f"SpikeDetection: prev3 {prev3!r} is non-positive — corruption"
+                )
+            velocity = (curr - prev3) / prev3
 
         logger.debug(
             f"SpikeDetector: price={curr:.4f}, MA={ma:.4f}, "
             f"deviation={deviation:+.3%}, velocity={velocity:+.3%}"
         )
 
-        # =====================================================================
         # SIGNAL 1: MA DEVIATION SPIKE → mean reversion
-        # =====================================================================
         if deviation_abs >= self.spike_threshold:
             logger.info(
                 f"MA deviation spike: {deviation:+.3%} from MA "
                 f"(${curr:.4f} vs MA={ma:.4f})"
             )
 
-            # Fade the spike (mean reversion)
             direction = SignalDirection.BEARISH if deviation > 0 else SignalDirection.BULLISH
             target = Decimal(str(ma))
 
-            # Strength by magnitude (calibrated for 0-1 probability prices)
             if deviation_abs >= 0.12:
                 strength = SignalStrength.VERY_STRONG
             elif deviation_abs >= 0.08:
@@ -126,7 +128,6 @@ class SpikeDetectionProcessor(BaseSignalProcessor):
                 strength = SignalStrength.WEAK
 
             confidence = min(0.90, 0.50 + (deviation_abs - self.spike_threshold) * 3.0)
-
             if confidence < self.min_confidence:
                 return None
 
@@ -137,13 +138,14 @@ class SpikeDetectionProcessor(BaseSignalProcessor):
             )
 
             signal = TradingSignal(
-                timestamp=datetime.now(),
+                timestamp=now,
                 source=self.name,
                 signal_type=SignalType.SPIKE_DETECTED,
                 direction=direction,
                 strength=strength,
                 confidence=confidence,
                 current_price=current_price,
+                signal_id=self._next_signal_id(decision_id),
                 target_price=target,
                 stop_loss=stop_loss,
                 metadata={
@@ -162,16 +164,10 @@ class SpikeDetectionProcessor(BaseSignalProcessor):
             )
             return signal
 
-        # =====================================================================
         # SIGNAL 2: VELOCITY SPIKE → short-term momentum continuation
-        # Only fires when price is NOT already at an MA extreme (no double-signal)
-        # =====================================================================
         if abs(velocity) >= self.velocity_threshold and deviation_abs < self.spike_threshold * 0.6:
-            logger.info(
-                f"Velocity spike: {velocity:+.3%} in last 3 ticks"
-            )
+            logger.info(f"Velocity spike: {velocity:+.3%} in last 3 ticks")
 
-            # Momentum continuation (short-term, lower confidence)
             direction = SignalDirection.BULLISH if velocity > 0 else SignalDirection.BEARISH
 
             vel_strength = abs(velocity) / self.velocity_threshold
@@ -189,13 +185,14 @@ class SpikeDetectionProcessor(BaseSignalProcessor):
                 return None
 
             signal = TradingSignal(
-                timestamp=datetime.now(),
+                timestamp=now,
                 source=self.name,
                 signal_type=SignalType.MOMENTUM,
                 direction=direction,
                 strength=strength,
                 confidence=confidence,
                 current_price=current_price,
+                signal_id=self._next_signal_id(decision_id),
                 metadata={
                     "detection_mode": "velocity",
                     "velocity_pct": velocity,

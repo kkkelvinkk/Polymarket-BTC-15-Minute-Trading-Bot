@@ -54,6 +54,8 @@ class TestDecisionSnapshotContext(DecisionSnapshotTestCase):
         strategy = self._new_strategy()
         self._set_market(strategy)
         strategy.price_history = [Decimal("0.50")] * 20
+        strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+        strategy._price_history_ts = [None] * len(strategy.price_history)
         strategy._tick_buffer.append({"ts": datetime.now(timezone.utc), "price": Decimal("0.50")})
 
         class _OrderBookProcessor:
@@ -85,6 +87,8 @@ class TestDecisionSnapshotContext(DecisionSnapshotTestCase):
             "decision-frozen-context",
         )
         strategy.price_history = [Decimal("0.90")] * 20
+        strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+        strategy._price_history_ts = [None] * len(strategy.price_history)
         strategy._tick_buffer.append({"ts": datetime.now(timezone.utc), "price": Decimal("0.90")})
         self._set_market(
             strategy,
@@ -113,6 +117,8 @@ class TestDecisionSnapshotContext(DecisionSnapshotTestCase):
         strategy = self._new_strategy()
         self._set_market(strategy)
         strategy.price_history = [Decimal("0.50")] * 20
+        strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+        strategy._price_history_ts = [None] * len(strategy.price_history)
         strategy._tick_buffer.append({"ts": datetime.now(timezone.utc), "price": Decimal("0.50")})
 
         class _OrderBookProcessor:
@@ -156,6 +162,8 @@ class TestDecisionSnapshotContext(DecisionSnapshotTestCase):
         strategy = self._new_strategy()
         self._set_market(strategy)
         strategy.price_history = [Decimal("0.50")] * 20
+        strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+        strategy._price_history_ts = [None] * len(strategy.price_history)
         strategy._tick_buffer.append({"ts": datetime.now(timezone.utc), "price": Decimal("0.50")})
 
         class _OrderBookProcessor:
@@ -199,6 +207,8 @@ class TestDecisionSnapshotContext(DecisionSnapshotTestCase):
         strategy = self._new_strategy()
         self._set_market(strategy)
         strategy.price_history = [Decimal("0.50")] * 20
+        strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+        strategy._price_history_ts = [None] * len(strategy.price_history)
         strategy._tick_buffer.append({"ts": datetime.now(timezone.utc), "price": Decimal("0.50")})
         fetched = []
 
@@ -255,27 +265,31 @@ class TestDecisionSnapshotContext(DecisionSnapshotTestCase):
         self._set_market(strategy)
         first_tick_ts = datetime.now(timezone.utc)
         strategy.price_history = [Decimal("0.50")] * 20
+        strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+        strategy._price_history_ts = [None] * len(strategy.price_history)
         strategy._tick_buffer.append({"ts": first_tick_ts, "price": Decimal("0.50")})
         snapshot = strategy._capture_decision_input_snapshot(
             Decimal("0.40"),
             "decision-frozen-signals",
         )
         strategy.price_history = [Decimal("0.90")] * 20
+        strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+        strategy._price_history_ts = [None] * len(strategy.price_history)
         strategy._tick_buffer.append({"ts": datetime.now(timezone.utc), "price": Decimal("0.90")})
         captured = {}
 
         class _CaptureHistoryProcessor:
-            def process(self, current_price, historical_prices, metadata):
+            def process(self, current_price, historical_prices, metadata, **_kw):
                 captured["history"] = (current_price, tuple(historical_prices))
                 return None
 
         class _CaptureTickProcessor:
-            def process(self, current_price, historical_prices, metadata):
+            def process(self, current_price, historical_prices, metadata, **_kw):
                 captured["tick_buffer"] = tuple(metadata["tick_buffer"])
                 return None
 
         class _NullProcessor:
-            def process(self, current_price, historical_prices, metadata):
+            def process(self, current_price, historical_prices, metadata, **_kw):
                 return None
 
         strategy.spike_detector = _CaptureHistoryProcessor()
@@ -283,10 +297,15 @@ class TestDecisionSnapshotContext(DecisionSnapshotTestCase):
         strategy.deribit_pcr_processor = _NullProcessor()
         metadata = {"tick_buffer": [tick.as_processor_dict() for tick in snapshot.tick_buffer]}
 
-        signals = strategy._process_signals(snapshot, metadata)
+        signals = strategy._process_signals(snapshot, metadata, now=snapshot.reference_time)
 
         self.assertEqual(signals, [])
-        self.assertEqual(captured["history"], (Decimal("0.40"), tuple([Decimal("0.50")] * 20)))
+        captured_current, captured_hist = captured["history"]
+        self.assertEqual(captured_current, Decimal("0.40"))
+        self.assertEqual(
+            tuple(p.value for p in captured_hist),
+            tuple([Decimal("0.50")] * 20),
+        )
         self.assertEqual(
             captured["tick_buffer"],
             ({"ts": first_tick_ts, "price": Decimal("0.50")},),
@@ -296,6 +315,8 @@ class TestDecisionSnapshotContext(DecisionSnapshotTestCase):
         strategy = self._new_strategy()
         self._set_market(strategy)
         strategy.price_history = [Decimal("0.50")] * 20
+        strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+        strategy._price_history_ts = [None] * len(strategy.price_history)
         snapshot = strategy._capture_decision_input_snapshot(
             Decimal("0.40"),
             "decision-shadow-isolated",
@@ -303,14 +324,14 @@ class TestDecisionSnapshotContext(DecisionSnapshotTestCase):
         calls = []
 
         class _RaisingProcessor:
-            def process(self, current_price, historical_prices, metadata):
+            def process(self, current_price, historical_prices, metadata, **_kw):
                 raise AssertionError("live processor should not run for shadow observation")
 
         class _RecordingProcessor:
             def __init__(self, name):
                 self.name = name
 
-            def process(self, current_price, historical_prices, metadata):
+            def process(self, current_price, historical_prices, metadata, **_kw):
                 calls.append(self.name)
                 return None
 
@@ -325,6 +346,7 @@ class TestDecisionSnapshotContext(DecisionSnapshotTestCase):
             snapshot,
             {"spot_price": Decimal("100000")},
             observation_only=True,
+            now=snapshot.reference_time,
         )
 
         self.assertEqual(signals, [])

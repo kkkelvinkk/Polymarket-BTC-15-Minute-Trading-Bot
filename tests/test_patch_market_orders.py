@@ -1,5 +1,7 @@
 import importlib.util
 import asyncio
+from datetime import datetime, timezone
+import sys
 import types
 import unittest
 from pathlib import Path
@@ -7,6 +9,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "patch_market_orders.py"
+TEST_MARKET_INTERVAL_SECONDS = 900
 
 
 def load_patch_module():
@@ -31,6 +34,8 @@ class PatchMarketOrdersTests(unittest.TestCase):
         cls._original_methods = {
             "generate_order_status_reports":
                 PolymarketExecutionClient.generate_order_status_reports,
+            "generate_fill_reports":
+                PolymarketExecutionClient.generate_fill_reports,
             "_parse_trades_response_object":
                 PolymarketExecutionClient._parse_trades_response_object,
             "_submit_market_order":
@@ -51,6 +56,12 @@ class PatchMarketOrdersTests(unittest.TestCase):
             return
         for name, original in self._original_methods.items():
             setattr(PolymarketExecutionClient, name, original)
+        canonical = sys.modules.get("patch_market_orders")
+        if canonical is not None:
+            canonical._uuid_guard_applied = False
+            canonical._uuid_guard_market_interval_seconds = None
+            canonical._patch_applied = False
+            canonical._patch_market_interval_seconds = None
 
     def test_auto_redeem_handler_exception_is_not_swallowed(self):
         module = load_patch_module()
@@ -72,7 +83,11 @@ class PatchMarketOrdersTests(unittest.TestCase):
         )
 
         original_submit = PolymarketExecutionClient._submit_market_order
-        self.assertTrue(module.apply_market_order_patch())
+        self.assertTrue(
+            module.apply_market_order_patch(
+                market_interval_seconds=TEST_MARKET_INTERVAL_SECONDS,
+            )
+        )
         self.assertIs(PolymarketExecutionClient._submit_market_order, original_submit)
 
     def test_native_limit_ioc_maps_to_clob_limit_order_and_fak_post(self):
@@ -295,7 +310,7 @@ class PatchMarketOrdersTests(unittest.TestCase):
             module.verify_no_nautilus_client_order_id_uuid_fallback(DummyClient)
 
     def test_uuid_guard_blocks_unpatched_installed_nautilus(self):
-        """Regression: installed nautilus_trader (1.222.0 or 1.227.0) still
+        """Regression: installed nautilus_trader (1.222.0 or 1.228.0) still
         contains the UUID4 client-id fallback at 3 sites until our
         guard patch is applied. The verify MUST block live startup on the
         unpatched class.
@@ -339,7 +354,9 @@ class PatchMarketOrdersTests(unittest.TestCase):
         # Use the canonical module so the handler registry is shared with the
         # patched method's _dispatch_actual_fill closure.
         import patch_market_orders as canonical
-        canonical.apply_uuid_fallback_guard_patch()
+        canonical.apply_uuid_fallback_guard_patch(
+            market_interval_seconds=TEST_MARKET_INTERVAL_SECONDS,
+        )
 
         captured = []
 
@@ -370,11 +387,15 @@ class PatchMarketOrdersTests(unittest.TestCase):
                     return _MockTrade()
 
             class _MockCache:
-                def instrument(self, _instrument_id):
-                    return object()  # truthy
-
                 def client_order_id(self, _venue_order_id):
                     return None  # FORCE the unmapped-venue branch
+
+            class _MockInstrumentProvider:
+                async def initialize(self):
+                    return None
+
+                def find(self, _instrument_id):
+                    return object()  # truthy
 
             class _MockClock:
                 def timestamp_ns(self):
@@ -389,6 +410,7 @@ class PatchMarketOrdersTests(unittest.TestCase):
                 _wallet_address = "0xWALLET"
                 _api_key = "API"
                 _cache = _MockCache()
+                _instrument_provider = _MockInstrumentProvider()
                 account_id = object()
                 _clock = _MockClock()
                 _log = _MockLog()
@@ -418,6 +440,358 @@ class PatchMarketOrdersTests(unittest.TestCase):
         finally:
             canonical.unregister_actual_fill_handler(handler)
 
+    def test_zz_patched_generate_fill_reports_scopes_aggregate_to_provider_markets(self):
+        """Startup mass-status fill reconciliation must query loaded markets.
+
+        Nautilus calls GenerateFillReports with instrument_id=None at startup.
+        The patched method must not issue the upstream account-wide
+        TradeParams() request; it must enumerate provider-loaded Polymarket condition
+        IDs and set params.market before any trade rows are decoded.
+        """
+        try:
+            from nautilus_trader.adapters.polymarket.execution import (
+                PolymarketExecutionClient,
+            )
+        except ImportError:
+            self.skipTest("nautilus_trader is not installed in this environment")
+
+        import patch_market_orders as canonical
+        canonical.apply_uuid_fallback_guard_patch(
+            market_interval_seconds=TEST_MARKET_INTERVAL_SECONDS,
+        )
+
+        captured_requests = []
+        releases = []
+
+        class _Symbol:
+            def __init__(self, value):
+                self.value = value
+
+        class _InstrumentId:
+            def __init__(self, value):
+                self.symbol = _Symbol(value)
+
+        class _Instrument:
+            def __init__(self, value, expiration_s):
+                self.id = _InstrumentId(value)
+                self.expiration_ns = expiration_s * 1_000_000_000
+                # Reconciliation derives the market window from the slug START;
+                # expiration_ns is Gamma's date-only midnight and is unused. The
+                # slug start = expiration - interval keeps the window identical.
+                self.info = {
+                    "market_slug": (
+                        f"btc-updown-15m-{expiration_s - TEST_MARKET_INTERVAL_SECONDS}"
+                    )
+                }
+
+        class _Cache:
+            pass
+
+        class _InstrumentProvider:
+            def __init__(self):
+                self.initialized = 0
+
+            async def initialize(self):
+                self.initialized += 1
+
+            def list_all(self):
+                return [
+                    _Instrument("condOld-tokenYES", 1781982899),
+                    _Instrument("condA-tokenYES", 1781982900),
+                    _Instrument("condA-tokenNO", 1781982900),
+                    _Instrument("condB-tokenYES", 1781983800),
+                    _Instrument("condFuture-tokenYES", 1781984700),
+                ]
+
+        class _RetryManager:
+            async def run(self, name, details, runner, func, *, params):
+                captured_requests.append((name, details, params))
+                return []
+
+        class _RetryPool:
+            async def acquire(self):
+                return _RetryManager()
+
+            async def release(self, retry_manager):
+                releases.append(retry_manager)
+
+        class _HttpClient:
+            def get_trades(self, *, params):
+                raise AssertionError("retry manager should own get_trades execution")
+
+        class _Log:
+            def debug(self, *_args, **_kwargs):
+                return None
+
+        class _MockSelf:
+            _log = _Log()
+            _cache = _Cache()
+            _retry_manager_pool = _RetryPool()
+            _http_client = _HttpClient()
+
+            def __init__(self):
+                self._instrument_provider = _InstrumentProvider()
+
+            def _parse_trades_response_object(self, *_args, **_kwargs):
+                raise AssertionError("empty trade responses should not be decoded")
+
+            def _log_report_receipt(self, count, report_type, level):
+                self.receipt = (count, report_type, level)
+
+        command = types.SimpleNamespace(
+            instrument_id=None,
+            venue_order_id=None,
+            start=datetime.fromtimestamp(1781982900, tz=timezone.utc),
+            end=datetime.fromtimestamp(1781983200, tz=timezone.utc),
+        )
+
+        mock_self = _MockSelf()
+        reports = asyncio.run(
+            PolymarketExecutionClient.generate_fill_reports(mock_self, command)
+        )
+
+        self.assertEqual(reports, [])
+        self.assertEqual([params.market for _, _, params in captured_requests], ["condA", "condB"])
+        self.assertEqual(
+            [details for _, details, _ in captured_requests],
+            [["condA"], ["condB"]],
+        )
+        self.assertEqual(
+            [params.after for _, _, params in captured_requests],
+            [1781982900, 1781982900],
+        )
+        self.assertEqual(
+            [params.before for _, _, params in captured_requests],
+            [1781983200, 1781983200],
+        )
+        self.assertEqual(len(releases), 2)
+        self.assertEqual(mock_self.receipt[0:2], (0, "FillReport"))
+        self.assertEqual(mock_self._instrument_provider.initialized, 1)
+
+    def test_zz_patched_order_status_reports_scopes_aggregate_open_orders(self):
+        try:
+            from nautilus_trader.adapters.polymarket.execution import (
+                PolymarketExecutionClient,
+            )
+        except ImportError:
+            self.skipTest("nautilus_trader is not installed in this environment")
+
+        import patch_market_orders as canonical
+        canonical.apply_uuid_fallback_guard_patch(
+            market_interval_seconds=TEST_MARKET_INTERVAL_SECONDS,
+        )
+
+        captured_requests = []
+
+        class _Symbol:
+            def __init__(self, value):
+                self.value = value
+
+        class _InstrumentId:
+            def __init__(self, value):
+                self.symbol = _Symbol(value)
+
+        class _Instrument:
+            def __init__(self, value, expiration_s):
+                self.id = _InstrumentId(value)
+                self.expiration_ns = expiration_s * 1_000_000_000
+                # Reconciliation derives the market window from the slug START;
+                # expiration_ns is Gamma's date-only midnight and is unused. The
+                # slug start = expiration - interval keeps the window identical.
+                self.info = {
+                    "market_slug": (
+                        f"btc-updown-15m-{expiration_s - TEST_MARKET_INTERVAL_SECONDS}"
+                    )
+                }
+
+        class _Cache:
+            pass
+
+        class _InstrumentProvider:
+            def __init__(self):
+                self.initialized = 0
+
+            async def initialize(self):
+                self.initialized += 1
+
+            def list_all(self):
+                return [
+                    _Instrument("condA-tokenYES", 1781982900),
+                    _Instrument("condA-tokenNO", 1781982900),
+                    _Instrument("condB-tokenYES", 1781983800),
+                    _Instrument("condFuture-tokenYES", 1781984700),
+                ]
+
+        class _RetryManager:
+            async def run(self, name, details, runner, func, *, params):
+                captured_requests.append((name, details, params))
+                return []
+
+        class _RetryPool:
+            async def acquire(self):
+                return _RetryManager()
+
+            async def release(self, _retry_manager):
+                return None
+
+        class _Log:
+            def debug(self, *_args, **_kwargs):
+                return None
+
+        class _MockSelf:
+            _log = _Log()
+            _cache = _Cache()
+            _retry_manager_pool = _RetryPool()
+            _http_client = types.SimpleNamespace(get_open_orders=object())
+            _config = types.SimpleNamespace(generate_order_history_from_trades=False)
+
+            def __init__(self):
+                self._instrument_provider = _InstrumentProvider()
+
+            def _log_report_receipt(self, count, report_type, level):
+                self.receipt = (count, report_type, level)
+
+        command = types.SimpleNamespace(
+            instrument_id=None,
+            start=datetime.fromtimestamp(1781982900, tz=timezone.utc),
+            end=datetime.fromtimestamp(1781983200, tz=timezone.utc),
+            log_receipt_level="INFO",
+        )
+
+        mock_self = _MockSelf()
+        reports = asyncio.run(
+            PolymarketExecutionClient.generate_order_status_reports(mock_self, command)
+        )
+
+        self.assertEqual(reports, [])
+        self.assertEqual(
+            [(params.market, params.asset_id) for _, _, params in captured_requests],
+            [
+                ("condA", "tokenYES"),
+                ("condA", "tokenNO"),
+                ("condB", "tokenYES"),
+            ],
+        )
+        self.assertEqual(mock_self.receipt, (0, "OrderStatusReport", "INFO"))
+        self.assertEqual(mock_self._instrument_provider.initialized, 1)
+
+    def test_zz_order_history_from_trades_preserves_reconciliation_window(self):
+        try:
+            from nautilus_trader.adapters.polymarket.execution import (
+                PolymarketExecutionClient,
+            )
+            from nautilus_trader.model.identifiers import (
+                ClientOrderId,
+                InstrumentId,
+                VenueOrderId,
+            )
+        except ImportError:
+            self.skipTest("nautilus_trader is not installed in this environment")
+
+        import patch_market_orders as canonical
+        canonical.apply_uuid_fallback_guard_patch(
+            market_interval_seconds=TEST_MARKET_INTERVAL_SECONDS,
+        )
+
+        captured_fill_command = {}
+
+        class _Symbol:
+            def __init__(self, value):
+                self.value = value
+
+        class _InstrumentId:
+            def __init__(self, value):
+                self.symbol = _Symbol(value)
+
+        class _Instrument:
+            id = _InstrumentId("condA-tokenYES")
+            expiration_ns = 1781982900 * 1_000_000_000
+            # Slug START = expiration - interval (900); window stays [..2000, ..2900].
+            info = {"market_slug": "btc-updown-15m-1781982000"}
+
+        class _Cache:
+            def orders_open(self, venue):
+                return [
+                    types.SimpleNamespace(
+                        instrument_id=InstrumentId.from_str("condA-tokenYES.POLYMARKET"),
+                        client_order_id=ClientOrderId("client-open"),
+                        venue_order_id=VenueOrderId("venue-open"),
+                    )
+                ]
+
+            def orders(self):
+                return []
+
+        class _InstrumentProvider:
+            def __init__(self):
+                self.initialized = 0
+
+            async def initialize(self):
+                self.initialized += 1
+
+            def list_all(self):
+                return [_Instrument()]
+
+        class _RetryManager:
+            async def run(self, name, details, runner, func, *, params):
+                return []
+
+        class _RetryPool:
+            async def acquire(self):
+                return _RetryManager()
+
+            async def release(self, _retry_manager):
+                return None
+
+        class _Log:
+            def debug(self, *_args, **_kwargs):
+                return None
+
+            def warning(self, *_args, **_kwargs):
+                return None
+
+        class _MockSelf:
+            _log = _Log()
+            _cache = _Cache()
+            _retry_manager_pool = _RetryPool()
+            _http_client = types.SimpleNamespace(get_open_orders=object())
+            _config = types.SimpleNamespace(generate_order_history_from_trades=True)
+            _clock = types.SimpleNamespace(timestamp_ns=lambda: 0)
+
+            def __init__(self):
+                self._instrument_provider = _InstrumentProvider()
+
+            async def generate_order_status_report(self, command):
+                self.order_status_command = command
+                return None
+
+            async def generate_fill_reports(self, command):
+                captured_fill_command["command"] = command
+                return []
+
+            def _log_report_receipt(self, count, report_type, level):
+                self.receipt = (count, report_type, level)
+
+        start = datetime.fromtimestamp(1781982900, tz=timezone.utc)
+        end = datetime.fromtimestamp(1781983200, tz=timezone.utc)
+        command = types.SimpleNamespace(
+            instrument_id=None,
+            start=start,
+            end=end,
+            log_receipt_level="INFO",
+        )
+
+        mock_self = _MockSelf()
+        reports = asyncio.run(
+            PolymarketExecutionClient.generate_order_status_reports(mock_self, command)
+        )
+
+        self.assertEqual(reports, [])
+        self.assertIs(captured_fill_command["command"].start, start)
+        self.assertIs(captured_fill_command["command"].end, end)
+        self.assertEqual(mock_self.receipt, (0, "OrderStatusReport", "INFO"))
+        self.assertEqual(mock_self._instrument_provider.initialized, 1)
+
     def test_zz_uuid_fallback_guard_patch_lets_verify_pass(self):
         """Applying the UUID-fallback guard patch replaces the 3
         ClientOrderId-via-UUID4 fallback sites with _dispatch_actual_fill +
@@ -439,7 +813,9 @@ class PatchMarketOrdersTests(unittest.TestCase):
             self.skipTest("nautilus_trader is not installed in this environment")
 
         # Apply the patch
-        result = module.apply_uuid_fallback_guard_patch()
+        result = module.apply_uuid_fallback_guard_patch(
+            market_interval_seconds=TEST_MARKET_INTERVAL_SECONDS,
+        )
         self.assertTrue(result)
 
         # Verify now passes on the patched method source

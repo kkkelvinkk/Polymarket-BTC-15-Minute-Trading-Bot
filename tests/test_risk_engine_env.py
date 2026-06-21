@@ -1,5 +1,6 @@
 import os
 import unittest
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from execution.risk_engine import RiskEngine
@@ -24,7 +25,9 @@ class RiskEngineEnvTests(unittest.TestCase):
             os.environ["MAX_DRAWDOWN_PCT"] = "0.20"
             os.environ["MAX_LOSS_PER_DAY"] = "8.00"
 
-            risk = RiskEngine()
+            # Beta-8: now= is a REQUIRED constructor kwarg (M11).
+            now = datetime(2026, 5, 24, tzinfo=timezone.utc)
+            risk = RiskEngine(now=now)
 
             self.assertEqual(risk.limits.max_position_size, Decimal("5.50"))
             self.assertEqual(risk.limits.max_total_exposure, Decimal("20.00"))
@@ -36,6 +39,7 @@ class RiskEngineEnvTests(unittest.TestCase):
                 size=Decimal("5.50"),
                 direction="long",
                 current_price=Decimal("0.8550"),
+                now=now,
             )
 
             self.assertTrue(is_valid, error)

@@ -12,46 +12,27 @@ repair paths.
 from __future__ import annotations
 
 import argparse
-import json
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import httpx
 
+from analysis.gamma_resolution import (
+    GAMMA_MARKETS_URL,
+    WINNING_PRICE,
+    fetch_market_by_slug,
+    load_decision_records as _load_decisions,
+    parse_finite_decimal as _decimal,
+    winning_side as _winning_side,
+)
 
-GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
-WINNING_PRICE = Decimal("1")
-
-
-def _decimal(value: Any, field_name: str) -> Decimal:
-    parsed = Decimal(str(value))
-    if not parsed.is_finite():
-        raise ValueError(f"{field_name} must be finite, got {value!r}")
-    return parsed
-
-
-def _json_array(value: Any, field_name: str) -> list[Any]:
-    if not isinstance(value, str):
-        raise ValueError(f"{field_name} must be a JSON-encoded array string")
-    parsed = json.loads(value)
-    if not isinstance(parsed, list):
-        raise ValueError(f"{field_name} must be a JSON array")
-    return parsed
-
-
-def _load_decisions(path: Path) -> list[dict[str, Any]]:
-    records = []
-    with path.open("r", encoding="utf-8") as fh:
-        for line_number, line in enumerate(fh, 1):
-            stripped = line.strip()
-            if stripped == "":
-                raise ValueError(f"{path}:{line_number} is blank")
-            record = json.loads(stripped)
-            if not isinstance(record, dict):
-                raise ValueError(f"{path}:{line_number} is not a JSON object")
-            records.append(record)
-    return records
+__all__ = [
+    "GAMMA_MARKETS_URL",
+    "WINNING_PRICE",
+    "main",
+    "run",
+]
 
 
 def _decided_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -79,55 +60,14 @@ def _decided_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _fetch_market_by_slug(client: httpx.Client, slug: str) -> dict[str, Any]:
-    response = client.get(
-        GAMMA_MARKETS_URL,
-        params={"slug": slug, "limit": 2},
-    )
-    response.raise_for_status()
-    markets = response.json()
-    if not isinstance(markets, list):
-        raise ValueError("Gamma markets response is not a JSON array")
-    exact_matches = [market for market in markets if market["slug"] == slug]
-    if len(exact_matches) != 1:
-        raise ValueError(f"Gamma returned {len(exact_matches)} exact matches for slug {slug!r}")
-    market = exact_matches[0]
-    if not isinstance(market, dict):
-        raise ValueError(f"Gamma market for slug {slug!r} is not a JSON object")
-    return market
+    """Estimate caller uses the ``accept-unclosed-as-pending`` policy.
 
-
-def _market_is_closed(market: dict[str, Any]) -> bool:
-    closed = market["closed"]
-    if isinstance(closed, bool):
-        return closed
-    raise ValueError(f"closed must be a boolean for {market['slug']}")
-
-
-def _winning_side(market: dict[str, Any]) -> str | None:
-    closed = _market_is_closed(market)
-    if not closed:
-        return None
-    outcomes = _json_array(market["outcomes"], "outcomes")
-    prices = _json_array(market["outcomePrices"], "outcomePrices")
-    if len(outcomes) != len(prices):
-        raise ValueError(f"outcomes/outcomePrices length mismatch for {market['slug']}")
-
-    winners = []
-    for outcome, price in zip(outcomes, prices):
-        parsed_price = _decimal(price, "outcomePrices[]")
-        if parsed_price == WINNING_PRICE:
-            normalized = str(outcome).strip().lower()
-            if normalized in ("yes", "up"):
-                winners.append("long")
-            elif normalized in ("no", "down"):
-                winners.append("short")
-            else:
-                raise ValueError(f"unsupported winning outcome {outcome!r} for {market['slug']}")
-    if len(winners) == 0:
-        raise ValueError(f"closed market {market['slug']} has no winning outcome")
-    if len(winners) != 1:
-        raise ValueError(f"market {market['slug']} has {len(winners)} winners")
-    return winners[0]
+    ``closed_only=False`` requires an exact slug match and the caller treats
+    ``winning_side()==None`` (i.e., the market is still open) as a pending
+    record, not a missing one. The shared helper's ``@overload``-narrowed
+    return type guarantees a non-``None`` dict on this branch.
+    """
+    return fetch_market_by_slug(client, slug, closed_only=False)
 
 
 def _estimate_record(record: dict[str, Any], winner: str, stake_usd: Decimal) -> dict[str, Any]:

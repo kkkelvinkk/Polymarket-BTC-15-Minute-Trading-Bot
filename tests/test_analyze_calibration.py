@@ -300,10 +300,14 @@ class AnalyzePathBTests(unittest.TestCase):
         self.assertEqual(report["resolved_calibration_records"], 0)
 
     def test_excludes_records_with_omitted_decision_fields(self):
+        # decision_id is REQUIRED on every record (§3.A row 16 / §3.D
+        # guard-rail #2: foundational state must fail-stop on missing,
+        # not be substituted with a synthetic id).
         records = [
             {"decision_id": "D1", "fused_confidence": 0.72, "fused_direction": "bullish"},
             {"decision_id": "D2", "slug": "slug-missing-fused"},
             {
+                "decision_id": "D3",
                 "slug": "slug-missing-entry",
                 "fused_confidence": 0.74,
                 "fused_direction": "bullish",
@@ -360,6 +364,16 @@ class AnalyzePathBTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "no winning outcome"):
             ac.analyze_path_b([record], resolver, Decimal("0.005"), Decimal("0.01"))
+
+    def test_missing_decision_id_fails_stop(self):
+        # §3.A row 16 / §3.D guard-rail #2 — fail-stop on missing
+        # decision_id, NOT substitute a synthetic identifier.
+        records = [{"slug": "slug-x", "fused_confidence": 0.7, "fused_direction": "bullish"}]
+        resolver = _Resolver({})
+        with self.assertRaisesRegex(
+            ValueError, "missing required field 'decision_id'"
+        ):
+            ac.analyze_path_b(records, resolver, Decimal("0.005"), Decimal("0.01"))
 
 
 class GateThreeCheckTests(unittest.TestCase):

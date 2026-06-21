@@ -15,6 +15,8 @@ class TestDecisionSnapshotScheduling(DecisionSnapshotTestCase):
         self._set_market(strategy)
         strategy._stable_tick_count = 3
         strategy.price_history = [Decimal("0.50")] * 20
+        strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+        strategy._price_history_ts = [None] * len(strategy.price_history)
         strategy._last_bid_ask = (Decimal("0.39"), Decimal("0.40"))
         snapshot = strategy._capture_decision_input_snapshot(
             Decimal("0.40"),
@@ -24,6 +26,8 @@ class TestDecisionSnapshotScheduling(DecisionSnapshotTestCase):
 
         async def _mode_check():
             strategy.price_history = [Decimal("0.90")] * 20
+            strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+            strategy._price_history_ts = [None] * len(strategy.price_history)
             strategy._last_bid_ask = (Decimal("0.80"), Decimal("0.82"))
             return True
 
@@ -39,7 +43,10 @@ class TestDecisionSnapshotScheduling(DecisionSnapshotTestCase):
 
         self.assertFalse(result)
         self.assertTrue(captured["is_simulation"])
-        self.assertEqual(captured["snapshot"].price_history, tuple([Decimal("0.50")] * 20))
+        self.assertEqual(
+            tuple(p.value for p in captured["snapshot"].price_history),
+            tuple([Decimal("0.50")] * 20),
+        )
         self.assertEqual(captured["snapshot"].yes_bid_ask, (Decimal("0.39"), Decimal("0.40")))
 
     def test_on_quote_tick_schedules_trigger_tick_snapshot(self):
@@ -49,6 +56,8 @@ class TestDecisionSnapshotScheduling(DecisionSnapshotTestCase):
             datetime.now(timezone.utc).timestamp() - 800
         )
         strategy.price_history = [Decimal("0.50")] * 20
+        strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+        strategy._price_history_ts = [None] * len(strategy.price_history)
         strategy._market_stable = True
         strategy._stable_tick_count = 3
         strategy.last_trade_time = -1
@@ -66,6 +75,8 @@ class TestDecisionSnapshotScheduling(DecisionSnapshotTestCase):
 
         def _mutating_snapshot_from_state(**kwargs):
             strategy.price_history = [Decimal("0.90")] * 20
+            strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+            strategy._price_history_ts = [None] * len(strategy.price_history)
             strategy._last_bid_ask = (Decimal("0.80"), Decimal("0.82"))
             return original_snapshot_from_state(**kwargs)
 
@@ -73,13 +84,15 @@ class TestDecisionSnapshotScheduling(DecisionSnapshotTestCase):
 
         strategy.on_quote_tick(self._quote_tick(strategy))
         strategy.price_history = [Decimal("0.90")] * 20
+        strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+        strategy._price_history_ts = [None] * len(strategy.price_history)
         strategy._last_bid_ask = (Decimal("0.80"), Decimal("0.82"))
         scheduled[0]()
 
         snapshot = captured["snapshot"]
         self.assertEqual(snapshot.current_price, Decimal("0.40"))
-        self.assertEqual(snapshot.price_history[-1], Decimal("0.40"))
-        self.assertNotIn(Decimal("0.90"), snapshot.price_history)
+        self.assertEqual(snapshot.price_history[-1].value, Decimal("0.40"))
+        self.assertNotIn(Decimal("0.90"), [p.value for p in snapshot.price_history])
         self.assertEqual(snapshot.yes_bid_ask, (Decimal("0.39"), Decimal("0.41")))
         self.assertEqual(snapshot.reference_time, snapshot.tick_buffer[-1].ts)
         self.assertEqual(snapshot.sub_interval, 0)
@@ -95,6 +108,8 @@ class TestDecisionSnapshotScheduling(DecisionSnapshotTestCase):
             datetime.now(timezone.utc).timestamp() - 100
         )
         strategy.price_history = [Decimal("0.50")] * 20
+        strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+        strategy._price_history_ts = [None] * len(strategy.price_history)
         strategy._market_stable = True
         strategy._stable_tick_count = 3
         strategy._capture_locked_decision_state = (
@@ -112,6 +127,8 @@ class TestDecisionSnapshotScheduling(DecisionSnapshotTestCase):
             datetime.now(timezone.utc).timestamp() - 800
         )
         strategy.price_history = [Decimal("0.50")] * 20
+        strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+        strategy._price_history_ts = [None] * len(strategy.price_history)
         strategy._market_stable = True
         strategy._stable_tick_count = 3
         strategy._restart_in_progress = True
@@ -137,6 +154,8 @@ class TestDecisionSnapshotScheduling(DecisionSnapshotTestCase):
             datetime.now(timezone.utc).timestamp() - 800
         )
         strategy.price_history = [Decimal("0.50")] * 20
+        strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+        strategy._price_history_ts = [None] * len(strategy.price_history)
         strategy._market_stable = True
         strategy._stable_tick_count = 3
         strategy._shadow_decision_in_progress = True
@@ -163,6 +182,8 @@ class TestDecisionSnapshotScheduling(DecisionSnapshotTestCase):
             datetime.now(timezone.utc).timestamp() - 800
         )
         strategy.price_history = [Decimal("0.50")] * 20
+        strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+        strategy._price_history_ts = [None] * len(strategy.price_history)
         strategy._market_stable = True
         strategy._stable_tick_count = 3
 
@@ -199,6 +220,8 @@ class TestDecisionSnapshotScheduling(DecisionSnapshotTestCase):
         market_timestamp = datetime.now(timezone.utc).timestamp() - 400
         strategy.all_btc_instruments[0]["market_timestamp"] = market_timestamp
         strategy.price_history = [Decimal("0.50")] * 20
+        strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+        strategy._price_history_ts = [None] * len(strategy.price_history)
         strategy._market_stable = True
         strategy._stable_tick_count = 3
 
@@ -237,6 +260,8 @@ class TestDecisionSnapshotScheduling(DecisionSnapshotTestCase):
             datetime.now(timezone.utc).timestamp() - 800
         )
         strategy.price_history = [Decimal("0.50")] * 20
+        strategy._price_history_sources = ["synthetic_startup"] * len(strategy.price_history)
+        strategy._price_history_ts = [None] * len(strategy.price_history)
         strategy._market_stable = True
         strategy._stable_tick_count = 3
         decision_log_path = Path(

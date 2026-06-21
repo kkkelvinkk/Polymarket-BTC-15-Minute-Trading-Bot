@@ -4,7 +4,7 @@ Manages order placement, fills, and position lifecycle
 """
 import asyncio
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -92,19 +92,28 @@ class ExecutionEngine:
         self,
         risk_engine: Optional[RiskEngine] = None,
         dry_run: bool = True,  # Simulate orders without real execution
+        *,
+        now: datetime,
     ):
         """
         Initialize execution engine.
-        
-        Args:
-            risk_engine: Risk management engine
-            dry_run: If True, simulate orders (no real trading)
+
+        Review-cycle fix (R2 round 2): ``now`` is a REQUIRED kwarg (M11)
+        because the singleton fallback path constructs the risk engine
+        which itself requires ``now=``. The prior ``or`` truthiness
+        fallback at ``risk_engine = risk_engine or get_risk_engine()``
+        is replaced by an explicit ``is None`` branch.
         """
         if not dry_run:
             raise RuntimeError(
                 "Legacy ExecutionEngine live mode is disabled; use bot.py live order pipeline"
             )
-        self.risk_engine = risk_engine or get_risk_engine()
+        if risk_engine is None:
+            risk_engine = get_risk_engine(now=now)
+        self.risk_engine = risk_engine
+        # Stored so async paths can pass a fresh UTC ``now=`` to risk methods
+        # that require it (the dry-run path mutates risk state).
+        self._startup_now = now
         self.dry_run = dry_run
         
         # Order tracking
@@ -178,11 +187,12 @@ class ExecutionEngine:
             logger.warning("Neutral signal - no trade")
             return None
         
-        # Validate with risk engine
+        # Validate with risk engine — Beta-8 requires UTC ``now=``.
         is_valid, error = self.risk_engine.validate_new_position(
             size=position_size,
             direction=direction,
             current_price=current_price,
+            now=datetime.now(timezone.utc),
         )
         
         if not is_valid:
@@ -226,10 +236,10 @@ class ExecutionEngine:
             )
 
         self._order_counter += 1
-        order_id = f"order_{self._order_counter}_{datetime.now().timestamp()}"
+        order_id = f"order_{self._order_counter}_{datetime.now(timezone.utc).timestamp()}"
         order = Order(
             order_id=order_id,
-            timestamp=datetime.now(),
+            timestamp=datetime.now(timezone.utc),
             order_type=OrderType.MARKET,
             side=side,
             size=size,
@@ -261,7 +271,7 @@ class ExecutionEngine:
         order.filled_size = order.size
         order.filled_price = fill_price
         order.fills.append({
-            "timestamp": datetime.now(),
+            "timestamp": datetime.now(timezone.utc),
             "price": fill_price,
             "size": order.size,
         })
@@ -288,7 +298,7 @@ class ExecutionEngine:
             entry_price: Entry price
         """
         # Generate position ID
-        position_id = f"pos_{datetime.now().timestamp()}"
+        position_id = f"pos_{datetime.now(timezone.utc).timestamp()}"
         
         # Determine direction
         direction = "long" if order.side == OrderSide.BUY else "short"
@@ -300,7 +310,7 @@ class ExecutionEngine:
             "direction": direction,
             "entry_price": entry_price,
             "size": order.filled_size,
-            "entry_time": datetime.now(),
+            "entry_time": datetime.now(timezone.utc),
             "stop_loss": order.stop_loss,
             "take_profit": order.take_profit,
             "status": "open",
@@ -311,7 +321,7 @@ class ExecutionEngine:
         self._positions[position_id] = position
         order.position_id = position_id
         
-        # Add to risk engine
+        # Add to risk engine — Beta-8 requires UTC ``now=``.
         self.risk_engine.add_position(
             position_id=position_id,
             size=order.filled_size,
@@ -319,6 +329,7 @@ class ExecutionEngine:
             direction=direction,
             stop_loss=order.stop_loss,
             take_profit=order.take_profit,
+            now=datetime.now(timezone.utc),
         )
         
         logger.info(
@@ -374,13 +385,14 @@ class ExecutionEngine:
             close_order.filled_size = position["size"]
             close_order.filled_price = exit_price
         
-        # Calculate P&L
-        pnl = self.risk_engine.remove_position(position_id, exit_price)
-        
+        # Calculate P&L — Beta-8 requires UTC ``now=``.
+        _close_now = datetime.now(timezone.utc)
+        pnl = self.risk_engine.remove_position(position_id, exit_price, now=_close_now)
+
         # Update position
         position["status"] = "closed"
         position["exit_price"] = exit_price
-        position["exit_time"] = datetime.now()
+        position["exit_time"] = _close_now
         position["pnl"] = pnl
         position["close_reason"] = reason
         
@@ -395,46 +407,12 @@ class ExecutionEngine:
         
         return pnl
     
-    async def update_positions(self, current_price: Decimal) -> None:
-        """
-        Update all open positions with current price.
-        
-        Args:
-            current_price: Current market price
-        """
-        for position_id, position in list(self._positions.items()):
-            if position["status"] != "open":
-                continue
-            
-            # Update in risk engine
-            risk_pos = self.risk_engine.update_position(position_id, current_price)
-            
-            if not risk_pos:
-                continue
-            
-            # Check stop loss
-            if position["stop_loss"]:
-                should_stop = (
-                    (position["direction"] == "long" and current_price <= position["stop_loss"]) or
-                    (position["direction"] == "short" and current_price >= position["stop_loss"])
-                )
-                
-                if should_stop:
-                    logger.warning(f"Stop loss hit for {position_id}")
-                    await self.close_position(position_id, current_price, "stop_loss")
-                    continue
-            
-            # Check take profit
-            if position["take_profit"]:
-                should_take = (
-                    (position["direction"] == "long" and current_price >= position["take_profit"]) or
-                    (position["direction"] == "short" and current_price <= position["take_profit"])
-                )
-                
-                if should_take:
-                    logger.info(f"Take profit hit for {position_id}")
-                    await self.close_position(position_id, current_price, "take_profit")
-    
+    # Beta-8: update_positions deleted. Its sole production caller was a
+    # deleted test method; the only consumer of get_statistics
+    # (monitoring/grafana_exporter) does not transit this path. Risk-engine
+    # ``update_position``, ``_assess_risk_level``, ``_check_stop_loss``,
+    # ``_check_take_profit`` were all removed in the same Beta-8 diff.
+
     def get_order(self, order_id: str) -> Optional[Order]:
         """Get order by ID."""
         return self._orders.get(order_id)
@@ -471,9 +449,13 @@ class ExecutionEngine:
 # Singleton instance
 _execution_engine_instance = None
 
-def get_execution_engine() -> ExecutionEngine:
-    """Get singleton execution engine."""
+def get_execution_engine(*, now: datetime) -> ExecutionEngine:
+    """Get singleton execution engine.
+
+    Review-cycle fix (R2 round 2): ``now`` REQUIRED (M11) for Beta-8
+    risk engine propagation.
+    """
     global _execution_engine_instance
     if _execution_engine_instance is None:
-        _execution_engine_instance = ExecutionEngine(dry_run=True)
+        _execution_engine_instance = ExecutionEngine(dry_run=True, now=now)
     return _execution_engine_instance

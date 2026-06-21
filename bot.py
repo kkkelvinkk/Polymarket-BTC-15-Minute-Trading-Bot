@@ -102,11 +102,25 @@ from core.strategy_brain.signal_processors.divergence_processor import PriceDive
 from core.strategy_brain.signal_processors.orderbook_processor import OrderBookImbalanceProcessor
 from core.strategy_brain.signal_processors.tick_velocity_processor import TickVelocityProcessor
 from core.strategy_brain.signal_processors.deribit_pcr_processor import DeribitPCRProcessor
-from core.strategy_brain.fusion_engine.signal_fusion import SignalFusionEngine, get_fusion_engine
+from core.strategy_brain.fusion_engine.signal_fusion import SignalFusionEngine
 from execution.risk_engine import get_risk_engine
 from monitoring.performance_tracker import get_performance_tracker
 from monitoring.grafana_exporter import get_grafana_exporter
-from feedback.learning_engine import get_learning_engine
+from feedback.learning_engine import LearningEngine
+
+# Beta-5: PRODUCTION_DEFAULT_WEIGHTS is the SINGLE SOURCE OF TRUTH for fusion
+# weights at startup. Six processor-source keys ONLY (NO "default" key per v22 —
+# unknown signal sources are DROPPED per §3.D, not silently weighted).
+# Values copied verbatim from the pre-Beta-5 _configure_fusion_engine helper to
+# preserve byte-equal fusion behaviour (TC06 byte-equal-fixture guard).
+PRODUCTION_DEFAULT_WEIGHTS: dict[str, float] = {
+    "OrderBookImbalance": 0.30,
+    "TickVelocity":       0.25,
+    "PriceDivergence":    0.18,
+    "SpikeDetection":     0.12,
+    "DeribitPCR":         0.10,
+    "SentimentAnalysis":  0.05,
+}
 
 from vault_store import (
     DEFAULT_VAULT_FILE,
@@ -143,7 +157,14 @@ from account_state_collateral import (
 )
 from decision_context import fetch_market_context_for_snapshot
 from decision_log import DecisionRecord, new_decision_id
-from decision_snapshot import DecisionInputSnapshot, DecisionTickSnapshot
+from decision_snapshot import DecisionInputSnapshot, DecisionTickSnapshot, PriceHistoryEntry
+# Gamma: opt-in raw decision snapshot recorder. Production paths only.
+from raw_decision_snapshot import RawDecisionSnapshotRecorder
+from strategy_version import STRATEGY_VERSION as _STRATEGY_VERSION_CONST
+from nautilus_reconciliation import (
+    assert_reconciliation_window_covers_a_market,
+    loaded_window_reconciliation_lookback_mins,
+)
 from depth_estimator import (
     InvalidBookLevelError,
     estimate_limit_ioc_fill,
@@ -934,7 +955,7 @@ class IntegratedBTCStrategy(Strategy):
         self._quote_stability_required = get_quote_stability_required_for_live()
         self._quote_stability_missing_logged = False
         self._last_instrument_switch = None
-        
+
         # =========================================================================
         # FIX 1: Force first trade by setting last_trade_time to -1
         # =========================================================================
@@ -982,69 +1003,112 @@ class IntegratedBTCStrategy(Strategy):
         # YES token id for the current market (set in _load_all_btc_instruments)
         self._yes_token_id: Optional[str] = None
 
-        # Signal processors
+        # Beta-3/4: name=, max_spot_history=, tolerance_seconds= are REQUIRED
+        # kwargs (no defaults). Slugs match the existing class-default PascalCase
+        # bit-for-bit (TC06 byte-equal guard); live AND shadow share the same
+        # slug so fusion's weight lookup stays consistent.
+        _div_max_spot = int(os.environ["DIVERGENCE_SPOT_HISTORY_MAX_LEN"])
+        _tv_tol = int(os.environ["TICK_VELOCITY_TOLERANCE_SECONDS"])
+
+        # Signal processors — live
         self.spike_detector = SpikeDetectionProcessor(
-            spike_threshold=0.05,       # FIXED: was 0.15 (too high for probabilities)
+            name="SpikeDetection",
+            spike_threshold=0.05,
             lookback_periods=20,
         )
         self.sentiment_processor = SentimentProcessor(
+            name="SentimentAnalysis",
             extreme_fear_threshold=25,
             extreme_greed_threshold=75,
         )
         self.divergence_processor = PriceDivergenceProcessor(
+            name="PriceDivergence",
+            max_spot_history=_div_max_spot,
             divergence_threshold=0.05,
         )
         self.orderbook_processor = OrderBookImbalanceProcessor(
-            imbalance_threshold=0.30,   # 30% skew to signal
-            min_book_volume=50.0,       # ignore illiquid books
+            name="OrderBookImbalance",
+            imbalance_threshold=0.30,
+            min_book_volume=50.0,
         )
         self.tick_velocity_processor = TickVelocityProcessor(
-            velocity_threshold_60s=0.015,  # 1.5% move in 60s
-            velocity_threshold_30s=0.010,  # 1.0% move in 30s
+            name="TickVelocity",
+            tolerance_seconds=_tv_tol,
+            velocity_threshold_60s=0.015,
+            velocity_threshold_30s=0.010,
         )
         self.deribit_pcr_processor = DeribitPCRProcessor(
+            name="DeribitPCR",
             bullish_pcr_threshold=1.20,
             bearish_pcr_threshold=0.70,
             max_days_to_expiry=2,
-            cache_seconds=300,          # refresh every 5 min
+            cache_seconds=300,
         )
+        # Signal processors — shadow (same slugs, separate instances)
         self._shadow_spike_detector = SpikeDetectionProcessor(
+            name="SpikeDetection",
             spike_threshold=0.05,
             lookback_periods=20,
         )
         self._shadow_sentiment_processor = SentimentProcessor(
+            name="SentimentAnalysis",
             extreme_fear_threshold=25,
             extreme_greed_threshold=75,
         )
         self._shadow_divergence_processor = PriceDivergenceProcessor(
+            name="PriceDivergence",
+            max_spot_history=_div_max_spot,
             divergence_threshold=0.05,
         )
         self._shadow_orderbook_processor = OrderBookImbalanceProcessor(
+            name="OrderBookImbalance",
             imbalance_threshold=0.30,
             min_book_volume=50.0,
         )
         self._shadow_tick_velocity_processor = TickVelocityProcessor(
+            name="TickVelocity",
+            tolerance_seconds=_tv_tol,
             velocity_threshold_60s=0.015,
             velocity_threshold_30s=0.010,
         )
         self._shadow_deribit_pcr_processor = DeribitPCRProcessor(
+            name="DeribitPCR",
             bullish_pcr_threshold=1.20,
             bearish_pcr_threshold=0.70,
             max_days_to_expiry=2,
             cache_seconds=300,
         )
 
-        # Signal fusion — update weights for 6 processors
-        self.fusion_engine = get_fusion_engine()
-        self._shadow_fusion_engine = SignalFusionEngine()
-        self._configure_fusion_engine(self.fusion_engine)
-        self._configure_fusion_engine(self._shadow_fusion_engine)
+        # Beta-5: Signal fusion engines constructed with REQUIRED
+        # PRODUCTION_DEFAULT_WEIGHTS and recency_window_seconds; no
+        # _configure_fusion_engine post-construction mutation.
+        _fusion_recency = int(os.environ["FUSION_RECENCY_WINDOW_SECONDS"])
+        self.fusion_engine = SignalFusionEngine(
+            weights=PRODUCTION_DEFAULT_WEIGHTS,
+            recency_window_seconds=_fusion_recency,
+        )
+        self._shadow_fusion_engine = SignalFusionEngine(
+            weights=PRODUCTION_DEFAULT_WEIGHTS,
+            recency_window_seconds=_fusion_recency,
+        )
 
-        # Risk management
-        self.risk_engine = get_risk_engine()
+        # Beta-8: bot must explicitly acknowledge the UTC daily-reset
+        # boundary shift (G6 bullet b). Without this env, the bot raises
+        # at startup with a pointer to the operations doc.
+        if os.environ.get("POLYBOT_ACKNOWLEDGE_UTC_DAILY_RESET") != "1":
+            raise RuntimeError(
+                "POLYBOT_ACKNOWLEDGE_UTC_DAILY_RESET=1 is REQUIRED at startup. "
+                "Daily-stats reset boundary moves from local-TZ to UTC per Beta-8; "
+                "operators must explicitly acknowledge — see "
+                "docs/RAW_DECISION_SNAPSHOT_OPERATIONS.md."
+            )
+
+        # Risk management — Beta-8: singleton constructed with UTC startup ``now``.
+        _risk_startup_now = datetime.now(timezone.utc)
+        self.risk_engine = get_risk_engine(now=_risk_startup_now)
         try:
-            self._rehydrate_settled_daily_risk()
-            self._rehydrate_open_settlement_risk()
+            self._rehydrate_settled_daily_risk(now=_risk_startup_now)
+            self._rehydrate_open_settlement_risk(now=_risk_startup_now)
         except Exception:
             self._release_live_trade_ledger_lock()
             raise
@@ -1052,17 +1116,45 @@ class IntegratedBTCStrategy(Strategy):
         # Performance tracking
         self.performance_tracker = get_performance_tracker()
 
-        # Learning engine
-        self.learning_engine = get_learning_engine()
+        # Beta-5: LearningEngine takes the live fusion engine as a required
+        # injection (no singleton, no module-level state).
+        self.learning_engine = LearningEngine(fusion_engine=self.fusion_engine)
 
         # Grafana (optional)
         if enable_grafana:
-            self.grafana_exporter = get_grafana_exporter()
+            # Beta-8 caller-propagation: thread the startup UTC ``now``
+            # through grafana so its internal get_risk_engine call is
+            # satisfied (review-cycle R2 round 2 P0 fix).
+            self.grafana_exporter = get_grafana_exporter(now=_risk_startup_now)
         else:
             self.grafana_exporter = None
 
-        # Price history
-        self.price_history = []
+        # Beta-1: Price history with parallel provenance lists. The three
+        # lists are mutated ONLY via ``self._append_price_history(...)``;
+        # RP12-extended static check forbids any direct write to any of
+        # the three names outside that helper's body. ``self.price_history``
+        # remains a List[Decimal] for in-process consumers (fusion math is
+        # unchanged); the parallel ``_price_history_sources`` and
+        # ``_price_history_ts`` lists carry per-entry provenance that the
+        # snapshot constructor zips into PriceHistoryEntry tuples at
+        # capture time.
+        self.price_history: List[Decimal] = []
+        self._price_history_sources: List[str] = []
+        self._price_history_ts: List[Optional[datetime]] = []
+        # Review-cycle fix (R3 round 2): initialize to None so
+        # _decision_reject can safely test `is not None` rather than
+        # using getattr-with-default fallback. Set inside the body
+        # wrapper and cleared in its finally.
+        self._raw_recorder_for_decision: Optional[RawDecisionSnapshotRecorder] = None
+        # Review-cycle fix: pre-initialize instrument-id attributes to None
+        # so the snapshot constructor can use direct attribute access
+        # rather than getattr-with-None fallback. These are populated by
+        # _load_all_btc_instruments (lines 4384-4385 / 4416-4417).
+        self._yes_instrument_id: Optional[Any] = None
+        self._no_instrument_id: Optional[Any] = None
+        # Per-side quote freshness — Beta-1; populated by on_quote_tick.
+        self._last_yes_quote_ts: Optional[datetime] = None
+        self._last_no_quote_ts: Optional[datetime] = None
         self.max_history = 100
 
         # Decision-only simulation observation tracker
@@ -1105,15 +1197,40 @@ class IntegratedBTCStrategy(Strategy):
         )
         logger.info("=" * 80)
 
-    @staticmethod
-    def _configure_fusion_engine(fusion_engine: SignalFusionEngine) -> None:
-        # Rebalanced weights (must sum <= 1.0; higher = more influence)
-        fusion_engine.set_weight("OrderBookImbalance", 0.30)
-        fusion_engine.set_weight("TickVelocity", 0.25)
-        fusion_engine.set_weight("PriceDivergence", 0.18)
-        fusion_engine.set_weight("SpikeDetection", 0.12)
-        fusion_engine.set_weight("DeribitPCR", 0.10)
-        fusion_engine.set_weight("SentimentAnalysis", 0.05)
+    # Beta-5: _configure_fusion_engine helper deleted; PRODUCTION_DEFAULT_WEIGHTS
+    # at module top is the single source of truth. set_weight() is no longer
+    # callable post-construction (TC61b).
+
+    def _append_price_history(
+        self,
+        value: Decimal,
+        *,
+        source: str,
+        ts: Optional[datetime],
+    ) -> None:
+        """Beta-1: sole allowed writer of the three price-history lists.
+
+        Appends to all three lists atomically (no intermediate yield),
+        enforces equal lengths, and applies the single max-length
+        truncation policy. RP12-extended static check forbids any other
+        write to ``self.price_history`` / ``self._price_history_sources``
+        / ``self._price_history_ts``.
+        """
+        if source not in ("live_quote_tick", "synthetic_startup"):
+            raise RuntimeError(
+                f"_append_price_history: unknown source tag {source!r}"
+            )
+        if ts is not None and (ts.tzinfo is None or ts.utcoffset() is None):
+            raise RuntimeError(
+                "_append_price_history: ts must be timezone-aware (UTC)"
+            )
+        self.price_history.append(value)
+        self._price_history_sources.append(source)
+        self._price_history_ts.append(ts)
+        while len(self.price_history) > self.max_history:
+            self.price_history.pop(0)
+            self._price_history_sources.pop(0)
+            self._price_history_ts.pop(0)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1207,21 +1324,21 @@ class IntegratedBTCStrategy(Strategy):
             raise RuntimeError(f"unexpected SIZING_MODE after validation: {sizing_mode!r}")
 
         if position_size <= LIVE_MIN_MARKET_BUY_USD:
-            rec.reject(
+            self._decision_reject(rec,
                 "position_size_below_live_minimum",
                 f"resolved_trade_usd={position_size} must be greater than {LIVE_MIN_MARKET_BUY_USD}",
             )
             return None
         max_position_size = self.risk_engine.limits.max_position_size
         if position_size > max_position_size:
-            rec.reject(
+            self._decision_reject(rec,
                 "size_exceeds_max_position_size",
                 f"resolved_trade_usd={position_size} exceeds MAX_POSITION_SIZE={max_position_size}",
             )
             return None
         required_free_collateral = position_size + sizing_config["balance_safety_buffer_usd"]
         if free_collateral < required_free_collateral:
-            rec.reject(
+            self._decision_reject(rec,
                 "balance_guard",
                 f"free_collateral={free_collateral} < required={required_free_collateral}",
             )
@@ -1666,7 +1783,7 @@ class IntegratedBTCStrategy(Strategy):
                 self._block_live_settlement_ledger(reason)
                 raise SettlementLedgerError(reason) from e
 
-    def _rehydrate_open_settlement_risk(self) -> None:
+    def _rehydrate_open_settlement_risk(self, *, now: datetime) -> None:
         """Restore unresolved filled trades into the risk engine after a restart."""
         with self._settlement_lock:
             open_items = list(self._open_live_trades.items())
@@ -1689,6 +1806,7 @@ class IntegratedBTCStrategy(Strategy):
                     size=size,
                     entry_price=entry_price,
                     direction="buy_yes" if direction_raw == "long" else "buy_no",
+                    now=now,
                     count_trade=False,
                 )
             except Exception as exc:
@@ -1697,9 +1815,15 @@ class IntegratedBTCStrategy(Strategy):
                 self._release_live_trade_ledger_lock()
                 raise SettlementLedgerError(reason) from exc
 
-    def _rehydrate_settled_daily_risk(self) -> None:
-        """Restore same-day realized settlement P&L after a process restart."""
-        today = datetime.now().astimezone().date()
+    def _rehydrate_settled_daily_risk(self, *, now: datetime) -> None:
+        """Restore same-day realized settlement P&L after a process restart.
+
+        Beta-8 (R1-Q4 fix): both the ``today`` calendar axis and the
+        per-trade ``settled_at`` filter are UTC, matching the UTC daily
+        reset boundary so a non-UTC operator restarting near the local↔UTC
+        midnight overlap does not double-count or under-count.
+        """
+        today = now.date()
         daily_pnl = Decimal("0")
         daily_trades = 0
 
@@ -1719,7 +1843,7 @@ class IntegratedBTCStrategy(Strategy):
                 reason = f"settled trade {order_id} missing valid settled_at for daily risk rehydrate"
                 self._block_live_settlement_ledger(reason)
                 raise SettlementLedgerError(reason)
-            if settled_at.astimezone().date() != today:
+            if settled_at.astimezone(timezone.utc).date() != today:
                 continue
             if unresolved:
                 continue
@@ -1750,7 +1874,7 @@ class IntegratedBTCStrategy(Strategy):
                 reason = "risk engine missing restore_daily_stats for settled daily risk rehydrate"
                 self._block_live_settlement_ledger(reason)
                 raise SettlementLedgerError(reason)
-            restore_daily_stats(daily_pnl, daily_trades)
+            restore_daily_stats(daily_pnl, daily_trades, now=now)
 
     def _unresolved_settlement_unknowns(self) -> List[Dict[str, Any]]:
         """Return settled records that still need manual or REST reconciliation."""
@@ -3566,7 +3690,10 @@ class IntegratedBTCStrategy(Strategy):
             raise SettlementLedgerError(reason) from e
 
         try:
-            risk_pnl = self.risk_engine.remove_position(order_id, exit_price)
+            # Beta-8: now= is the UTC-aware exit_time already in scope.
+            risk_pnl = self.risk_engine.remove_position(
+                order_id, exit_price, now=exit_time,
+            )
             if risk_pnl is None:
                 if source != "late_auto_redeem":
                     raise SettlementLedgerError(f"risk_engine.remove_position returned None for {order_id}")
@@ -3577,6 +3704,7 @@ class IntegratedBTCStrategy(Strategy):
                     )
                 record_realized_pnl(
                     pnl,
+                    now=exit_time,
                     source=f"polymarket_{source}",
                     metadata={"order_id": order_id, "slug": meta.get("slug")},
                 )
@@ -4079,16 +4207,23 @@ class IntegratedBTCStrategy(Strategy):
         if self.instrument_id:
             self.subscribe_quote_ticks(self.instrument_id)
             logger.info(f"✓ SUBSCRIBED to market: {self.instrument_id}")
-            
-            # Try to get current price from cache
-            try:
-                quote = self.cache.quote_tick(self.instrument_id)
-                if quote and quote.bid_price and quote.ask_price:
-                    current_price = (quote.bid_price + quote.ask_price) / 2
-                    self.price_history.append(current_price)
-                    logger.info(f"✓ Initial price: ${float(current_price):.4f}")
-            except Exception as e:
-                logger.debug(f"No initial price yet: {e}")
+
+            # Initial price from cache. ``cache.quote_tick`` returns either a
+            # QuoteTick or None when no tick has arrived yet; any exception
+            # from the cache layer is a real fault and must propagate
+            # (review-cycle fix: removed the broad try/except that was masking
+            # cache faults as "no initial price yet" — Rule 1).
+            quote = self.cache.quote_tick(self.instrument_id)
+            if quote is not None and quote.bid_price and quote.ask_price:
+                current_price = (quote.bid_price + quote.ask_price) / 2
+                # Beta-1: initial-from-cache price — no upstream tick ts,
+                # tag as synthetic_startup since it isn't a live tick event.
+                self._append_price_history(
+                    current_price,
+                    source="synthetic_startup",
+                    ts=None,
+                )
+                logger.info(f"✓ Initial price: ${float(current_price):.4f}")
 
         # Generate synthetic history if needed
         if len(self.price_history) < 20:
@@ -4125,7 +4260,12 @@ class IntegratedBTCStrategy(Strategy):
             change = Decimal(str(random.uniform(-0.03, 0.03)))
             new_price = base_price * (Decimal("1.0") + change)
             new_price = max(Decimal("0.01"), min(Decimal("0.99"), new_price))
-            self.price_history.append(new_price)
+            # Beta-1: synthetic-startup back-fill; no upstream tick.
+            self._append_price_history(
+                new_price,
+                source="synthetic_startup",
+                ts=None,
+            )
             base_price = new_price
 
     # ------------------------------------------------------------------
@@ -4136,23 +4276,23 @@ class IntegratedBTCStrategy(Strategy):
         """Load ALL BTC instruments from cache and sort by start time"""
         instruments = self.cache.instruments()
         logger.info(f"Loading ALL BTC instruments from {len(instruments)} total...")
-        
+
         now = datetime.now(timezone.utc)
         current_timestamp = int(now.timestamp())
-        
+
         btc_instruments = []
-        
+
         for instrument in instruments:
             try:
                 if hasattr(instrument, 'info') and instrument.info:
                     question = instrument.info.get('question', '').lower()
                     slug = instrument.info.get('market_slug', '').lower()
-                    
+
                     if ('btc' in question or 'btc' in slug) and '15m' in slug:
                         try:
                             timestamp_part = slug.split('-')[-1]
                             market_timestamp = int(timestamp_part)
-                            
+
                             # The slug timestamp IS the market start time (Unix, no offset).
                             # end_date_iso is a DATE-only string (e.g. "2026-02-20"), NOT a datetime,
                             # so parsing it gives midnight UTC which is wrong for intraday markets.
@@ -4160,7 +4300,7 @@ class IntegratedBTCStrategy(Strategy):
                             real_start_ts = market_timestamp
                             end_timestamp = market_timestamp + 900  # 15-min markets always
                             time_diff = real_start_ts - current_timestamp
-                            
+
                             # Only include markets that haven't ended yet
                             if end_timestamp > current_timestamp:
                                 # Extract token ID for CLOB order book API.
@@ -4187,7 +4327,7 @@ class IntegratedBTCStrategy(Strategy):
                             continue
             except Exception:
                 continue
-        
+
         # Pair YES and NO tokens by explicit outcome, not provider load order.
         markets_by_slug = {}
         slug_order = []
@@ -4227,10 +4367,10 @@ class IntegratedBTCStrategy(Strategy):
             primary['no_token_id'] = no_inst.get('token_id')
             deduped.append(primary)
         btc_instruments = deduped
-        
+
         # Sort by start time (absolute timestamp, not time-of-day)
         btc_instruments.sort(key=lambda x: x['market_timestamp'])
-        
+
         logger.info("=" * 80)
         logger.info(f"FOUND {len(btc_instruments)} BTC 15-MIN MARKETS:")
         for i, inst in enumerate(btc_instruments):
@@ -4239,9 +4379,9 @@ class IntegratedBTCStrategy(Strategy):
             status = "ACTIVE" if is_active else "FUTURE" if inst['time_diff_minutes'] > 0 else "PAST"
             logger.info(f"  [{i}] {inst['slug']}: {status} (starts at {inst['start_time'].strftime('%H:%M:%S')}, ends at {inst['end_time'].strftime('%H:%M:%S')})")
         logger.info("=" * 80)
-        
+
         self.all_btc_instruments = btc_instruments
-        
+
         # Find current market and SUBSCRIBE IMMEDIATELY
         # FIXED: A market is current if it has STARTED and not yet ENDED (use end_time, not a hardcoded 15-min window)
         for i, inst in enumerate(btc_instruments):
@@ -4256,7 +4396,7 @@ class IntegratedBTCStrategy(Strategy):
                 logger.info(f"✓ CURRENT MARKET: {inst['slug']} (index {i})")
                 logger.info(f"  Next switch at: {self.next_switch_time.strftime('%H:%M:%S')}")
                 logger.info(f"  YES token: {self._yes_token_id[:16]}…" if self._yes_token_id else "  YES token: unknown")
-                
+
                 # =========================================================================
                 # CRITICAL FIX: Subscribe immediately!
                 # =========================================================================
@@ -4266,7 +4406,7 @@ class IntegratedBTCStrategy(Strategy):
                     logger.info("  ✓ SUBSCRIBED to NO token quotes")
                 logger.info(f"  ✓ SUBSCRIBED to current market")
                 break
-        
+
         if self.current_instrument_index == -1 and btc_instruments:
             # No currently-active market — find the NEAREST upcoming one
             # (smallest positive time_diff_minutes = starts soonest)
@@ -4297,26 +4437,26 @@ class IntegratedBTCStrategy(Strategy):
             logger.info(f"  ✓ SUBSCRIBED to future market")
             # Block trading until the market actually opens (timer loop sets _market_open flag)
             self._waiting_for_market_open = True
-            
+
     def _switch_to_next_market(self):
         """Switch to the next market in the pre-loaded list"""
         if not self.all_btc_instruments:
             logger.error("No instruments loaded!")
             return False
-        
+
         next_index = self.current_instrument_index + 1
         if next_index >= len(self.all_btc_instruments):
             logger.warning("No more markets available - will restart bot")
             return False
-        
+
         next_market = self.all_btc_instruments[next_index]
         now = datetime.now(timezone.utc)
-        
+
         # Check if next market is ready
         if now < next_market['start_time']:
             logger.info(f"Waiting for next market at {next_market['start_time'].strftime('%H:%M:%S')}")
             return False
-        
+
         # Switch to next market
         with self._decision_state_lock:
             if self._decision_in_progress:
@@ -4336,15 +4476,15 @@ class IntegratedBTCStrategy(Strategy):
             # Reset trade timer so we trade at the NEXT quote we receive
             # Use -1 so any interval will trigger (same as startup)
             self.last_trade_time = -1
-        
+
         logger.info("=" * 80)
         logger.info(f"SWITCHING TO NEXT MARKET: {next_market['slug']}")
         logger.info(f"  Current time: {now.strftime('%H:%M:%S')}")
         logger.info(f"  Market ends at: {self.next_switch_time.strftime('%H:%M:%S')}")
         logger.info("=" * 80)
-        
+
         logger.info(f"  Trade timer reset — will trade on next tick")
-        
+
         self.subscribe_quote_ticks(self.instrument_id)
         if self._no_instrument_id:
             self.subscribe_quote_ticks(self._no_instrument_id)
@@ -4445,7 +4585,7 @@ class IntegratedBTCStrategy(Strategy):
 
             is_yes_tick = tick.instrument_id == self.instrument_id
             is_no_tick = (
-                getattr(self, "_no_instrument_id", None) is not None
+                self._no_instrument_id is not None
                 and tick.instrument_id == self._no_instrument_id
             )
             if not is_yes_tick and not is_no_tick:
@@ -4461,7 +4601,7 @@ class IntegratedBTCStrategy(Strategy):
                         if tick.instrument_id == self.instrument_id:
                             self._reset_stability(f"missing quote side bid={bid}, ask={ask}")
                 return
-                
+
             try:
                 bid_decimal = bid.as_decimal()
                 ask_decimal = ask.as_decimal()
@@ -4494,7 +4634,7 @@ class IntegratedBTCStrategy(Strategy):
             with self._decision_state_lock:
                 locked_is_yes_tick = tick.instrument_id == self.instrument_id
                 locked_is_no_tick = (
-                    getattr(self, "_no_instrument_id", None) is not None
+                    self._no_instrument_id is not None
                     and tick.instrument_id == self._no_instrument_id
                 )
                 if not locked_is_yes_tick and not locked_is_no_tick:
@@ -4502,16 +4642,42 @@ class IntegratedBTCStrategy(Strategy):
 
                 if locked_is_no_tick:
                     self._last_no_bid_ask = (bid_decimal, ask_decimal)
+                    # Beta-1: per-side quote freshness for the snapshot's
+                    # frozen_quotes block.
+                    self._last_no_quote_ts = now
                     return
 
-                # Always store price history
+                # Beta-1: live quote tick. ``ts_event`` is the upstream UTC
+                # event time (Nautilus exposes it as nanoseconds since
+                # epoch); convert to UTC-aware datetime for the snapshot.
+                # Review-cycle fix: removed the wall-clock fallback that
+                # was masking missing ts_event as a synthesized timestamp
+                # (Rule 1 + G3 replay-determinism). Tick objects without
+                # ts_event are a real fault and fail-stop.
                 mid_price = (bid_decimal + ask_decimal) / 2
-                self.price_history.append(mid_price)
-                if len(self.price_history) > self.max_history:
-                    self.price_history.pop(0)
+                tick_ts_ns = getattr(tick, "ts_event", None)
+                if tick_ts_ns is None:
+                    raise RuntimeError(
+                        "quote tick missing ts_event; cannot record live "
+                        "quote provenance per Beta-1 contract"
+                    )
+                if isinstance(tick_ts_ns, datetime):
+                    tick_ts = tick_ts_ns
+                else:
+                    tick_ts = datetime.fromtimestamp(
+                        int(tick_ts_ns) / 1_000_000_000, tz=timezone.utc
+                    )
+                self._append_price_history(
+                    mid_price,
+                    source="live_quote_tick",
+                    ts=tick_ts,
+                )
 
                 # Store latest bid/ask for liquidity check before order placement
                 self._last_bid_ask = (bid_decimal, ask_decimal)
+                # Beta-1: per-side quote freshness for the snapshot's
+                # frozen_quotes block.
+                self._last_yes_quote_ts = now
 
                 # Tick buffer for TickVelocityProcessor (rolling 90s window)
                 self._tick_buffer.append({'ts': now, 'price': mid_price})
@@ -4576,7 +4742,7 @@ class IntegratedBTCStrategy(Strategy):
 
             # =========================================================================
             # FIXED TRADING LOGIC:
-            # 
+            #
             # We trade once per 15-min market interval.
             # Instead of checking wall-clock 15-min boundaries (which caused the 2-hour
             # wait), we use a simple counter keyed to the Polymarket market's OWN
@@ -4797,7 +4963,7 @@ class IntegratedBTCStrategy(Strategy):
     ):
         """Synchronous wrapper for trading decision (called from executor)."""
         owns_decision_flag = strategy_observation_mode != "shadow_policy"
-        
+
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -4851,7 +5017,7 @@ class IntegratedBTCStrategy(Strategy):
                 seconds_into_sub_interval=seconds_into_sub_interval,
                 trade_window_label=trade_window_label,
             )
-            rec.reject(
+            self._decision_reject(rec,
                 "snapshot_capture_exception",
                 f"{type(exc).__name__}: {exc}",
             )
@@ -4905,7 +5071,7 @@ class IntegratedBTCStrategy(Strategy):
                 seconds_into_sub_interval=decision_snapshot.seconds_into_sub_interval,
                 trade_window_label=decision_snapshot.trade_window_label,
             )
-            rec.reject(
+            self._decision_reject(rec,
                 "executor_enqueue_exception",
                 f"{type(exc).__name__}: {exc}",
             )
@@ -4930,10 +5096,34 @@ class IntegratedBTCStrategy(Strategy):
             DecisionTickSnapshot(ts=tick["ts"], price=tick["price"])
             for tick in self._tick_buffer
         )
+        # Beta-1: zip parallel provenance lists into PriceHistoryEntry tuples.
+        # Helper invariant: all three lists have equal length post-helper, so
+        # this zip is always well-formed.
+        if not (
+            len(self.price_history) == len(self._price_history_sources)
+            == len(self._price_history_ts)
+        ):
+            raise RuntimeError(
+                "price_history provenance lists out of sync — "
+                "RP12-extended invariant violated"
+            )
+        price_history_entries = tuple(
+            PriceHistoryEntry(
+                value=val,
+                ts=ts,
+                source=src,
+                synthetic=(src == "synthetic_startup"),
+            )
+            for val, src, ts in zip(
+                self.price_history,
+                self._price_history_sources,
+                self._price_history_ts,
+            )
+        )
         return {
             "captured_at": datetime.now(timezone.utc),
             "reference_time": reference_time,
-            "price_history": tuple(self.price_history),
+            "price_history": price_history_entries,
             "tick_buffer": tick_buffer,
             "yes_bid_ask": self._last_bid_ask,
             "no_bid_ask": self._last_no_bid_ask,
@@ -4946,8 +5136,15 @@ class IntegratedBTCStrategy(Strategy):
             "market_end_time": market_meta.get("end_time"),
             "cached_yes_token_id": self._yes_token_id,
             "instrument_id": self.instrument_id,
-            "yes_instrument_id": getattr(self, "_yes_instrument_id", None),
-            "no_instrument_id": getattr(self, "_no_instrument_id", None),
+            # Review-cycle fix: direct attribute access — both fields are
+            # pre-initialized to None in __init__ and populated by
+            # _load_all_btc_instruments before any decision body runs.
+            "yes_instrument_id": self._yes_instrument_id,
+            "no_instrument_id": self._no_instrument_id,
+            # Beta-1: per-side quote freshness for the snapshot's
+            # frozen_quotes block.
+            "yes_quote_timestamp": self._last_yes_quote_ts,
+            "no_quote_timestamp": self._last_no_quote_ts,
         }
 
     def _decision_snapshot_from_state(
@@ -4985,6 +5182,10 @@ class IntegratedBTCStrategy(Strategy):
             sub_interval=sub_interval,
             seconds_into_sub_interval=seconds_into_sub_interval,
             trade_window_label=trade_window_label,
+            # Beta-1: per-side quote freshness from the captured locked state.
+            # Review-cycle fix: direct-index (was `.get(None)` fallback).
+            yes_quote_timestamp=state["yes_quote_timestamp"],
+            no_quote_timestamp=state["no_quote_timestamp"],
         )
 
     def _capture_decision_input_snapshot(
@@ -5094,7 +5295,7 @@ class IntegratedBTCStrategy(Strategy):
             f"MAX_DECISION_SNAPSHOT_AGE_SECONDS={max_age_seconds}"
         )
         logger.error(f"LIVE ORDER BLOCKED: {reason}")
-        rec.reject(gate, reason)
+        self._decision_reject(rec, gate, reason)
         return False
 
     async def _make_trading_decision(
@@ -5111,7 +5312,7 @@ class IntegratedBTCStrategy(Strategy):
 
         Decision-log wiring: every early-return path records exactly one
         decisions.jsonl line via the `rec` DecisionRecord context manager.
-        Reject branches call ``rec.reject(gate, reason)`` immediately before
+        Reject branches call ``self._decision_reject(rec, gate, reason)`` immediately before
         ``return False``; the positive path calls ``rec.decided(...)`` before
         delegating to the simulation/live executor.
         """
@@ -5149,12 +5350,81 @@ class IntegratedBTCStrategy(Strategy):
         rec: DecisionRecord,
         observation_only: bool = False,
     ) -> bool:
+        # Gamma-1: open the raw recorder for this decision body and wrap
+        # the inner body in a try/finally so its __exit__ catches exceptions
+        # AND writes the universal-trailing final_decision row + (when
+        # RAW_DECISION_SNAPSHOT_DIR is set) the JSONL line. The recorder is
+        # single-use per decision body invocation.
+        bot_mode = (
+            "simulation" if is_simulation
+            else ("shadow_policy" if observation_only else "live_gate")
+        )
+        raw_recorder = RawDecisionSnapshotRecorder(
+            decision_id=decision_snapshot.decision_id,
+            bot_mode=bot_mode,
+            strategy_version=_STRATEGY_VERSION_CONST,
+            git_sha=os.environ.get("POLYBOT_GIT_SHA", ""),
+            decision_reference_time=decision_snapshot.reference_time,
+        )
+        self._raw_recorder_for_decision = raw_recorder
+        raw_recorder.__enter__()
+        exc_info_for_recorder: tuple = (None, None, None)
+        try:
+            return await self._make_trading_decision_body_inner(
+                decision_snapshot,
+                trade_key,
+                is_simulation,
+                rec,
+                observation_only=observation_only,
+                raw_recorder=raw_recorder,
+            )
+        except BaseException:
+            import sys
+            exc_info_for_recorder = sys.exc_info()
+            raise
+        finally:
+            raw_recorder.__exit__(*exc_info_for_recorder)
+            # Review-cycle fix (R3 round 2): clear the attribute after
+            # __exit__ so the recorder isn't reused on the
+            # snapshot-capture-exception / executor-enqueue-exception
+            # paths which fire OUTSIDE this method. Those paths call
+            # _decision_reject; without this clear, mirror_reject would
+            # raise on the finalized recorder and mask the original
+            # exception.
+            self._raw_recorder_for_decision = None
+
+    async def _make_trading_decision_body_inner(
+        self,
+        decision_snapshot: DecisionInputSnapshot,
+        trade_key,
+        is_simulation: bool,
+        rec: DecisionRecord,
+        *,
+        observation_only: bool = False,
+        raw_recorder: RawDecisionSnapshotRecorder,
+    ) -> bool:
+        # Beta-6: build the effective_decision_config dict EXACTLY ONCE,
+        # AFTER observation_only is resolved (caller has already resolved
+        # mode), BEFORE any gate fires. RP9 / TC57 enforce.
+        from effective_decision_config import build_effective_decision_config
+        # Review-cycle fix (R2 round 2): pass ``os.environ.__getitem__``
+        # rather than ``os.environ.get`` so missing required envs raise
+        # KeyError naming the missing var rather than producing a late
+        # ``int(None)`` TypeError downstream.
+        effective_config = build_effective_decision_config(
+            env_reader=os.environ.__getitem__,
+            processor_registry=self._processor_registry_for_decision(observation_only),
+            fusion_engine=self._fusion_engine_for_decision(observation_only),
+            risk_engine=self.risk_engine,
+        )
+
         current_price = decision_snapshot.current_price
         rec.update(
             decision_snapshot_at=decision_snapshot.captured_at,
             decision_reference_time=decision_snapshot.reference_time,
             decision_price_history_len=len(decision_snapshot.price_history),
             decision_tick_buffer_len=len(decision_snapshot.tick_buffer),
+            effective_config=effective_config,
         )
         logger.info(f"Mode: {'SIMULATION' if is_simulation else 'LIVE TRADING'}")
         order_config = (
@@ -5173,7 +5443,7 @@ class IntegratedBTCStrategy(Strategy):
                     f"({len(unresolved)} item(s)). Resolve or repair unresolved ledger state "
                     f"in {LIVE_TRADE_LEDGER_PATH.name} before placing new live orders."
                 )
-                rec.reject(
+                self._decision_reject(rec,
                     "live_paused_unresolved_settlement",
                     f"{len(unresolved)} unresolved item(s)",
                 )
@@ -5183,7 +5453,7 @@ class IntegratedBTCStrategy(Strategy):
                 "ORDER BLOCKED: quote stability below configured threshold "
                 f"({decision_snapshot.stable_tick_count} < {quote_stability_required})"
             )
-            rec.reject(
+            self._decision_reject(rec,
                 "quote_stability_below_configured_threshold",
                 f"stable_tick_count={decision_snapshot.stable_tick_count} < required={quote_stability_required}",
             )
@@ -5192,7 +5462,7 @@ class IntegratedBTCStrategy(Strategy):
         # --- Minimum history guard ---
         if len(decision_snapshot.price_history) < 20:
             logger.warning(f"Not enough price history ({len(decision_snapshot.price_history)}/20)")
-            rec.reject(
+            self._decision_reject(rec,
                 "history_too_short",
                 f"len(price_history)={len(decision_snapshot.price_history)} < 20",
             )
@@ -5248,11 +5518,12 @@ class IntegratedBTCStrategy(Strategy):
             decision_snapshot,
             metadata,
             observation_only=observation_only,
+            now=decision_snapshot.reference_time,
         )
 
         if not signals:
             logger.info("No signals generated — no trade this interval")
-            rec.reject("no_signals", "_process_signals returned empty list")
+            self._decision_reject(rec, "no_signals", "_process_signals returned empty list")
             return False
 
         logger.info(f"Generated {len(signals)} signal(s):")
@@ -5261,13 +5532,17 @@ class IntegratedBTCStrategy(Strategy):
                 f"  [{sig.source}] {sig.direction.value}: "
                 f"score={sig.score:.1f}, confidence={sig.confidence:.2%}"
             )
+        # Review-cycle fix: TradingSignal is a closed dataclass with
+        # required source/direction/confidence and a ``score`` property
+        # — drop defensive getattr defaults that would mask future field
+        # renames.
         rec.update(
             model_signals=[
                 {
-                    "source": str(getattr(sig, "source", "")),
-                    "direction": str(getattr(sig.direction, "value", sig.direction)),
-                    "score": float(getattr(sig, "score", 0.0)),
-                    "confidence": float(getattr(sig, "confidence", 0.0)),
+                    "source": str(sig.source),
+                    "direction": str(sig.direction.value),
+                    "score": float(sig.score),
+                    "confidence": float(sig.confidence),
                     "metadata": sig.metadata,
                 }
                 for sig in signals
@@ -5277,10 +5552,20 @@ class IntegratedBTCStrategy(Strategy):
         # --- Fuse signals into one consensus ---
         fusion_engine = self._fusion_engine_for_decision(observation_only)
         with self._signal_processing_lock:
-            fused = fusion_engine.fuse_signals(signals, min_signals=2, min_score=55.0)
+            # Beta-2/Beta-5: now= is REQUIRED (no default); reference_time is
+            # the decision's frozen UTC instant so replay is deterministic.
+            # Review-cycle fix: read min_signals / min_score from
+            # effective_config so harness sweeps over FUSION_MIN_SIGNALS /
+            # FUSION_MIN_SCORE actually move the production verdict.
+            fused = fusion_engine.fuse_signals(
+                signals,
+                now=decision_snapshot.reference_time,
+                min_signals=int(effective_config["fusion"]["fusion_min_signals"]),
+                min_score=float(effective_config["fusion"]["fusion_min_score"]),
+            )
         if not fused:
             logger.info("Fusion produced no actionable signal — no trade this interval")
-            rec.reject("fusion_no_consensus", "fusion_engine.fuse_signals returned None")
+            self._decision_reject(rec, "fusion_no_consensus", "fusion_engine.fuse_signals returned None")
             return False
 
         logger.info(
@@ -5312,8 +5597,11 @@ class IntegratedBTCStrategy(Strategy):
         #   price 0.40–0.60 → too close to call → SKIP (this is where we were losing)
         #
         # =========================================================================
-        TREND_UP_THRESHOLD   = 0.60   # price above this → buy YES (UP)
-        TREND_DOWN_THRESHOLD = 0.40   # price below this → buy NO (DOWN)
+        # Review-cycle fix: trend thresholds are §12 promoted envs
+        # (TREND_UP_THRESHOLD / TREND_DOWN_THRESHOLD) read via
+        # effective_config so harness sweeps move the production verdict.
+        TREND_UP_THRESHOLD   = float(effective_config["trend"]["trend_up_threshold"])
+        TREND_DOWN_THRESHOLD = float(effective_config["trend"]["trend_down_threshold"])
 
         price_float = float(current_price)
 
@@ -5332,7 +5620,7 @@ class IntegratedBTCStrategy(Strategy):
                 f"⏭ TREND: NEUTRAL ({price_float:.2%}) — price too close to 0.50, SKIPPING trade "
                 f"(coin flip territory: {TREND_DOWN_THRESHOLD:.0%}–{TREND_UP_THRESHOLD:.0%})"
             )
-            rec.reject(
+            self._decision_reject(rec,
                 "trend_filter_neutral",
                 f"price {price_float:.4f} in neutral band [0.40, 0.60]",
             )
@@ -5350,7 +5638,7 @@ class IntegratedBTCStrategy(Strategy):
                     f"SKIP: trend wants {direction.upper()} but fused signal is "
                     f"{actual_signal.upper()} — no independent confirmation"
                 )
-                rec.reject(
+                self._decision_reject(rec,
                     "signal_confirmation_mismatch",
                     f"trend={direction} but fused={actual_signal}",
                 )
@@ -5360,7 +5648,7 @@ class IntegratedBTCStrategy(Strategy):
                     f"SKIP: fused confidence {fused.confidence:.2%} below "
                     f"MIN_SIGNAL_CONFIDENCE={min_confidence:.2%}"
                 )
-                rec.reject(
+                self._decision_reject(rec,
                     "min_signal_confidence",
                     f"fused.confidence={fused.confidence:.4f} < {float(min_confidence):.4f}",
                 )
@@ -5369,7 +5657,7 @@ class IntegratedBTCStrategy(Strategy):
         last_tick = decision_snapshot.yes_bid_ask
         if last_tick is None:
             logger.warning("SKIP: no executable YES quote cached")
-            rec.reject("no_yes_quote", "self._last_bid_ask is None")
+            self._decision_reject(rec, "no_yes_quote", "self._last_bid_ask is None")
             return False
         yes_bid, yes_ask = last_tick
         rec.update(yes_ask=yes_ask)
@@ -5382,7 +5670,7 @@ class IntegratedBTCStrategy(Strategy):
             no_tick = decision_snapshot.no_bid_ask
             if no_tick is None:
                 logger.warning("SKIP: no executable NO ask cached")
-                rec.reject("no_no_quote", "self._last_no_bid_ask is None")
+                self._decision_reject(rec, "no_no_quote", "self._last_no_bid_ask is None")
                 return False
             _, no_ask = no_tick
             top_of_book_entry = no_ask
@@ -5393,7 +5681,7 @@ class IntegratedBTCStrategy(Strategy):
 
         if selected_order_book_key not in metadata:
             logger.warning(f"SKIP: {entry_source} order-book snapshot missing from market context")
-            rec.reject(
+            self._decision_reject(rec,
                 "depth_aware_book_snapshot_missing",
                 f"{selected_order_book_key} missing from market context",
             )
@@ -5412,7 +5700,7 @@ class IntegratedBTCStrategy(Strategy):
                 logger.info(
                     "SKIP: LIMIT_IOC accepted cap is outside Polymarket token bounds"
                 )
-                rec.reject(
+                self._decision_reject(rec,
                     "limit_price_out_of_bounds",
                     f"fused.confidence={fused.confidence:.4f}",
                 )
@@ -5420,19 +5708,19 @@ class IntegratedBTCStrategy(Strategy):
             if direction == "long":
                 if decision_snapshot.yes_instrument_id is None:
                     logger.warning("SKIP: YES token instrument unavailable for LIMIT_IOC")
-                    rec.reject("limit_ioc_no_yes_instrument", "_yes_instrument_id is None")
+                    self._decision_reject(rec, "limit_ioc_no_yes_instrument", "_yes_instrument_id is None")
                     return False
                 trade_instrument_id = decision_snapshot.yes_instrument_id
             else:
                 if decision_snapshot.no_instrument_id is None:
                     logger.warning("SKIP: NO token instrument unavailable for LIMIT_IOC")
-                    rec.reject("limit_ioc_no_no_instrument", "_no_instrument_id is None")
+                    self._decision_reject(rec, "limit_ioc_no_no_instrument", "_no_instrument_id is None")
                     return False
                 trade_instrument_id = decision_snapshot.no_instrument_id
             instrument = self.cache.instrument(trade_instrument_id)
             if not instrument:
                 logger.error(f"SKIP: instrument not in cache for LIMIT_IOC: {trade_instrument_id}")
-                rec.reject(
+                self._decision_reject(rec,
                     "limit_ioc_instrument_not_cached",
                     f"instrument_id={trade_instrument_id}",
                 )
@@ -5450,7 +5738,7 @@ class IntegratedBTCStrategy(Strategy):
                 logger.warning(
                     "SKIP: LIMIT_IOC token quantity is below Polymarket 5-token minimum"
                 )
-                rec.reject(
+                self._decision_reject(rec,
                     "limit_ioc_below_min_tokens",
                     f"budget={POSITION_SIZE_USD} submitted_limit_price={submitted_limit_price}",
                 )
@@ -5498,7 +5786,7 @@ class IntegratedBTCStrategy(Strategy):
                 f"({entry_source} {float(executable_entry):.2%} + buffers "
                 f"{float(fee_buffer + spread_buffer):.2%})"
             )
-            rec.reject(
+            self._decision_reject(rec,
                 "ev_gate",
                 f"fused.confidence={fused.confidence:.4f} < min_required={float(min_required_confidence):.4f} "
                 f"({entry_source}={float(executable_entry):.4f} + buffers={float(fee_buffer + spread_buffer):.4f})",
@@ -5522,14 +5810,16 @@ class IntegratedBTCStrategy(Strategy):
                 return False
 
         # Risk engine tracks submitted orders plus filled markets until settlement.
+        # Beta-8: now= is REQUIRED; use the decision's frozen UTC reference_time.
         is_valid, error = self.risk_engine.validate_new_position(
             size=POSITION_SIZE_USD,
             direction=direction,
             current_price=current_price,
+            now=decision_snapshot.reference_time,
         )
         if not is_valid:
             logger.warning(f"Risk engine blocked trade: {error}")
-            rec.reject("risk_engine", str(error))
+            self._decision_reject(rec, "risk_engine", str(error))
             return False
 
         logger.info(
@@ -5541,7 +5831,10 @@ class IntegratedBTCStrategy(Strategy):
         # The bid/ask values come from the frozen decision snapshot.
         # If ask <= 0.02 or bid <= 0.02, the orderbook is essentially empty
         # and a FAK (IOC market) order will be rejected immediately.
-        MIN_LIQUIDITY = Decimal("0.02")
+        # Beta-10: liquidity_floor reads from effective_config (built at
+        # the top of this body) instead of an inline literal. The harness
+        # sweeps this value through ``promoted_env.liquidity_floor``.
+        MIN_LIQUIDITY = Decimal(effective_config["promoted_env"]["liquidity_floor"])
         if direction == "long":
             if yes_ask <= MIN_LIQUIDITY:
                 logger.warning(
@@ -5549,7 +5842,7 @@ class IntegratedBTCStrategy(Strategy):
                     f"is at or below the ${float(MIN_LIQUIDITY):.2f} liquidity floor. "
                     "Market is too thin/extreme; will retry next tick."
                 )
-                rec.reject(
+                self._decision_reject(rec,
                     "liquidity_floor_yes_ask",
                     f"YES ask={float(yes_ask):.4f} <= {float(MIN_LIQUIDITY):.2f}",
                 )
@@ -5560,7 +5853,7 @@ class IntegratedBTCStrategy(Strategy):
                 f"is at or below the ${float(MIN_LIQUIDITY):.2f} liquidity floor. "
                 "Market is too thin/extreme; will retry next tick."
             )
-            rec.reject(
+            self._decision_reject(rec,
                 "liquidity_floor_no_ask",
                 f"NO ask={float(no_ask):.4f} <= {float(MIN_LIQUIDITY):.2f}",
             )
@@ -5568,6 +5861,25 @@ class IntegratedBTCStrategy(Strategy):
 
         # Positive decision — record before delegating to executor.
         rec.decided(direction=direction)
+        # Review-cycle fix: populate the raw recorder's final_decision
+        # output dict per §4.4 / §6.4 Delta-7(d). The recorder is always
+        # bound at this point (set in the outer body wrapper, cleared
+        # only after __exit__); direct attribute access — no getattr.
+        if self._raw_recorder_for_decision is not None:
+            selected_side = "yes" if direction == "long" else "no"
+            selected_token_id = (
+                decision_snapshot.yes_token_id if direction == "long"
+                else decision_snapshot.no_token_id
+            )
+            self._raw_recorder_for_decision.set_final_accept_output(
+                selected_side=selected_side,
+                selected_token_id=str(selected_token_id),
+                submitted_limit_price=str(submitted_limit_price),
+                accepted_limit_price=str(accepted_limit_price),
+                limit_order_token_qty=str(limit_order_token_qty),
+                fusion_direction=str(fused.direction.value),
+                fusion_confidence=str(fused.confidence),
+            )
 
         # --- Execute ---
         if is_simulation:
@@ -5593,7 +5905,7 @@ class IntegratedBTCStrategy(Strategy):
             if rec.fields["rejected_at_gate"] is None:
                 # Reject reason tracked at the executor layer; surface a generic
                 # late-stage rejection so the record still reflects the outcome.
-                rec.reject("executor_returned_false", "place_real_order or paper_trade returned False")
+                self._decision_reject(rec, "executor_returned_false", "place_real_order or paper_trade returned False")
         if placed and trade_key is not None:
             self.last_trade_time = trade_key
         return placed
@@ -5656,7 +5968,7 @@ class IntegratedBTCStrategy(Strategy):
         """
         if not side_token_id:
             logger.warning("SKIP: missing side token id for depth-aware EV gate")
-            rec.reject(
+            self._decision_reject(rec,
                 "depth_aware_missing_token_id",
                 f"{entry_source} side has no token_id in market metadata",
             )
@@ -5677,7 +5989,7 @@ class IntegratedBTCStrategy(Strategy):
                     f"SKIP: side_token_id {side_token_id[:16]}… does not match "
                     f"market_meta {expected_side.lower()}_token_id"
                 )
-                rec.reject(
+                self._decision_reject(rec,
                     "depth_aware_token_side_mismatch",
                     f"side_token_id does not match market_meta {expected_side.lower()}_token_id "
                     f"for entry_source={entry_source!r}",
@@ -5690,7 +6002,7 @@ class IntegratedBTCStrategy(Strategy):
         book = order_book
         if not book:
             logger.warning("SKIP: depth-aware order-book snapshot is empty")
-            rec.reject(
+            self._decision_reject(rec,
                 "depth_aware_no_book",
                 f"{entry_source} provided order_book snapshot is None/empty",
             )
@@ -5698,7 +6010,7 @@ class IntegratedBTCStrategy(Strategy):
         asks = book.get("asks") or []
         if not asks:
             logger.warning("SKIP: depth-aware book has no asks")
-            rec.reject(
+            self._decision_reject(rec,
                 "depth_aware_empty_asks",
                 f"{entry_source} book has no ask levels",
             )
@@ -5710,7 +6022,7 @@ class IntegratedBTCStrategy(Strategy):
                 )
             except InvalidBookLevelError as exc:
                 logger.warning(f"SKIP: depth-aware book has invalid level: {exc}")
-                rec.reject(
+                self._decision_reject(rec,
                     "depth_aware_invalid_book_level",
                     f"{entry_source}: {exc}",
                 )
@@ -5721,7 +6033,7 @@ class IntegratedBTCStrategy(Strategy):
                     f"SKIP: depth-aware book too thin for ${float(position_size_usd):.2f} "
                     f"{entry_source} sweep (tokens fillable: {tokens_str})"
                 )
-                rec.reject(
+                self._decision_reject(rec,
                     "depth_aware_book_too_thin",
                     f"{entry_source} cannot fill ${float(position_size_usd):.2f} "
                     f"(tokens fillable: {tokens_str})",
@@ -5751,7 +6063,7 @@ class IntegratedBTCStrategy(Strategy):
             )
         except InvalidBookLevelError as exc:
             logger.warning(f"SKIP: depth-aware book has invalid level: {exc}")
-            rec.reject(
+            self._decision_reject(rec,
                 "depth_aware_invalid_book_level",
                 f"{entry_source}: {exc}",
             )
@@ -5763,7 +6075,7 @@ class IntegratedBTCStrategy(Strategy):
                 f"price <= ${float(submitted_limit_price):.4f} "
                 f"(tokens fillable: {tokens_str})"
             )
-            rec.reject(
+            self._decision_reject(rec,
                 "depth_aware_limit_ioc_no_liquidity",
                 f"{entry_source} no fill at submitted_limit_price={submitted_limit_price}",
             )
@@ -6199,8 +6511,8 @@ class IntegratedBTCStrategy(Strategy):
                     "market_start_time": self._jsonable(market_meta.get("start_time")),
                     "market_end_time": market_end_time.isoformat(),
                     "submitted_at": submitted_at,
-                    "signal_score": getattr(signal, "score", 0.0),
-                    "signal_confidence": getattr(signal, "confidence", 0.0),
+                    "signal_score": float(signal.score),
+                    "signal_confidence": float(signal.confidence),
                 }
                 self._persist_submitted_order_intent_locked(
                     order_id=unique_id,
@@ -6209,11 +6521,15 @@ class IntegratedBTCStrategy(Strategy):
                 )
                 intent_persisted = True
                 self._submitted_positions[unique_id] = submitted_meta
+                # Beta-8: now= is the decision's UTC reference_time
+                # (in-scope as the ``decision_reference_time`` parameter of
+                # _place_real_order).
                 self.risk_engine.add_position(
                     position_id=unique_id,
                     size=position_size,
                     entry_price=entry_price_for_intent,
                     direction="buy_yes" if direction == "long" else "buy_no",
+                    now=decision_reference_time,
                 )
 
             submit_attempted = True
@@ -6260,17 +6576,77 @@ class IntegratedBTCStrategy(Strategy):
     def _fusion_engine_for_decision(self, observation_only: bool) -> SignalFusionEngine:
         return self._shadow_fusion_engine if observation_only else self.fusion_engine
 
+    def _decision_reject(
+        self,
+        rec: DecisionRecord,
+        name: str,
+        reason: str,
+        *,
+        inputs: Any = None,
+    ) -> None:
+        """Review-cycle fix: mirror every body-level reject into the raw
+        decision recorder so the captured record reflects the actual
+        outcome (per §4.4 + §6.4 Delta-7(f)). The recorder is set in
+        ``_make_trading_decision_body``'s try/finally and cleared after
+        ``__exit__`` so direct attribute access is safe at every call
+        site (rejects on the snapshot-capture-exception /
+        executor-enqueue-exception paths see ``None`` and skip the
+        mirror; rejects inside the body always see a fresh recorder).
+        """
+        rec.reject(name, reason)
+        if self._raw_recorder_for_decision is not None:
+            self._raw_recorder_for_decision.mirror_reject(
+                name, reason, inputs=inputs,
+            )
+
+    def _processor_registry_for_decision(
+        self,
+        observation_only: bool,
+    ) -> "ProcessorRegistry":
+        """Beta-6: return the live or shadow processor registry."""
+        from effective_decision_config import ProcessorRegistry
+        if observation_only:
+            return ProcessorRegistry(
+                spike=self._shadow_spike_detector,
+                sentiment=self._shadow_sentiment_processor,
+                divergence=self._shadow_divergence_processor,
+                orderbook=self._shadow_orderbook_processor,
+                tick_velocity=self._shadow_tick_velocity_processor,
+                deribit_pcr=self._shadow_deribit_pcr_processor,
+            )
+        return ProcessorRegistry(
+            spike=self.spike_detector,
+            sentiment=self.sentiment_processor,
+            divergence=self.divergence_processor,
+            orderbook=self.orderbook_processor,
+            tick_velocity=self.tick_velocity_processor,
+            deribit_pcr=self.deribit_pcr_processor,
+        )
+
     def _process_signals(
         self,
         decision_snapshot: DecisionInputSnapshot,
-        metadata=None,
+        metadata,
         *,
         observation_only: bool = False,
+        now: datetime,
     ):
+        # Review-cycle fix: ``metadata`` is REQUIRED (was Optional with
+        # ``None``-substitute fallback), ``now`` is REQUIRED kwarg (per
+        # Beta-2 spec which explicitly required _process_signals to take
+        # now=). The caller in _make_trading_decision_body always passes
+        # both; tests are updated to match.
+        if not isinstance(metadata, dict):
+            raise TypeError(
+                f"_process_signals: metadata must be a dict; got "
+                f"{type(metadata).__name__}"
+            )
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise RuntimeError(
+                "_process_signals: now must be timezone-aware (UTC)"
+            )
         with self._signal_processing_lock:
             signals = []
-            if metadata is None:
-                metadata = {}
             current_price = decision_snapshot.current_price
             historical_prices = decision_snapshot.price_history
             spike_detector = (
@@ -6303,10 +6679,20 @@ class IntegratedBTCStrategy(Strategy):
                 else:
                     processed_metadata[key] = value
 
+            # Beta-2/3: now= and decision_id= are REQUIRED kwargs on every
+            # processor's process() call. Review-cycle fix: _process_signals
+            # now takes a REQUIRED ``now`` kwarg (the caller passes
+            # decision_snapshot.reference_time); decision_id comes from the
+            # snapshot.
+            _now = now
+            _decision_id = decision_snapshot.decision_id
+
             spike_signal = spike_detector.process(
                 current_price=current_price,
                 historical_prices=historical_prices,
                 metadata=processed_metadata,
+                now=_now,
+                decision_id=_decision_id,
             )
             if spike_signal:
                 signals.append(spike_signal)
@@ -6316,6 +6702,8 @@ class IntegratedBTCStrategy(Strategy):
                     current_price=current_price,
                     historical_prices=historical_prices,
                     metadata=processed_metadata,
+                    now=_now,
+                    decision_id=_decision_id,
                 )
                 if sentiment_signal:
                     signals.append(sentiment_signal)
@@ -6325,6 +6713,8 @@ class IntegratedBTCStrategy(Strategy):
                     current_price=current_price,
                     historical_prices=historical_prices,
                     metadata=processed_metadata,
+                    now=_now,
+                    decision_id=_decision_id,
                 )
                 if divergence_signal:
                     signals.append(divergence_signal)
@@ -6335,6 +6725,8 @@ class IntegratedBTCStrategy(Strategy):
                     current_price=current_price,
                     historical_prices=historical_prices,
                     metadata=processed_metadata,
+                    now=_now,
+                    decision_id=_decision_id,
                 )
                 if ob_signal:
                     signals.append(ob_signal)
@@ -6345,6 +6737,8 @@ class IntegratedBTCStrategy(Strategy):
                     current_price=current_price,
                     historical_prices=historical_prices,
                     metadata=processed_metadata,
+                    now=_now,
+                    decision_id=_decision_id,
                 )
                 if tv_signal:
                     signals.append(tv_signal)
@@ -6354,6 +6748,8 @@ class IntegratedBTCStrategy(Strategy):
                 current_price=current_price,
                 historical_prices=historical_prices,
                 metadata=processed_metadata,
+                now=_now,
+                decision_id=_decision_id,
             )
             if pcr_signal:
                 signals.append(pcr_signal)
@@ -8251,11 +8647,13 @@ class IntegratedBTCStrategy(Strategy):
             self._submitted_positions.pop(order_id, None)
 
             try:
+                # Beta-8: now= for adjust_position at the fill instant.
                 self.risk_engine.adjust_position(
                     position_id=order_id,
                     size=total_notional,
                     entry_price=average_price,
                     direction="buy_yes" if direction_raw == "long" else "buy_no",
+                    now=datetime.now(timezone.utc),
                 )
             except Exception as e:
                 reason = f"failed to adjust risk position for fill {order_id}: {e}"
@@ -8440,7 +8838,9 @@ def ensure_live_market_order_patch() -> None:
     global patch_applied
     if patch_applied:
         return
-    patch_applied = apply_market_order_patch()
+    patch_applied = apply_market_order_patch(
+        market_interval_seconds=MARKET_INTERVAL_SECONDS,
+    )
     if not patch_applied:
         raise RuntimeError("Live mode requires market order patch to be applied")
     logger.info("Market order patch applied successfully")
@@ -8450,7 +8850,7 @@ def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, tes
     """Run the integrated BTC 15-min trading bot - LOADS ALL BTC MARKETS FOR THE DAY"""
     if not simulation:
         prepare_live_environment()
-    
+
     print("=" * 80)
     print("INTEGRATED POLYMARKET BTC 15-MIN TRADING BOT")
     print("Nautilus + Redis Control")
@@ -8514,19 +8914,21 @@ def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, tes
         print(f"  LIMIT_REQUIRED_EDGE: {order_config['limit_required_edge']}")
     print()
 
-    now = datetime.now(timezone.utc)
-    
     # =========================================================================
     # Slug timestamps ARE standard Unix timestamps (no offset) aligned to
     # 15-min boundaries. Generate slugs for current + next 24 hours.
     # =========================================================================
     now = datetime.now(timezone.utc)
-    unix_interval_start = (int(now.timestamp()) // 900) * 900  # current 15-min boundary
+    unix_interval_start = (
+        (int(now.timestamp()) // MARKET_INTERVAL_SECONDS) * MARKET_INTERVAL_SECONDS
+    )  # current 15-min boundary
+    first_loaded_market_start = unix_interval_start - MARKET_INTERVAL_SECONDS
 
-    btc_slugs = []
-    for i in range(-1, 97):  # include 1 prior interval (in case we're just after boundary)
-        timestamp = unix_interval_start + (i * 900)
-        btc_slugs.append(f"btc-updown-15m-{timestamp}")
+    # include 1 prior interval (in case we're just after a boundary)
+    btc_market_starts = [
+        unix_interval_start + (i * MARKET_INTERVAL_SECONDS) for i in range(-1, 97)
+    ]
+    btc_slugs = [f"btc-updown-15m-{timestamp}" for timestamp in btc_market_starts]
 
     filters = {
         "active": True,
@@ -8558,8 +8960,8 @@ def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, tes
     polymarket_api_secret = str(polymarket_creds["api_secret"])
     polymarket_passphrase = str(polymarket_creds["passphrase"])
     polymarket_signature_type = int(polymarket_creds["signature_type"])
-    # Nautilus 1.227.0 compatibility: Polymarket config field was renamed
-    # `instrument_provider` -> `instrument_config` in nautilus_trader 1.227.0.
+    # Nautilus compatibility: Polymarket config field is `instrument_config`
+    # in the installed adapter.
     poly_data_cfg = PolymarketDataClientConfig(
         private_key=polymarket_private_key,
         api_key=polymarket_api_key,
@@ -8582,6 +8984,34 @@ def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, tes
             instrument_config=instrument_cfg,
         )
 
+    nautilus_reconciliation_lookback_mins = (
+        loaded_window_reconciliation_lookback_mins(
+            now=now,
+            first_loaded_market_start=first_loaded_market_start,
+            startup_buffer_seconds=MARKET_INTERVAL_SECONDS,
+        )
+    )
+    logger.info(
+        "Nautilus startup reconciliation scoped to loaded window: "
+        f"lookback={nautilus_reconciliation_lookback_mins} minutes "
+        f"from first_loaded_market_start={first_loaded_market_start}"
+    )
+
+    # Fail-stop pre-flight: the reconciliation window MUST overlap at least one
+    # candidate market window, or startup reconciliation aborts the trader
+    # before it starts (while the node still logs RUNNING). Mirrors the patch's
+    # slug-derived overlap geometry against the slugs we are about to load.
+    overlapping_market_count = assert_reconciliation_window_covers_a_market(
+        now=now,
+        lookback_mins=nautilus_reconciliation_lookback_mins,
+        market_start_timestamps=btc_market_starts,
+        market_interval_seconds=MARKET_INTERVAL_SECONDS,
+    )
+    logger.info(
+        "Reconciliation window pre-flight OK: "
+        f"{overlapping_market_count} candidate market(s) overlap the window"
+    )
+
     config = TradingNodeConfig(
         environment="live",
         trader_id="BTC-15MIN-INTEGRATED-001",
@@ -8592,6 +9022,7 @@ def run_integrated_bot(simulation: bool = True, enable_grafana: bool = True, tes
         data_engine=LiveDataEngineConfig(qsize=6000),
         exec_engine=LiveExecEngineConfig(
             qsize=6000,
+            reconciliation_lookback_mins=nautilus_reconciliation_lookback_mins,
         ),
         risk_engine=LiveRiskEngineConfig(bypass=simulation),
         data_clients={POLYMARKET: poly_data_cfg},

@@ -146,9 +146,16 @@ class DecisionSnapshotTestCase(unittest.TestCase):
             def as_decimal(self):
                 return self.value
 
+        # Review-cycle fix: ts_event is required on every tick per Beta-1
+        # (review-cycle removed the wall-clock fallback at on_quote_tick).
+        # Use a fixed test instant in nanoseconds-since-epoch.
+        from datetime import datetime, timezone as _tz
+        _epoch_ns = int(datetime.now(_tz.utc).timestamp() * 1_000_000_000)
+
         class _Tick:
             instrument_id = strategy.instrument_id
             bid_price = _Price(bid)
             ask_price = _Price(ask)
+            ts_event = _epoch_ns
 
         return _Tick()

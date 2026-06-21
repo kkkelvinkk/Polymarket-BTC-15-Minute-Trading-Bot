@@ -3,7 +3,11 @@ from decimal import Decimal
 
 import pytest
 
-from decision_snapshot import DecisionInputSnapshot, DecisionTickSnapshot
+from decision_snapshot import (
+    DecisionInputSnapshot,
+    DecisionTickSnapshot,
+    PriceHistoryEntry,
+)
 
 
 def _snapshot_kwargs():
@@ -13,7 +17,14 @@ def _snapshot_kwargs():
         "captured_at": aware_time,
         "reference_time": aware_time,
         "current_price": Decimal("0.50"),
-        "price_history": (Decimal("0.50"),),
+        "price_history": (
+            PriceHistoryEntry(
+                value=Decimal("0.50"),
+                ts=aware_time,
+                source="live_quote_tick",
+                synthetic=False,
+            ),
+        ),
         "tick_buffer": (DecisionTickSnapshot(ts=aware_time, price=Decimal("0.50")),),
         "yes_bid_ask": (Decimal("0.49"), Decimal("0.51")),
         "no_bid_ask": (Decimal("0.49"), Decimal("0.51")),

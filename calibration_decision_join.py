@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 from collections import defaultdict
 from decimal import Decimal
@@ -11,64 +10,28 @@ from typing import Any
 
 import httpx
 
+from analysis.gamma_resolution import (
+    GAMMA_MARKETS_URL,
+    WINNING_PRICE,
+    fetch_market_by_slug,
+    load_decision_records,
+    parse_finite_decimal as _decimal,
+    winning_side as _winning_side,
+)
 
-GAMMA_MARKETS_URL = "https://gamma-api.polymarket.com/markets"
-WINNING_PRICE = Decimal("1")
-
-
-def _decimal(value: Any, field_name: str) -> Decimal:
-    parsed = Decimal(str(value))
-    if not parsed.is_finite():
-        raise ValueError(f"{field_name} must be finite, got {value!r}")
-    return parsed
-
-
-def _json_array(value: Any, field_name: str) -> list[Any]:
-    if not isinstance(value, str):
-        raise ValueError(f"{field_name} must be a JSON-encoded array string")
-    parsed = json.loads(value)
-    if not isinstance(parsed, list):
-        raise ValueError(f"{field_name} must be a JSON array")
-    return parsed
-
-
-def load_decision_records(path: Path) -> list[dict[str, Any]]:
-    records = []
-    with path.open("r", encoding="utf-8") as fh:
-        for line_number, line in enumerate(fh, 1):
-            stripped = line.strip()
-            if stripped == "":
-                raise ValueError(f"{path}:{line_number} is blank")
-            record = json.loads(stripped)
-            if not isinstance(record, dict):
-                raise ValueError(f"{path}:{line_number} is not a JSON object")
-            records.append(record)
-    return records
+__all__ = [
+    "GAMMA_MARKETS_URL",
+    "WINNING_PRICE",
+    "GammaResolutionResolver",
+    "analyze_path_b",
+    "fetch_gamma_market_by_slug",
+    "load_decision_records",
+]
 
 
 def fetch_gamma_market_by_slug(client: httpx.Client, slug: str) -> dict[str, Any] | None:
-    response = client.get(
-        GAMMA_MARKETS_URL,
-        params={"slug": slug, "closed": "true", "limit": 2},
-    )
-    response.raise_for_status()
-    markets = response.json()
-    if not isinstance(markets, list):
-        raise ValueError("Gamma markets response is not a JSON array")
-    exact_matches = [market for market in markets if market["slug"] == slug]
-    if len(exact_matches) == 0:
-        if markets:
-            raise ValueError(
-                f"Gamma returned no exact closed match for slug {slug!r} "
-                f"among {len(markets)} candidate markets"
-            )
-        return None
-    if len(exact_matches) != 1:
-        raise ValueError(f"Gamma returned {len(exact_matches)} exact matches for slug {slug!r}")
-    market = exact_matches[0]
-    if not isinstance(market, dict):
-        raise ValueError(f"Gamma market for slug {slug!r} is not a JSON object")
-    return market
+    """Calibration caller uses the ``closed-only`` Gamma filter."""
+    return fetch_market_by_slug(client, slug, closed_only=True)
 
 
 class GammaResolutionResolver:
@@ -80,39 +43,6 @@ class GammaResolutionResolver:
         if slug not in self._markets_by_slug:
             self._markets_by_slug[slug] = fetch_gamma_market_by_slug(self._client, slug)
         return self._markets_by_slug[slug]
-
-
-def _market_is_closed(market: dict[str, Any]) -> bool:
-    closed = market["closed"]
-    if isinstance(closed, bool):
-        return closed
-    raise ValueError(f"closed must be a boolean for {market['slug']}")
-
-
-def _winning_side(market: dict[str, Any]) -> str | None:
-    if not _market_is_closed(market):
-        return None
-    outcomes = _json_array(market["outcomes"], "outcomes")
-    prices = _json_array(market["outcomePrices"], "outcomePrices")
-    if len(outcomes) != len(prices):
-        raise ValueError(f"outcomes/outcomePrices length mismatch for {market['slug']}")
-
-    winners = []
-    for outcome, price in zip(outcomes, prices):
-        parsed_price = _decimal(price, "outcomePrices[]")
-        if parsed_price == WINNING_PRICE:
-            normalized = str(outcome).strip().lower()
-            if normalized in ("yes", "up"):
-                winners.append("long")
-            elif normalized in ("no", "down"):
-                winners.append("short")
-            else:
-                raise ValueError(f"unsupported winning outcome {outcome!r} for {market['slug']}")
-    if len(winners) == 0:
-        raise ValueError(f"closed market {market['slug']} has no winning outcome")
-    if len(winners) != 1:
-        raise ValueError(f"market {market['slug']} has {len(winners)} winners")
-    return winners[0]
 
 
 def _fused_direction_won(record: dict[str, Any], winner: str, decision_id: str) -> int:
@@ -189,7 +119,14 @@ def analyze_path_b(
     }
 
     for index, record in enumerate(decision_records, 1):
-        decision_id = str(record.get("decision_id", f"record#{index}"))
+        # §3.A row 16 / §3.D guard-rail #2: decision_id is foundational
+        # state; missing → fail-stop, not substitute a synthetic id.
+        if "decision_id" not in record:
+            raise ValueError(
+                f"decision record #{index} is missing required field "
+                "'decision_id'"
+            )
+        decision_id = str(record["decision_id"])
         slug = record.get("slug")
         if slug in (None, ""):
             excluded["missing_market_slug"] += 1

@@ -178,7 +178,12 @@ class GrafanaMetricsExporter:
         host: str = "0.0.0.0",
         port: int = 8000,
         update_interval: int = 5,  # seconds
+        *,
+        now: "datetime",
     ):
+        # Review-cycle fix (R2 round 2): now= is REQUIRED so the
+        # get_risk_engine singleton (Beta-8 contract) gets its required
+        # construction-time UTC instant when grafana is the first caller.
         """
         Initialize metrics exporter.
 
@@ -191,10 +196,10 @@ class GrafanaMetricsExporter:
         self.port = port
         self.update_interval = update_interval
         
-        # Components
+        # Components — pass UTC now= through to satisfy Beta-8 contract.
         self.performance = get_performance_tracker()
-        self.risk = get_risk_engine()
-        self.execution = get_execution_engine()
+        self.risk = get_risk_engine(now=now)
+        self.execution = get_execution_engine(now=now)
         
         # Prometheus metrics
         self._setup_metrics()
@@ -457,16 +462,22 @@ class GrafanaMetricsExporter:
 # Singleton instance
 _grafana_exporter_instance = None
 
-def get_grafana_exporter() -> GrafanaMetricsExporter:
+def get_grafana_exporter(*, now: "datetime") -> GrafanaMetricsExporter:
     """Get singleton Grafana exporter.
 
     Reads GRAFANA_HOST and GRAFANA_PORT from the process environment (loaded
     from .env at startup). If unset, the constructor defaults apply
     (host=0.0.0.0, port=8000) — these preserve the prior hardcoded values.
+
+    Review-cycle fix (R2 round 2): ``now`` is REQUIRED (M11) so the
+    grafana-startup path propagates the bot's startup UTC instant down to
+    ``get_risk_engine(now=...)``.
     """
     global _grafana_exporter_instance
     if _grafana_exporter_instance is None:
         host = os.getenv("GRAFANA_HOST", "0.0.0.0")
         port = int(os.getenv("GRAFANA_PORT", "8000"))
-        _grafana_exporter_instance = GrafanaMetricsExporter(host=host, port=port)
+        _grafana_exporter_instance = GrafanaMetricsExporter(
+            host=host, port=port, now=now,
+        )
     return _grafana_exporter_instance
