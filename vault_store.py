@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import stat
+import sys
 from dataclasses import dataclass
 from getpass import getpass
 from pathlib import Path
@@ -191,3 +192,24 @@ def prompt_vault_password() -> str:
 
 def load_vault_from_prompt(path: Path = DEFAULT_VAULT_FILE) -> PolymarketVault:
     return load_vault(prompt_vault_password(), path)
+
+
+def read_vault_password_from_stdin() -> str:
+    """Read one vault-password line piped on stdin by a supervising wrapper.
+
+    Used when ``POLYBOT_VAULT_PASSWORD_STDIN=1`` so the long-lived auto-restart
+    wrapper can prompt once and feed each restarted child the password over a
+    stdin pipe. The password never crosses the environment or disk. Raises if no
+    line arrives (a misconfiguration) rather than silently prompting instead.
+    """
+    line = sys.stdin.readline()
+    if line == "":
+        raise RuntimeError(
+            "POLYBOT_VAULT_PASSWORD_STDIN is set but no vault password line was "
+            "received on stdin; the supervising wrapper must pipe it"
+        )
+    return validate_vault_password(line.rstrip("\n"))
+
+
+def load_vault_from_stdin(path: Path = DEFAULT_VAULT_FILE) -> PolymarketVault:
+    return load_vault(read_vault_password_from_stdin(), path)

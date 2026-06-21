@@ -8,6 +8,50 @@ from datetime import datetime
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
+
+def _prompt_and_verify_vault_password():
+    """Prompt once for the vault password and verify it decrypts the vault.
+
+    Returns the verified password so the wrapper can pipe it to each restarted
+    bot.py child on stdin (POLYBOT_VAULT_PASSWORD_STDIN=1), so the operator is
+    not re-prompted on every 90-minute auto-restart. Re-prompts on a malformed
+    or wrong password; structural vault errors (missing/corrupt/insecure file)
+    propagate since re-typing cannot fix them. The password is held only in
+    this wrapper's memory for the session and never written to env or disk.
+    """
+    from getpass import getpass
+
+    from vault_crypto import InvalidVaultPasswordError
+    from vault_store import (
+        DEFAULT_VAULT_FILE,
+        load_vault,
+        validate_vault_password,
+    )
+
+    while True:
+        try:
+            password = validate_vault_password(
+                getpass("Credentials vault password: ")
+            )
+        except ValueError as exc:
+            # Password FORMAT problem (empty / surrounding whitespace / too
+            # short) — retryable by re-typing.
+            print(f"Vault password rejected: {exc}. Please try again.")
+            continue
+        try:
+            # Verify the password actually decrypts the vault; discard the
+            # decrypted result so secrets do not persist in the wrapper. ONLY a
+            # wrong password is retryable here; every other vault error
+            # (missing / corrupt / insecure file, or any decrypted-but-invalid
+            # payload — whatever exception type it surfaces as) propagates,
+            # since re-typing the password cannot fix it.
+            load_vault(password, DEFAULT_VAULT_FILE)
+        except InvalidVaultPasswordError:
+            print("Vault password incorrect. Please try again.")
+            continue
+        return password
+
+
 def run_bot():
     """Run the bot with auto-restart using the SAME Python environment."""
     
@@ -17,8 +61,10 @@ def run_bot():
     python_cmd = sys.executable
     
     # Get command line arguments (excluding the script name)
-    # If you run "python 15m_bot_runner.py --live", this captures ['--live']
+    # If you run "python 15m_bot_runner.py --live --confirm-live", this
+    # captures ['--live', '--confirm-live'].
     bot_args = sys.argv[1:] if len(sys.argv) > 1 else []
+    is_live = "--live" in bot_args
     
     print("=" * 80)
     print("BTC 15-MIN TRADING BOT - AUTO-RESTART WRAPPER")
@@ -45,8 +91,31 @@ def run_bot():
         print("Please set BOT_SCRIPT to your bot filename")
         sys.exit(1)
     
+    # In live mode, prompt for the vault password ONCE here in the supervising
+    # wrapper, verify it, then pipe it to each restarted child on stdin so the
+    # operator is not asked again on every 90-minute auto-restart. The password
+    # is held only in this process's memory; the flag below is not a secret.
+    child_env = os.environ.copy()
+    vault_password = None
+    if is_live:
+        # The wrapper pipes exactly one stdin line (the vault password) to each
+        # child, so bot.py MUST run with --confirm-live to skip its interactive
+        # "Type LIVE" prompt; otherwise that input() would consume the piped
+        # password line and the child would abort on every restart. The wrapper
+        # is inherently unattended after this single prompt, so we require
+        # --confirm-live explicitly rather than silently injecting it.
+        if "--confirm-live" not in bot_args:
+            sys.exit(
+                "Live auto-restart wrapper requires --confirm-live: it prompts "
+                "for the vault password once and pipes it to each restarted "
+                "child, which needs --confirm-live to skip the interactive LIVE "
+                "prompt. Re-run: python 15m_bot_runner.py --live --confirm-live"
+            )
+        vault_password = _prompt_and_verify_vault_password()
+        child_env["POLYBOT_VAULT_PASSWORD_STDIN"] = "1"
+
     restart_count = 0
-    
+
     while True:
         restart_count += 1
         
@@ -60,10 +129,19 @@ def run_bot():
         try:
             # Run the bot with arguments!
             cmd = [python_cmd, BOT_SCRIPT] + bot_args
-            result = subprocess.run(
-                cmd,
-                check=False
-            )
+            if is_live:
+                # Feed the vault password on the child's stdin (memory -> pipe,
+                # never env or disk). subprocess closes stdin after the line, so
+                # the child reads exactly one password line, then sees EOF.
+                result = subprocess.run(
+                    cmd,
+                    check=False,
+                    env=child_env,
+                    input=vault_password + "\n",
+                    text=True,
+                )
+            else:
+                result = subprocess.run(cmd, check=False, env=child_env)
             
             exit_code = result.returncode
             

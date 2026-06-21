@@ -125,6 +125,7 @@ PRODUCTION_DEFAULT_WEIGHTS: dict[str, float] = {
 from vault_store import (
     DEFAULT_VAULT_FILE,
     load_vault_from_prompt,
+    load_vault_from_stdin,
     refuse_secret_dotenv_keys,
     refuse_secret_environment_keys,
 )
@@ -373,6 +374,13 @@ def get_polymarket_runtime_credentials(simulation: bool) -> dict[str, str | int]
             "signature_type": signature_type,
         }
 
+    # The auto-restart wrapper (15m_bot_runner.py) prompts for the vault
+    # password once and pipes it to each restarted child on stdin, setting
+    # POLYBOT_VAULT_PASSWORD_STDIN=1. The flag value is not a secret; the
+    # password itself only ever crosses the stdin pipe, never the environment
+    # or disk. A direct `python bot.py --live` run (no flag) still prompts.
+    if os.getenv("POLYBOT_VAULT_PASSWORD_STDIN") == "1":
+        return load_vault_from_stdin(DEFAULT_VAULT_FILE).to_runtime_credentials()
     return load_vault_from_prompt(DEFAULT_VAULT_FILE).to_runtime_credentials()
 
 
