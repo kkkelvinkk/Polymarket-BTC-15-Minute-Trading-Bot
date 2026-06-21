@@ -47,7 +47,7 @@ nautilus_trader==1.228.0
 niquests==3.19.1
 numpy==2.4.6
 packaging==26.2
-pandas==3.0.3
+pandas==2.3.3
 parsimonious==0.10.0
 pluggy==1.6.0
 poly_eip712_structs==0.0.1
@@ -64,7 +64,7 @@ pyarrow==24.0.0
 pycparser==3.0
 pycryptodome==3.23.0
 pydantic==2.13.4
-pydantic_core==2.47.0
+pydantic_core==2.46.4
 Pygments==2.20.0
 pytest==9.1.1
 python-dateutil==2.9.0.post0
@@ -94,9 +94,9 @@ urllib3-future==2.21.902
 uvloop==0.22.1
 verlib2==0.3.2
 wassima==2.1.1
-watchdog==6.0.0
+watchdog==4.0.2
 web3==7.16.0
-websockets==16.0
+websockets==15.0.1
 wheel==0.47.0
 win32_setctime==1.2.0
 yarl==1.24.2
